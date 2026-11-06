@@ -10,3 +10,4 @@ cd "$VK_SRC"
 cargo build --release --offline 2>/dev/null || cargo build --release
 cargo test --release ${CARGO_TEST_ARGS:-}
 install -m755 $CARGO_TARGET_DIR/release/libdv_engine_vk.so "$PREFIX/lib/libdv_engine_vk.so.1"
+install -Dm755 $CARGO_TARGET_DIR/release/dvvk-int64-check "$PREFIX/bin/dvvk-int64-check"

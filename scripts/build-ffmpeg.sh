@@ -31,7 +31,7 @@ if [ ! -f config.h ]; then
     --disable-devices --enable-pthreads --disable-network \
     --enable-v4l2_m2m --enable-libdrm --enable-libudev --enable-v4l2-request \
     --disable-mmal --enable-sand \
-    --enable-vaapi --disable-vdpau \
+    --disable-vaapi --disable-vdpau --disable-xlib --disable-libxcb \
     --enable-runtime-cpudetect --enable-neon --enable-hwaccels \
     --disable-encoders --enable-encoder=rawvideo --enable-encoder=wrapped_avframe \
     --disable-muxers --enable-muxer=rawvideo --enable-muxer=null --enable-muxer=framemd5 \

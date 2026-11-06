@@ -1,0 +1,17 @@
+# dvbench: CB1 (static, from CroqueMr's tree) and yblod's Vulkan engine
+# (dlopened) on the same DRM PRIME pictures.
+cmake_minimum_required(VERSION 3.22)
+project(dvbench C)
+set(CB1_SOURCE_DIR "" CACHE PATH "CB1/src of CroqueMr's libreelec-x86-DV")
+set(DVVK_INCLUDE_DIR "" CACHE PATH "yblod-engine/vk/include")
+add_subdirectory(${CB1_SOURCE_DIR} cb1)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(DEPS REQUIRED IMPORTED_TARGET libavformat libavcodec libavutil egl glesv2 libdrm libplacebo)
+add_executable(dvbench dvbench.c source.c alloc.c)
+set_target_properties(dvbench PROPERTIES C_STANDARD 11 BUILD_RPATH_USE_ORIGIN ON INSTALL_RPATH "$ORIGIN/../lib")
+target_compile_options(dvbench PRIVATE -O2 -Wall -Wno-unused-parameter)
+target_include_directories(dvbench PRIVATE ${DVVK_INCLUDE_DIR} ${CB1_SOURCE_DIR})
+target_link_libraries(dvbench PRIVATE dvbridge_core PkgConfig::DEPS ${CMAKE_DL_LIBS} m)
+add_executable(probe-dmabuf probe-dmabuf.c)
+target_link_libraries(probe-dmabuf PRIVATE PkgConfig::DEPS vulkan)
+install(TARGETS dvbench probe-dmabuf RUNTIME DESTINATION bin)
