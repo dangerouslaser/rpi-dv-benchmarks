@@ -14,7 +14,9 @@ scripts/vm.sh tests/check.sh    # every byte-identical check on clips/
 scripts/vm.sh dvbench --hash clips/X.mkv
 ```
 
-On the Pi: copy `out/dvbench-rpi5-*.tar.gz`, see [bundle/README.md](bundle/README.md).
+On the Pi: flash `out/dvbench-rpi5-sd.img.xz` (`scripts/make-image.sh`: Raspberry Pi OS Lite
++ the bundle + clips, user `dv`/`dvbench`, SSH, cma-512), or copy `out/dvbench-rpi5-*.tar.gz`
+to an existing install; see [bundle/README.md](bundle/README.md).
 
 - `sources.lock` pins every input; `scripts/fetch-sources.sh` fetches into `third_party/`.
 - Engine changes live on branch `rpi5` in `third_party/yblod`; `scripts/export-patches.sh`
