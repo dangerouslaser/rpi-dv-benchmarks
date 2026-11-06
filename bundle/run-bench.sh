@@ -90,6 +90,11 @@ for clip in "${CLIPS[@]}"; do
     run "$tag-v4l2-elsw" --source v4l2 --el-sw "$clip" && elsw=--el-sw
   fi
   check "$tag-v4l2-hash" --source v4l2 $elsw "$clip"
+  # Where the Vulkan engine's GPU time goes, stage by stage (GPU timestamps;
+  # reported every PROFILE_WINDOW frames of the throughput run).
+  DVVK_PROFILE=1 "$BENCH" --engines vk --frames 24 --throughput 15 ${NODE:+--node $NODE} --source v4l2 $elsw \
+    "$clip" >"$OUT/$tag-vk-profile.log" 2>&1
+  grep "^dvvk profile" "$OUT/$tag-vk-profile.log" | tail -2 | sed 's/^/   /'
   [ $SW = 1 ] && run "$tag-sw-sand" --source sw --layout sand "$clip"
 done | tee "$OUT/summary.txt"
 echo "results: $OUT"

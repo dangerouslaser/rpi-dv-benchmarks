@@ -1,7 +1,7 @@
 From b3cd6ce6481d80753fbcb637ba177a8302ec1ab9 Mon Sep 17 00:00:00 2001
 From: Bryan Hoban <bryan.hoban@gmail.com>
 Date: Fri, 6 Nov 2026 10:30:56 -0500
-Subject: [PATCH 1/4] yblod-engine-vk: build on aarch64 (c_char is u8 there)
+Subject: [PATCH 1/5] yblod-engine-vk: build on aarch64 (c_char is u8 there)
 
 ---
  yblod-engine/vk/src/device.rs | 2 +-

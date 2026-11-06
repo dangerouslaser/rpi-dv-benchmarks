@@ -14,7 +14,7 @@ Everything below runs on aarch64 today; only the Pi's own hardware paths
 | --- | --- |
 | FFmpeg 9.0, LibreELEC RPi5 config (`rpi` patch, V4L2 request HEVC, SAND) + CB1's DV patches | builds; all 14 patches apply |
 | libplacebo e2972fd + CB1's 21 patches; CB1 `dvbridge_core` (CroqueMr RC3 00615a5) | builds; ABI probes pass |
-| yblod Vulkan engine (libreelec-yblod 0.3.3 + `patches/yblod/`, 4 commits) | builds; `cargo test` 34/34; C CPU tests 4/4 |
+| yblod Vulkan engine (libreelec-yblod 0.3.3 + `patches/yblod/`, 5 commits) | builds; `cargo test` 34/34; C CPU tests 4/4 |
 | `dvbench` (port of `dvvk-mr-compare` to DRM PRIME frames) | runs both engines in a Debian arm64 VM (lavapipe / llvmpipe) |
 | Pi bundle `out/dvbench-rpi5-*.tar.gz` + `run-bench.sh` | self-contained; smoke-tested in the VM |
 
@@ -66,6 +66,45 @@ It records the system (Mesa, v3dv features, decoders, clocks, throttling),
 runs each clip from the hardware decoder (retrying with the EL in software if
 both layers can't share the decoder), cross-checks CB1 vs Vulkan output on the
 Pi's GPUs, and repeats from software decode for reference.
+
+## v3dv cost model and pre-hardware review (2026-11-06)
+
+Raspberry Pi OS trixie ships **Mesa 25.0.7**, not Mesa main. Checked against
+its v3dv source: same gaps as above plus `shaderInt16 = false` (enabled for
+V3D 7.1 only later). Patch 0005 makes the Pi shader build need neither
+shaderInt64 nor shaderInt16; without it the engine would not have started on
+a stock Pi.
+
+What the V3D compiler does (Mesa `v3dv_pipeline.c`, `nir_to_vir.c`):
+
+- **All 64-bit integer maths is lowered to 32-bit** (`lower_int64_options = ~0`).
+  A driver exposing shaderInt64 would generate about what our emulation
+  writes by hand, so "emulated" isn't the cost; the arithmetic is.
+- **Multipliers are 24-bit.** A 32-bit `imul` is 2 instructions (MULTOP +
+  UMUL24); the high half of a 32x32 product (`umulExtended`/`imulExtended`)
+  is lowered to 4 such multiplies plus ~10 adds/shifts/masks (Hacker's
+  Delight). A 64-bit product therefore costs ~20+ instructions.
+- **No integer divide.** Division by a non-constant is a long sequence;
+  division by a non-power-of-two constant becomes a `mul_high` (expensive here).
+
+Where that bites:
+
+| Hot spot | Per | Cost driver | Possible change |
+| --- | --- | --- | --- |
+| FEL MMR chroma (`fel_chroma`, `fel_mmr_dual_horizontal`, `fel_mmr_single`) | chroma sample, both channels | up to 24 signed 32x32->64 products + 64-bit adds | features are < 2^20 (the route's eligibility proof): split into 24-bit-friendly partial products (`umul24` = 1 instruction) |
+| `piecewise` (MMR single-layer) | pixel | 64x32 products | same |
+| `rounded(v, d)` with a runtime `d` (`method ? 128 : 4`) | EL sample | integer divide | branch to two constant power-of-two divisions |
+| `sand30_unpack` (ours) and the bench's GLES unpack for CB1 | sample | `n / 3`, `n % 3` (mul_high) | one invocation per 32-bit word (3 samples), no division |
+| `pack.comp` resized path `px / dx`, CB1 overlay `e / 71` | pixel / tile | divide | only on resized / overlay frames |
+
+CB1 does the same exact-integer MMR in GLES with `umulExtended` on `uvec2`
+(libplacebo patch 9913), so on the Pi both engines pay this; the comparison
+stays fair, but both could be faster.
+
+**Measure before changing:** v3dv has compute timestamps
+(`timestampComputeAndGraphics`), so `run-bench.sh` now also runs the Vulkan
+engine with `DVVK_PROFILE=1` (per-stage GPU ms: reconstruction, FEL stages,
+pack). Optimise the stages that show up there.
 
 ## Untested until the board arrives
 
