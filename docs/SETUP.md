@@ -24,6 +24,7 @@ git clone <this repo> && cd librelec-rpi5-dv
 ./scripts/build-all.sh      # fetch pinned sources, build everything, make the Pi bundle (~15 min first time)
 ./scripts/vm-setup.sh       # create the VM from vm/rpi5dv.yaml, provision it, verify dmabuf import
 scripts/vm.sh tests/check.sh    # all byte-identical checks (needs clips/, below)
+scripts/vm.sh tests/check.sh --validate   # plus the Pi configuration under the Vulkan validation layer
 ```
 
 `scripts/vm-setup.sh` is idempotent. `--recreate` deletes and rebuilds the VM

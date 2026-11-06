@@ -1,7 +1,7 @@
 From 0efff4d0e79418f583b94bf7670ad44eb8df7bad Mon Sep 17 00:00:00 2001
 From: Bryan Hoban <bryan.hoban@gmail.com>
 Date: Fri, 6 Nov 2026 11:05:41 -0500
-Subject: [PATCH 4/5] yblod-engine-vk: shaders without shaderInt64 (Raspberry
+Subject: [PATCH 4/6] yblod-engine-vk: shaders without shaderInt64 (Raspberry
  Pi 5)
 
 v3dv has no shaderInt64. Every shader is now also built as "<name>@noi64"

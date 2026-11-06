@@ -16,6 +16,10 @@
  *     --yblod            Vulkan engine as YBLOD runs it, not CB1's contract
  *     --throughput S     then each engine flat out over the decoded pictures
  *                        for S seconds, pipelined as in playback
+ *     --play S           then real-time playback for S seconds: a decoding
+ *                        thread (8-picture queue) and rendering on the
+ *                        stream's frame clock; counts pictures that missed
+ *                        their display deadline and decode stalls
  *     --node PATH        Vulkan's DRM render node (default: none, any device;
  *                        on the Pi the V3D node)
  *     --hash             print a hash of every output picture (A/B checks)
@@ -44,6 +48,7 @@
 #include <libplacebo/opengl.h>
 #include <linux/dma-buf.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -248,10 +253,14 @@ static const char *sand_fs =
     "uniform highp sampler2D column;\n"   /* RGBA8: bytes of one 128-byte column */
     "uniform int x0, row0, chroma;\n"     /* first sample of the strip, first row */
     "layout(location = 0) out vec4 o;\n"
-    "uint word_at(int n, int y) {\n"
-    "  vec4 b = texelFetch(column, ivec2((n / 3) % 32, row0 + y), 0) * 255.0 + 0.5;\n"
+    /* n / 3 without an integer divide (V3D has none): exact for n < 2^20,
+     * the fraction of (n + 0.5) / 3 being 1/6, 1/2 or 5/6. */
+    "int third(int n) { return int((float(n) + 0.5) * (1.0 / 3.0)); }\n"
+    "uint word_at(int q, int y) {\n"
+    "  vec4 b = texelFetch(column, ivec2(q & 31, row0 + y), 0) * 255.0 + 0.5;\n"
     "  return uint(b.r) | uint(b.g) << 8 | uint(b.b) << 16 | uint(b.a) << 24; }\n"
-    "float s10(int n, int y) { return float(((word_at(n, y) >> uint((n % 3) * 10)) & 1023u) << 6) / 65535.0; }\n"
+    "float s10(int n, int y) { int q = third(n);\n"
+    "  return float(((word_at(q, y) >> uint((n - 3 * q) * 10)) & 1023u) << 6) / 65535.0; }\n"
     "void main() {\n"
     "  ivec2 p = ivec2(gl_FragCoord.xy);\n"
     "  if (chroma == 0) { o = vec4(s10(p.x - x0, p.y), 0, 0, 1); return; }\n"
@@ -456,12 +465,250 @@ static struct stats summarize(double *t, int n)
     return s;
 }
 
+/* ---- one picture, per engine ------------------------------------------------ */
+
+static pl_opengl g_gl;
+static struct dvbridge_renderer *g_cb1;
+static pl_tex g_target;
+static dvvk_engine *g_vke;
+static int g_profile, g_fel = 1, g_contract = 1;
+
+/* CB1 renders picture q (Master Reference) into its target; GL work queued,
+ * not finished. 1 on success. */
+static int cb1_render(const struct dv_picture *q, double pts)
+{
+    AVFrame *el = g_fel ? q->el : NULL;
+    unsigned w = (unsigned)q->bl->width, h = (unsigned)q->bl->height;
+    unsigned x = ((W - w) / 2) & ~1u, y = ((H - h) / 2) & ~1u;
+    struct cb1_input *bi = cb1_input(g_gl->gpu, q->bl), *ei = el ? cb1_input(g_gl->gpu, el) : NULL;
+    if (!bi || (el && !ei))
+        return 0;
+    cb1_unpack(bi);
+    if (ei)
+        cb1_unpack(ei);
+    struct dvbridge_gl_frame bl = bi->frame, elf = {0};
+    dvbridge_gl_frame_set_chroma(&bl, cb1_chroma(q->bl->chroma_location, g_profile));
+    bl.frame.enhancement_layer = NULL;
+    if (ei) {
+        elf = ei->frame;
+        dvbridge_gl_frame_set_chroma(&elf, cb1_chroma(el->chroma_location, 7));
+        bl.frame.enhancement_layer = &elf.frame;
+    }
+    struct dvbridge_geometry g = {.source_width = (int)w, .source_height = (int)h, .x = (int)x, .y = (int)y,
+                                  .width = (int)w, .height = (int)h, .target_width = W, .target_height = H};
+    dvbridge_renderer_set_optimized_dv(g_cb1, true);
+    dvbridge_renderer_set_processing_optimizations(g_cb1, false);
+    dvbridge_renderer_set_overlay_visible(g_cb1, false);
+    int ok = dvbridge_render_master_reference(g_cb1, &bl.frame, q->dovi->data, q->dovi->size, pts,
+                                              el ? pts : NAN, g, g_target, false, NULL) == CB1_MASTER_READY;
+    if (ok)
+        dvbridge_render_commit(g_cb1);
+    else
+        dvbridge_renderer_reset(g_cb1);
+    return ok;
+}
+
+/* The Vulkan engine submits picture q (index i) into output `slot`; 1 on
+ * success, *ticket to wait on. */
+static int vk_submit(const struct dv_picture *q, double pts, long i, unsigned slot, uint64_t *ticket)
+{
+    AVFrame *el = g_fel ? q->el : NULL;
+    unsigned w = (unsigned)q->bl->width, h = (unsigned)q->bl->height;
+    unsigned x = ((W - w) / 2) & ~1u, y = ((H - h) / 2) & ~1u;
+    uint32_t bl_id = surface_id(q->bl), el_id = el ? surface_id(el) : 0xffffffffu;
+    if (vk_register(g_vke, q->bl, bl_id) || (el && vk_register(g_vke, el, el_id)))
+        return 0;
+    int top_left = cb1_chroma(q->bl->chroma_location, g_profile) == PL_CHROMA_TOP_LEFT;
+    dvvk_frame f = {.plan = {.width = w, .height = h, .x = x, .y = y, .dw = w, .dh = h,
+                             .chroma_top_left = (uint32_t)top_left, .has_el = el != NULL, .el_scaler = 1,
+                             .fel = (uint32_t)g_fel, .packet_id = 0, .refresh = i == 0,
+                             .pts = (int64_t)(pts * 1e6), .white_nits = 203.0, .cb1_contract = (uint32_t)g_contract},
+                    .bl_surface = bl_id, .el_surface = el_id, .metadata = q->dovi->data,
+                    .metadata_size = q->dovi->size, .output = slot};
+    return vk.submit(g_vke, &f, ticket) == 0;
+}
+
+/* ---- real-time playback ------------------------------------------------------ */
+
+/* --play: a decode thread fills a player-sized queue while the render loop
+ * runs on the stream's frame clock: picture k is due on screen at tick k + 1
+ * (one frame of latency, as a display flip). Counts pictures whose render
+ * missed that deadline and ticks at which decoding hadn't delivered yet. */
+#define PLAY_QUEUE 8
+
+struct play_queue {
+    pthread_mutex_t lock;
+    pthread_cond_t cond;
+    struct dv_picture q[PLAY_QUEUE];
+    int head, count, eof, stop;
+    struct dv_source *src;
+};
+
+static void *play_decoder(void *arg)
+{
+    struct play_queue *pq = arg;
+    for (;;) {
+        struct dv_picture p;
+        int r = dv_source_next(pq->src, &p);
+        if (r > 0 && (!p.dovi || p.bl->width > W || p.bl->height > H)) {
+            dv_picture_free(&p);
+            continue;
+        }
+        pthread_mutex_lock(&pq->lock);
+        while (r > 0 && pq->count == PLAY_QUEUE && !pq->stop)
+            pthread_cond_wait(&pq->cond, &pq->lock);
+        if (r <= 0 || pq->stop) {
+            pq->eof = 1;
+            pthread_cond_broadcast(&pq->cond);
+            pthread_mutex_unlock(&pq->lock);
+            if (r > 0)
+                dv_picture_free(&p);
+            return NULL;
+        }
+        pq->q[(pq->head + pq->count++) % PLAY_QUEUE] = p;
+        pthread_cond_broadcast(&pq->cond);
+        pthread_mutex_unlock(&pq->lock);
+    }
+}
+
+static void sleep_until_ms(double t)
+{
+    double d = t - now_ms();
+    if (d > 0) {
+        struct timespec ts = {(time_t)(d / 1e3), (long)(fmod(d, 1e3) * 1e6)};
+        nanosleep(&ts, NULL);
+    }
+}
+
+struct play_result {
+    long shown, late, starved, failed;
+    double worst_late_ms, cpu_ms, wall_ms;
+};
+
+static int play(const char *file, struct dv_source_options so, int engine, double seconds, struct play_result *res)
+{
+    memset(res, 0, sizeof(*res));
+    so.extra_frames = PLAY_QUEUE + 6;
+    struct play_queue pq = {.lock = PTHREAD_MUTEX_INITIALIZER, .cond = PTHREAD_COND_INITIALIZER};
+    pq.src = dv_source_open(file, &so);
+    if (!pq.src)
+        return -1;
+    AVRational rate = dv_source_rate(pq.src);
+    double period = rate.num > 0 ? 1e3 * rate.den / rate.num : 1e3 / 24;
+    pthread_t thread;
+    pthread_create(&thread, NULL, play_decoder, &pq);
+    /* Start once half the queue is buffered, as a player prerolls. */
+    pthread_mutex_lock(&pq.lock);
+    while (pq.count < PLAY_QUEUE / 2 && !pq.eof)
+        pthread_cond_wait(&pq.cond, &pq.lock);
+    pthread_mutex_unlock(&pq.lock);
+
+    /* In flight: the picture each output slot shows, and its completion. */
+    struct dv_picture held[3] = {{0}};
+    uint64_t tickets[3] = {0};
+    GLsync fences[3] = {0};
+    int pending[3] = {0};
+    double due[3] = {0};
+    double t0 = now_ms(), c0 = cpu_ms();
+    long frames = (long)(seconds * 1e3 / period);
+    for (long k = 0; k < frames; k++) {
+        double tick = t0 + k * period;
+        sleep_until_ms(tick);
+        unsigned slot = (unsigned)(k % 3);
+        /* The picture submitted three ticks ago must be done before its
+         * slot is reused; whether it met its own deadline was judged then. */
+        if (pending[slot]) {
+            if (engine == 0) {
+                glClientWaitSync(fences[slot], GL_SYNC_FLUSH_COMMANDS_BIT, UINT64_MAX);
+                glDeleteSync(fences[slot]);
+            } else
+                vk.wait(g_vke, tickets[slot], UINT64_MAX);
+            dv_picture_free(&held[slot]);
+            pending[slot] = 0;
+        }
+        /* Deadline check of the previous picture: due at this tick. */
+        unsigned prev = (unsigned)((k + 2) % 3);
+        if (k > 0 && pending[prev]) {
+            int done = engine == 0 ? glClientWaitSync(fences[prev], GL_SYNC_FLUSH_COMMANDS_BIT, 0) != GL_TIMEOUT_EXPIRED
+                                   : vk.wait(g_vke, tickets[prev], 0) == 1;
+            if (!done) {
+                res->late++;
+                if (engine == 0)
+                    glClientWaitSync(fences[prev], GL_SYNC_FLUSH_COMMANDS_BIT, UINT64_MAX);
+                else
+                    vk.wait(g_vke, tickets[prev], UINT64_MAX);
+                double l = now_ms() - due[prev];
+                if (l > res->worst_late_ms)
+                    res->worst_late_ms = l;
+            }
+        }
+        /* The next decoded picture. */
+        pthread_mutex_lock(&pq.lock);
+        if (!pq.count && !pq.eof)
+            res->starved++;
+        while (!pq.count && !pq.eof)
+            pthread_cond_wait(&pq.cond, &pq.lock);
+        if (!pq.count) {
+            pthread_mutex_unlock(&pq.lock);
+            break;
+        }
+        struct dv_picture p = pq.q[pq.head];
+        pq.head = (pq.head + 1) % PLAY_QUEUE;
+        pq.count--;
+        pthread_cond_broadcast(&pq.cond);
+        pthread_mutex_unlock(&pq.lock);
+
+        double pts = k * period / 1e3;
+        int ok;
+        if (engine == 0) {
+            ok = cb1_render(&p, pts);
+            fences[slot] = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+            glFlush();
+        } else
+            ok = vk_submit(&p, pts, k, slot, &tickets[slot]);
+        if (!ok) {
+            res->failed++;
+            if (engine == 0 && fences[slot])
+                glDeleteSync(fences[slot]);
+            dv_picture_free(&p);
+            continue;
+        }
+        held[slot] = p;
+        pending[slot] = 1;
+        due[slot] = tick + period;
+        res->shown++;
+    }
+    for (int s = 0; s < 3; s++)
+        if (pending[s]) {
+            if (engine == 0) {
+                glClientWaitSync(fences[s], GL_SYNC_FLUSH_COMMANDS_BIT, UINT64_MAX);
+                glDeleteSync(fences[s]);
+            } else
+                vk.wait(g_vke, tickets[s], UINT64_MAX);
+            dv_picture_free(&held[s]);
+        }
+    res->wall_ms = now_ms() - t0;
+    res->cpu_ms = cpu_ms() - c0;
+    pthread_mutex_lock(&pq.lock);
+    pq.stop = 1;
+    pthread_cond_broadcast(&pq.cond);
+    pthread_mutex_unlock(&pq.lock);
+    pthread_join(thread, NULL);
+    while (pq.count) {
+        dv_picture_free(&pq.q[pq.head]);
+        pq.head = (pq.head + 1) % PLAY_QUEUE;
+        pq.count--;
+    }
+    dv_source_close(pq.src);
+    return 0;
+}
+
 /* ---- main ---------------------------------------------------------------- */
 
 int main(int argc, char **argv)
 {
     int frames = 48, warmup = 8, fel = 1, contract = 1, hash = 0, run_cb1 = 1, run_vk = 1;
-    double throughput = 0;
+    double throughput = 0, play_seconds = 0;
     struct dv_source_options so = {.kind = DV_SOURCE_SW, .layout = DV_LAYOUT_SAND30, .extra_frames = 8};
     const char *file = NULL, *node = NULL, *dump = NULL, *json = NULL;
     for (int i = 1; i < argc; i++) {
@@ -488,6 +735,8 @@ int main(int argc, char **argv)
             contract = 0;
         else if (!strcmp(a, "--throughput") && v)
             throughput = atof(argv[++i]);
+        else if (!strcmp(a, "--play") && v)
+            play_seconds = atof(argv[++i]);
         else if (!strcmp(a, "--node") && v)
             node = argv[++i];
         else if (!strcmp(a, "--hash"))
@@ -618,6 +867,14 @@ int main(int argc, char **argv)
         }
     }
 
+    g_gl = gl;
+    g_cb1 = cb1;
+    g_target = target;
+    g_vke = vke;
+    g_profile = profile;
+    g_fel = fel;
+    g_contract = contract;
+
     /* 3. Per picture, synchronous. */
     FILE *js = json ? fopen(json, "w") : NULL;
     if (js)
@@ -637,54 +894,16 @@ int main(int argc, char **argv)
         int timed = 0, failed = 0;
         for (int i = 0; i < count; i++) {
             struct dv_picture *q = &pics[i];
-            AVFrame *el = fel ? q->el : NULL;
-            unsigned w = (unsigned)q->bl->width, h = (unsigned)q->bl->height;
-            unsigned x = ((W - w) / 2) & ~1u, y = ((H - h) / 2) & ~1u;
             double pts = i * period;
             int ok = 0;
             const struct out_buf *out = engine == 0 ? &cb_out : &vk_out[0];
             double t0 = now_ms();
             if (engine == 0) {
-                struct cb1_input *bi = cb1_input(gl->gpu, q->bl), *ei = el ? cb1_input(gl->gpu, el) : NULL;
-                if (bi && (!el || ei)) {
-                    cb1_unpack(bi);
-                    if (ei)
-                        cb1_unpack(ei);
-                    struct dvbridge_gl_frame bl = bi->frame, elf = {0};
-                    dvbridge_gl_frame_set_chroma(&bl, cb1_chroma(q->bl->chroma_location, profile));
-                    bl.frame.enhancement_layer = NULL;
-                    if (ei) {
-                        elf = ei->frame;
-                        dvbridge_gl_frame_set_chroma(&elf, cb1_chroma(el->chroma_location, 7));
-                        bl.frame.enhancement_layer = &elf.frame;
-                    }
-                    struct dvbridge_geometry g = {.source_width = (int)w, .source_height = (int)h, .x = (int)x,
-                                                  .y = (int)y, .width = (int)w, .height = (int)h,
-                                                  .target_width = W, .target_height = H};
-                    dvbridge_renderer_set_optimized_dv(cb1, true);
-                    dvbridge_renderer_set_processing_optimizations(cb1, false);
-                    dvbridge_renderer_set_overlay_visible(cb1, false);
-                    ok = dvbridge_render_master_reference(cb1, &bl.frame, q->dovi->data, q->dovi->size, pts,
-                                                          el ? pts : NAN, g, target, false, NULL) == CB1_MASTER_READY;
-                    if (ok)
-                        dvbridge_render_commit(cb1);
-                    else
-                        dvbridge_renderer_reset(cb1);
-                    glFinish();
-                }
+                ok = cb1_render(q, pts);
+                glFinish();
             } else {
-                uint32_t bl_id = surface_id(q->bl), el_id = el ? surface_id(el) : 0xffffffffu;
-                ok = !vk_register(vke, q->bl, bl_id) && (!el || !vk_register(vke, el, el_id));
-                int top_left = cb1_chroma(q->bl->chroma_location, profile) == PL_CHROMA_TOP_LEFT;
-                dvvk_frame f = {.plan = {.width = w, .height = h, .x = x, .y = y, .dw = w, .dh = h,
-                                         .chroma_top_left = (uint32_t)top_left, .has_el = el != NULL,
-                                         .el_scaler = 1, .fel = (uint32_t)fel, .packet_id = 0,
-                                         .refresh = i == 0, .pts = (int64_t)(pts * 1e6), .white_nits = 203.0,
-                                         .cb1_contract = (uint32_t)contract},
-                                .bl_surface = bl_id, .el_surface = el_id,
-                                .metadata = q->dovi->data, .metadata_size = q->dovi->size, .output = 0};
                 uint64_t ticket = 0;
-                ok = ok && vk.submit(vke, &f, &ticket) == 0 && vk.wait(vke, ticket, 10000000000ull) == 1;
+                ok = vk_submit(q, pts, i, 0, &ticket) && vk.wait(vke, ticket, 10000000000ull) == 1;
             }
             double t = now_ms() - t0;
             if (!ok) {
@@ -721,52 +940,16 @@ int main(int argc, char **argv)
             double t0 = now_ms(), c0 = cpu_ms(), end = t0 + throughput * 1e3;
             for (long i = 0; now_ms() < end; i++) {
                 struct dv_picture *q = &pics[i % count];
-                AVFrame *el = fel ? q->el : NULL;
-                unsigned w = (unsigned)q->bl->width, h = (unsigned)q->bl->height;
-                unsigned x = ((W - w) / 2) & ~1u, y = ((H - h) / 2) & ~1u;
                 double pts = i * period;
                 int ok = 0;
                 if (engine == 0) {
-                    struct cb1_input *bi = cb1_input(gl->gpu, q->bl), *ei = el ? cb1_input(gl->gpu, el) : NULL;
-                    if (bi && (!el || ei)) {
-                        cb1_unpack(bi);
-                        if (ei)
-                            cb1_unpack(ei);
-                        struct dvbridge_gl_frame bl = bi->frame, elf = {0};
-                        dvbridge_gl_frame_set_chroma(&bl, cb1_chroma(q->bl->chroma_location, profile));
-                        bl.frame.enhancement_layer = NULL;
-                        if (ei) {
-                            elf = ei->frame;
-                            dvbridge_gl_frame_set_chroma(&elf, cb1_chroma(el->chroma_location, 7));
-                            bl.frame.enhancement_layer = &elf.frame;
-                        }
-                        struct dvbridge_geometry g = {.source_width = (int)w, .source_height = (int)h,
-                                                      .x = (int)x, .y = (int)y, .width = (int)w, .height = (int)h,
-                                                      .target_width = W, .target_height = H};
-                        ok = dvbridge_render_master_reference(cb1, &bl.frame, q->dovi->data, q->dovi->size, pts,
-                                                              el ? pts : NAN, g, target, false, NULL) ==
-                             CB1_MASTER_READY;
-                        if (ok)
-                            dvbridge_render_commit(cb1);
-                        else
-                            dvbridge_renderer_reset(cb1);
-                    }
+                    ok = cb1_render(q, pts);
                 } else {
                     unsigned slot = (unsigned)(i % 3);
                     if (tickets[slot] && vk.wait(vke, tickets[slot], UINT64_MAX) != 1)
                         tfail++;
                     tickets[slot] = 0;
-                    uint32_t bl_id = surface_id(q->bl), el_id = el ? surface_id(el) : 0xffffffffu;
-                    int top_left = cb1_chroma(q->bl->chroma_location, profile) == PL_CHROMA_TOP_LEFT;
-                    dvvk_frame f = {.plan = {.width = w, .height = h, .x = x, .y = y, .dw = w, .dh = h,
-                                             .chroma_top_left = (uint32_t)top_left, .has_el = el != NULL,
-                                             .el_scaler = 1, .fel = (uint32_t)fel, .packet_id = 0,
-                                             .refresh = i == 0, .pts = (int64_t)(pts * 1e6), .white_nits = 203.0,
-                                             .cb1_contract = (uint32_t)contract},
-                                    .bl_surface = bl_id, .el_surface = el_id, .metadata = q->dovi->data,
-                                    .metadata_size = q->dovi->size, .output = slot};
-                    ok = !vk_register(vke, q->bl, bl_id) && (!el || !vk_register(vke, el, el_id)) &&
-                         vk.submit(vke, &f, &tickets[slot]) == 0;
+                    ok = vk_submit(q, pts, i, slot, &tickets[slot]);
                 }
                 done += ok;
                 tfail += !ok;
@@ -785,6 +968,26 @@ int main(int argc, char **argv)
                         done ? cpu / done : 0);
             if (tfail)
                 status = 1;
+        }
+
+        /* 5. Real-time playback from a decoding thread. */
+        if (play_seconds > 0) {
+            struct play_result r;
+            if (play(file, so, engine, play_seconds, &r)) {
+                printf("%-13s play: source failed\n", name);
+                status = 1;
+            } else {
+                printf("%-13s play: %ld pictures in %.1f s at the stream rate, %ld late (worst %.1f ms), "
+                       "%ld decode stalls, CPU %.2f ms/picture%s\n",
+                       name, r.shown, r.wall_ms / 1e3, r.late, r.worst_late_ms, r.starved,
+                       r.shown ? r.cpu_ms / r.shown : 0, r.failed ? " FAILURES" : "");
+                if (js)
+                    fprintf(js, ", \"play_shown\": %ld, \"play_late\": %ld, \"play_worst_late_ms\": %.2f, "
+                                "\"play_decode_stalls\": %ld, \"play_cpu_ms\": %.3f",
+                            r.shown, r.late, r.worst_late_ms, r.starved, r.shown ? r.cpu_ms / r.shown : 0);
+                if (r.failed)
+                    status = 1;
+            }
         }
         if (js)
             fprintf(js, "}");

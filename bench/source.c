@@ -9,6 +9,7 @@
 #include <libavutil/dovi_meta.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/pixdesc.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -23,7 +24,7 @@
 /* A dmabuf the software path copies pictures into; reused once released. */
 struct udma {
     struct dv_dmabuf buf;
-    int busy;
+    _Atomic int busy;   /* released by whichever thread frees the picture */
 };
 
 struct dv_source {

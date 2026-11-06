@@ -14,7 +14,7 @@ Everything below runs on aarch64 today; only the Pi's own hardware paths
 | --- | --- |
 | FFmpeg 9.0, LibreELEC RPi5 config (`rpi` patch, V4L2 request HEVC, SAND) + CB1's DV patches | builds; all 14 patches apply |
 | libplacebo e2972fd + CB1's 21 patches; CB1 `dvbridge_core` (CroqueMr RC3 00615a5) | builds; ABI probes pass |
-| yblod Vulkan engine (libreelec-yblod 0.3.3 + `patches/yblod/`, 5 commits) | builds; `cargo test` 34/34; C CPU tests 4/4 |
+| yblod Vulkan engine (libreelec-yblod 0.3.3 + `patches/yblod/`, 6 commits) | builds; `cargo test` 34/34; C CPU tests 4/4 |
 | `dvbench` (port of `dvvk-mr-compare` to DRM PRIME frames) | runs both engines in a Debian arm64 VM (lavapipe / llvmpipe) |
 | Pi bundle `out/dvbench-rpi5-*.tar.gz` + `run-bench.sh` | self-contained; smoke-tested in the VM |
 
@@ -101,10 +101,40 @@ CB1 does the same exact-integer MMR in GLES with `umulExtended` on `uvec2`
 (libplacebo patch 9913), so on the Pi both engines pay this; the comparison
 stays fair, but both could be faster.
 
+Done before hardware (patch 0006): no integer division in `sand30_unpack`
+(one invocation per word) or in `rounded()`'s runtime divisor (Pi build); the
+bench's GLES unpack for CB1 divides by 3 in float. All byte-identical.
+
+Not done, on purpose: hand-written 24-bit MMR products. Mesa has no rule
+turning a plain multiply with small operands into `umul24`, and GLSL/SPIR-V
+can't express `umul24`, so any decomposition still compiles to the same
+2-instruction 32-bit multiplies; fewer products needs an algorithmic change,
+to be chosen from the Pi's per-stage profile.
+
 **Measure before changing:** v3dv has compute timestamps
 (`timestampComputeAndGraphics`), so `run-bench.sh` now also runs the Vulkan
 engine with `DVVK_PROFILE=1` (per-stage GPU ms: reconstruction, FEL stages,
 pack). Optimise the stages that show up there.
+
+## Day-one readiness (run-bench.sh)
+
+- correctness first: CB1 == Vulkan on hardware-decoded pictures, and the
+  Vulkan engine's output from hardware == software decoding of the same
+  pictures (proves the SAND layout end to end; HEVC decoding is exact);
+- performance: each engine in its own process, 3 repeats alternating which
+  goes first, CPU governor set to performance, clocks / temperature /
+  throttle flags recorded around every run, throttled runs excluded from the
+  medians (`summarize.py` -> `table.txt`);
+- real-time playback (`dvbench --play`): decoding thread with an 8-picture
+  queue, rendering on the stream's frame clock, one frame of latency; late
+  pictures and decode stalls counted;
+- `DVVK_PROFILE=1` per-stage GPU times of the Vulkan engine.
+
+`tests/check.sh --validate` also runs the Pi configuration under the Khronos
+validation layer. Core validation is proven to fire (planted misaligned
+fill); synchronization validation is enabled but did not report a planted
+transfer->dispatch hazard on lavapipe with layers 1.4.309, so it is not
+relied on.
 
 ## Untested until the board arrives
 

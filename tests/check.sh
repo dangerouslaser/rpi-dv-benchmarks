@@ -7,10 +7,18 @@
 #        linear P010 input == SAND128 input == SAND + no int64 + no push
 #        descriptors (the Pi 5 configuration)
 #     3. per clip, CB1 == the Vulkan engine (SAND input, CB1 contract)
+#     4. --validate: the Pi 5 configuration under the Khronos validation layer
+#        (tests/vulkan/vk_layer_settings.txt); any validation error fails.
+#        Core validation is proven to fire here (a planted misaligned
+#        vkCmdFillBuffer is reported). Sync validation is switched on too but
+#        did NOT report a planted transfer->dispatch hazard on lavapipe with
+#        layers 1.4.309, so don't read a clean run as "barriers verified".
 # FRAMES (default 8) pictures each. Exit 1 on any difference.
 set -u
 cd "$(dirname "$0")/.."
 FRAMES=${FRAMES:-8}
+VALIDATE=0
+[ "${1:-}" = --validate ] && { VALIDATE=1; shift; }
 WORK=${WORK:-build/check}
 mkdir -p "$WORK"
 CLIPS=("$@")
@@ -48,6 +56,20 @@ for clip in "${CLIPS[@]}"; do
   done
   hashes "$t-cb1" --engines cb1 --layout sand "$clip"
   same "CB1 == vulkan (SAND, CB1 contract)" "$t-cb1-sand" "$t-cb1"
+  if [ $VALIDATE = 1 ]; then
+    for mode in "" --yblod; do
+      log=$t-validate${mode:+-yblod}.log
+      VK_LAYER_SETTINGS_PATH=$PWD/tests/vulkan VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation \
+        DVVK_NO_INT64=1 DVVK_NO_PUSH_DESCRIPTOR=1 \
+        dvbench --engines vk --frames 3 --warmup 0 --layout sand $mode "$clip" >"$log" 2>&1
+      n=$(grep -c "Validation Error" "$log")
+      if grep -q "Validation Layer Active" "$log" && [ "$n" = 0 ]; then
+        echo "ok    validation, Pi 5 mode${mode:+ (yblod)}: no errors"
+      else
+        echo "FAIL  validation, Pi 5 mode${mode:+ (yblod)}: $n errors (or layer missing), see $log"; fail=1
+      fi
+    done
+  fi
 done
 [ $fail = 0 ] && echo "all checks passed" || echo "CHECKS FAILED"
 exit $fail

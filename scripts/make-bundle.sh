@@ -13,7 +13,7 @@ cp "$P/bin/dvbench" "$P/bin/probe-dmabuf" "$P/bin/dvvk-int64-check" "$STAGE/bin/
 cp -P "$P"/lib/lib{avcodec,avformat,avutil,avfilter,swscale,swresample,postproc,avdevice}.so* "$STAGE/lib/" 2>/dev/null || true
 cp -P "$P"/lib/libplacebo.so* "$P/lib/libdv_engine_vk.so.1" "$STAGE/lib/"
 "$ROOT/scripts/in-docker.sh" bash -c "cp -L /usr/lib/aarch64-linux-gnu/libva.so.2 /usr/lib/aarch64-linux-gnu/libva-drm.so.2 /work/out/$NAME/lib/"
-cp "$ROOT/bundle/run-bench.sh" "$ROOT/bundle/README.md" "$STAGE/"
+cp "$ROOT/bundle/run-bench.sh" "$ROOT/bundle/summarize.py" "$ROOT/bundle/README.md" "$STAGE/"
 {
   echo "bundle $NAME built $(date -u +%Y-%m-%dT%H:%MZ)"
   sed -n '/^[a-z]/p' "$ROOT/sources.lock"

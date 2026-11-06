@@ -1,0 +1,167 @@
+From 46d69fcd4d58a43d5dd6663abea2601f83191954 Mon Sep 17 00:00:00 2001
+From: Bryan Hoban <bryan.hoban@gmail.com>
+Date: Fri, 6 Nov 2026 12:32:28 -0500
+Subject: [PATCH 6/6] yblod-engine-vk: no integer division in the Pi's
+ per-sample paths
+
+V3D has no integer divider: a runtime divisor becomes a software division,
+a constant non-power-of-two one a multiply-high (~20 instructions).
+
+- sand30_unpack: one invocation per luma word (3 pixels) and per chroma
+  word pair (3 U/V pairs) instead of n / 3, n % 3 per sample.
+- rounded() by the runtime 128-or-4 (fel_equal, the chroma phase sample):
+  in the Pi build (DV_NO_INT64) two constant power-of-two divisions.
+  Native SPIR-V unchanged.
+
+Outputs identical on lavapipe (P010 == SAND == Pi mode, CB1 == Vulkan),
+clean under the Khronos validation layer.
+---
+ yblod-engine/vk/shaders/common/dv_common.glsl | 11 +++-
+ yblod-engine/vk/shaders/fel_equal.comp        |  2 +-
+ yblod-engine/vk/shaders/sand30_unpack.comp    | 60 +++++++++++--------
+ yblod-engine/vk/src/engine.rs                 |  3 +-
+ 4 files changed, 47 insertions(+), 29 deletions(-)
+
+diff --git a/yblod-engine/vk/shaders/common/dv_common.glsl b/yblod-engine/vk/shaders/common/dv_common.glsl
+index 517cbdd..795097b 100644
+--- a/yblod-engine/vk/shaders/common/dv_common.glsl
++++ b/yblod-engine/vk/shaders/common/dv_common.glsl
+@@ -76,6 +76,15 @@ uint rounded(int v, int d)
+     return uint(clamp(v, 0, 65535));
+ }
+ 
++// rounded() by 128 (4-tap) or 4 (2-tap) as `method` picks. The Pi build (V3D:
++// no integer divider) keeps both divisors constant powers of two, i.e. shifts;
++// a runtime divisor would be a full software division per sample.
++#ifdef DV_NO_INT64
++#define ROUNDED_BY_METHOD(v, method) ((method) != 0u ? rounded(v, 128) : rounded(v, 4))
++#else
++#define ROUNDED_BY_METHOD(v, method) rounded(v, (method) != 0u ? 128 : 4)
++#endif
++
+ // A 16-bit UNORM sample as yblod recovers it: x65535, round to nearest even.
+ uint unorm16(float v) { return uint(roundEven(v * 65535.0)); }
+ uint unorm8(float v) { return uint(roundEven(v * 255.0)); }
+@@ -116,7 +125,7 @@ uvec2 phase_uv_sample(sampler2D src, uint x, int row, uint h, uint method)
+         for (int k = 0; k < 4; ++k)
+             v += taps[k] * ivec2(input_uv(src, x, uint(edge(int(y) + k - 1, h))));
+     }
+-    return min(uvec2(rounded(v.x, method != 0u ? 128 : 4), rounded(v.y, method != 0u ? 128 : 4)), uvec2(1023u));
++    return min(uvec2(ROUNDED_BY_METHOD(v.x, method), ROUNDED_BY_METHOD(v.y, method)), uvec2(1023u));
+ }
+ 
+ #endif
+diff --git a/yblod-engine/vk/shaders/fel_equal.comp b/yblod-engine/vk/shaders/fel_equal.comp
+index 8ffaf6a..4d0e5ce 100644
+--- a/yblod-engine/vk/shaders/fel_equal.comp
++++ b/yblod-engine/vk/shaders/fel_equal.comp
+@@ -26,7 +26,7 @@ uint phase_at(uint x, uint y)
+         for (int k = 0; k < 4; k++)
+             v += c[k] * int(input_sample(img0, x, uint(edge(int(y) + k - 1, h)), channel));
+     }
+-    return min(rounded(v, method != 0u ? 128 : 4), 1023u);
++    return min(ROUNDED_BY_METHOD(v, method), 1023u);
+ }
+ 
+ uint guide_sample(uint gx, uint gy)
+diff --git a/yblod-engine/vk/shaders/sand30_unpack.comp b/yblod-engine/vk/shaders/sand30_unpack.comp
+index b92892d..98573ec 100644
+--- a/yblod-engine/vk/shaders/sand30_unpack.comp
++++ b/yblod-engine/vk/shaders/sand30_unpack.comp
+@@ -6,9 +6,12 @@
+ //
+ // SAND128: the plane is cut into 128-byte-wide columns stored one after the
+ // other, each `colh` rows tall. P030 packs three 10-bit samples per 32-bit
+-// word (bits 0-9, 10-19, 20-29), luma Y Y Y, chroma U V U / V U V. Sample n
+-// of a row (luma x; chroma 2x + c) is in word n / 3 at bit (n % 3) * 10.
+-// Same addressing as FFmpeg's av_rpi_sand30_to_planar_{y,c}16.
++// word (bits 0-9, 10-19, 20-29): luma Y Y Y; chroma U V U | V U V over two
++// words. Same addressing as FFmpeg's av_rpi_sand30_to_planar_{y,c}16.
++//
++// One invocation per luma word (3 pixels) and per chroma word pair (3 U/V
++// pairs): no integer division anywhere (V3D has no divider; dividing by 3
++// costs a multiply-high, ~20 instructions, per sample).
+ layout(local_size_x = 16, local_size_y = 8) in;
+ 
+ layout(binding = 0, std430) readonly buffer LumaSrc { uint luma_words[]; };
+@@ -17,38 +20,43 @@ layout(binding = 2, r16) writeonly uniform image2D luma;
+ layout(binding = 3, rg16) writeonly uniform image2D chroma;
+ 
+ layout(push_constant) uniform Push {
+-    uint width, height;          // luma size
++    uint width, height;                // luma size
+     uint luma_offset, chroma_offset;   // bytes into their buffers (column 0, row 0)
+     uint luma_colh, chroma_colh;       // column heights in rows
+ };
+ 
+-uint byte_address(uint base, uint colh, uint n, uint row)
+-{
+-    uint b = (n / 3u) * 4u;
+-    return base + (b & 127u) + row * 128u + (b >> 7) * 128u * colh;
+-}
+-
+-uint luma10(uint n, uint row)
+-{
+-    uint a = byte_address(luma_offset, luma_colh, n, row);
+-    return (luma_words[a >> 2] >> ((n % 3u) * 10u)) & 0x3ffu;
+-}
+-
+-uint chroma10(uint n, uint row)
++// The word at byte b (a multiple of 4) of a row: b's column, then within it.
++uint word_index(uint base, uint colh, uint b, uint row)
+ {
+-    uint a = byte_address(chroma_offset, chroma_colh, n, row);
+-    return (chroma_words[a >> 2] >> ((n % 3u) * 10u)) & 0x3ffu;
++    return (base + (b & 127u) + row * 128u + (b >> 7) * 128u * colh) >> 2;
+ }
+ 
+ // UNORM16 store of an exact code: (v << 6) / 65535 rounds back to v << 6.
+-float unorm16(uint v) { return float(v << 6) / 65535.0; }
++float unorm16(uint v) { return float((v & 0x3ffu) << 6) / 65535.0; }
+ 
+ void main()
+ {
+-    uvec2 p = gl_GlobalInvocationID.xy;
+-    if (p.x < width && p.y < height)
+-        imageStore(luma, ivec2(p), vec4(unorm16(luma10(p.x, p.y)), 0.0, 0.0, 1.0));
+-    if (p.x < width / 2u && p.y < height / 2u)
+-        imageStore(chroma, ivec2(p),
+-                   vec4(unorm16(chroma10(2u * p.x, p.y)), unorm16(chroma10(2u * p.x + 1u, p.y)), 0.0, 1.0));
++    uint i = gl_GlobalInvocationID.x, row = gl_GlobalInvocationID.y;
++    // Luma: word i of the row holds pixels 3i, 3i + 1, 3i + 2.
++    if (row < height) {
++        uint x = i * 3u;
++        if (x < width) {
++            uint w = luma_words[word_index(luma_offset, luma_colh, i * 4u, row)];
++            for (uint k = 0u; k < 3u && x + k < width; ++k)
++                imageStore(luma, ivec2(x + k, row), vec4(unorm16(w >> (10u * k)), 0.0, 0.0, 1.0));
++        }
++    }
++    // Chroma: words 2i and 2i + 1 hold pairs 3i .. 3i + 2 (U V U | V U V).
++    if (row < height / 2u) {
++        uint x = i * 3u, cw = width / 2u;
++        if (x < cw) {
++            uint a = chroma_words[word_index(chroma_offset, chroma_colh, i * 8u, row)];
++            uint b = chroma_words[word_index(chroma_offset, chroma_colh, i * 8u + 4u, row)];
++            imageStore(chroma, ivec2(x, row), vec4(unorm16(a), unorm16(a >> 10), 0.0, 1.0));
++            if (x + 1u < cw)
++                imageStore(chroma, ivec2(x + 1u, row), vec4(unorm16(a >> 20), unorm16(b), 0.0, 1.0));
++            if (x + 2u < cw)
++                imageStore(chroma, ivec2(x + 2u, row), vec4(unorm16(b >> 10), unorm16(b >> 20), 0.0, 1.0));
++        }
++    }
+ }
+diff --git a/yblod-engine/vk/src/engine.rs b/yblod-engine/vk/src/engine.rs
+index feadc33..78ecb2e 100644
+--- a/yblod-engine/vk/src/engine.rs
++++ b/yblod-engine/vk/src/engine.rs
+@@ -3270,7 +3270,8 @@ fn acquire_surface(
+     let (w, h) = (s.luma.width, s.luma.height);
+     let pc = [w, h, sand.offsets[0], sand.offsets[1], sand.column_heights[0], sand.column_heights[1]];
+     gpu::push_constants(d, cmd, pipe, &pc);
+-    unsafe { d.device.cmd_dispatch(cmd, w.div_ceil(16), h.div_ceil(8), 1) };
++    // One invocation per luma word (3 pixels) / chroma word pair (3 pairs).
++    unsafe { d.device.cmd_dispatch(cmd, w.div_ceil(3).div_ceil(16), h.div_ceil(8), 1) };
+     let to_read = [s.luma.image, s.chroma.image].map(|image| {
+         vk::ImageMemoryBarrier2::default()
+             .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)

@@ -1,7 +1,7 @@
 From ad00e43e3503a8a10ca5ecb1f3fe60c12af3e6b8 Mon Sep 17 00:00:00 2001
 From: Bryan Hoban <bryan.hoban@gmail.com>
 Date: Fri, 6 Nov 2026 10:57:09 -0500
-Subject: [PATCH 3/5] yblod-engine-vk: run on software Vulkan for tests
+Subject: [PATCH 3/6] yblod-engine-vk: run on software Vulkan for tests
  (lavapipe)
 
 - drm_fd < 0: no DRM node; the first device (DVVK_DEVICE: name filter).

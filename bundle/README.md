@@ -24,12 +24,23 @@ Per clip, with the Pi's hardware decoder (V4L2 request, SAND128 frames):
   median / p95 milliseconds;
 - throughput: each engine flat out for 20 s, pipelined as in playback,
   frames per second and CPU milliseconds per frame;
-- a correctness check: CB1's and the Vulkan engine's 3840x2160 output,
-  byte for byte, on 12 pictures (they should be identical);
+- a correctness check first: CB1's and the Vulkan engine's 3840x2160 output,
+  byte for byte, on 12 pictures, and the Vulkan engine's output from the
+  hardware decoder vs software decoding (all should be identical);
+- each performance run 3 times, engine order alternating, with clocks,
+  temperature and throttling recorded (throttled runs are left out of the
+  medians in `table.txt`);
+- real-time playback for 30 s per engine: decoding on its own thread,
+  rendering at the stream's frame rate; late pictures and decode stalls;
+- the Vulkan engine's per-stage GPU times;
 - the same with software decoding, for reference.
 
-Everything lands in `results/HOST-DATE/` (`summary.txt`, `system.txt`, a
-log and a JSON per run). Send that directory back.
+Use an active cooler, and let `run-bench.sh` set the CPU governor
+(it needs passwordless `sudo`, the default on Raspberry Pi OS). `--quick`
+runs only the correctness checks (a couple of minutes).
+
+Everything lands in `results/HOST-DATE/` (`summary.txt`, `table.txt`,
+`system.txt`, a log and a JSON per run). Send that directory back.
 
 Useful clips: 4K Profile 7 FEL (two decodes per picture: the heaviest),
 Profile 7 MEL, Profile 8.1, Profile 5.

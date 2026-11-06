@@ -36,7 +36,8 @@ provision:
       # libraries dvbench and the engines link, and tools for poking around.
       apt-get install -y -qq --no-install-recommends \
         mesa-vulkan-drivers vulkan-tools libvulkan1 libegl-mesa0 libegl1 libgles2 libgbm1 \
-        libdrm2 libva2 libva-drm2 libudev1 mesa-utils-bin python3 gcc libc6-dev
+        libdrm2 libva2 libva-drm2 libudev1 mesa-utils-bin python3 gcc libc6-dev \
+        vulkan-validationlayers
       # /dev/udmabuf for every user (the bench allocates its buffers there).
       echo 'KERNEL=="udmabuf", MODE="0666"' >/etc/udev/rules.d/99-udmabuf.rules
       udevadm control --reload
