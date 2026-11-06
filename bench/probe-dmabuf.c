@@ -95,8 +95,14 @@ int main(void)
         type++;
     VkImportMemoryFdInfoKHR imp = {.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR,
                                    .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, .fd = dup(fd)};
+    /* At the dmabuf's own size: drivers pad requirements (v3dv: +64 bytes),
+     * and an import larger than the dmabuf fails (the engine does the same). */
+    off_t fd_size = lseek(fd, 0, SEEK_END);
     VkMemoryAllocateInfo mai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &imp,
-                                .allocationSize = req.size, .memoryTypeIndex = type};
+                                .allocationSize = fd_size > 0 ? (VkDeviceSize)fd_size : req.size,
+                                .memoryTypeIndex = type};
+    printf("vulkan buffer requirement %llu bytes, dmabuf %lld bytes\n", (unsigned long long)req.size,
+           (long long)fd_size);
     VkDeviceMemory mem;
     VkResult r = vkAllocateMemory(dev, &mai, NULL, &mem);
     printf("vulkan dmabuf buffer import: %s (%d)\n", r == VK_SUCCESS ? "ok" : "FAILED", r);

@@ -10,7 +10,7 @@ correctness checks and A/B tests.
 | Host | Build (Docker) | Run (`scripts/vm.sh`) |
 | --- | --- | --- |
 | Mac, Apple Silicon | native arm64 containers | Lima VM, `vm/rpi5dv.yaml` |
-| Linux aarch64 (e.g. an Ampere box, or the Pi itself) | native | natively, if `/dev/udmabuf` exists (`sudo modprobe udmabuf`) |
+| Linux aarch64 (e.g. an Ampere box, or the Pi itself) | natively: `scripts/install-native-deps.sh` once, then `build-all.sh` (no Docker) | natively, if `/dev/udmabuf` exists (`sudo modprobe udmabuf`) |
 | x86-64 | works under QEMU emulation (`docker run --privileged --rm tonistiigi/binfmt --install arm64`), slowly | not supported (no fast aarch64 VM) |
 
 ## macOS (Apple Silicon)

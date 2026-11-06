@@ -1,7 +1,7 @@
 From a518d010d395203f1cc5d67895a90def244a2689 Mon Sep 17 00:00:00 2001
 From: Bryan Hoban <bryan.hoban@gmail.com>
 Date: Fri, 6 Nov 2026 11:47:52 -0500
-Subject: [PATCH 5/6] yblod-engine-vk: portable shaders need no shaderInt16
+Subject: [PATCH 5/7] yblod-engine-vk: portable shaders need no shaderInt16
  either
 
 Mesa 25.0.7 (Raspberry Pi OS trixie) reports shaderInt16 = false on the

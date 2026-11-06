@@ -4,7 +4,8 @@
 # hardware HEVC decoder (V4L2 request, SAND128).
 #
 #   ./run-bench.sh [options] CLIP...
-#     --frames N        pictures per run (default 48)
+#     --frames N        pictures per run (default 12: the decoder's 32-buffer pool
+#                       limits hardware-decode runs to 12 held pictures)
 #     --throughput S    seconds of flat-out rendering per engine (default 20)
 #     --repeat N        performance runs per engine, engine order alternating (default 3)
 #     --play S          seconds of real-time playback per engine (default 30; 0 skips)
@@ -21,15 +22,18 @@
 #      first, clocks / temperature / throttling recorded around every run
 #   3. real-time playback: decoding on its own thread, rendering on the
 #      stream's frame clock; pictures that missed their display deadline
-#   4. the Vulkan engine's per-stage GPU times (DVVK_PROFILE)
-#   5. the same from software decoding, for reference
+#   4. the Vulkan engine's per-stage GPU times (DVVK_PROFILE), and the V3D
+#      compiler's statistics for every shader both engines use (threads,
+#      register spills: shader-stats.txt per clip)
+#   5. the same from software decoding, for reference, with linear P010 and
+#      with SAND input (the difference is the SAND conversion's cost)
 # Writes DIR/system.txt, a log and JSON per run, DIR/summary.txt and
 # DIR/table.txt (medians over repeats). Send the whole directory back.
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 export LD_LIBRARY_PATH="$HERE/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 BENCH="$HERE/bin/dvbench"
-FRAMES=48 THROUGHPUT=20 REPEAT=3 PLAY=30 SW=1 QUICK=0 OUT=
+FRAMES=12 THROUGHPUT=20 REPEAT=3 PLAY=30 SW=1 QUICK=0 OUT=
 CLIPS=()
 while [ $# -gt 0 ]; do
   case $1 in
@@ -68,6 +72,15 @@ if [ -n "$GOV_FILES" ] && [ "$GOV_BEFORE" != performance ]; then
   fi
 fi
 
+# The decoder's pictures live in CMA; Raspberry Pi OS's default (64 MB on some
+# boards) is too small for 4K HEVC plus a Profile 7 EL.
+CMA_MB=$(awk '/CmaTotal/ {print int($2 / 1024)}' /proc/meminfo)
+CMA_NOTE="CMA ${CMA_MB:-?} MB"
+if [ "${CMA_MB:-0}" -lt 256 ]; then
+  CMA_NOTE="$CMA_NOTE: WARNING, too small for 4K decoding; add  dtoverlay=vc4-kms-v3d,cma-512  to /boot/firmware/config.txt and reboot"
+  echo "$CMA_NOTE"
+fi
+
 snapshot() { # one line: time, temperature, throttle flags, clocks
   local t=$(vcgencmd measure_temp 2>/dev/null | cut -d= -f2)
   local th=$(vcgencmd get_throttled 2>/dev/null | cut -d= -f2)
@@ -83,6 +96,7 @@ snapshot() { # one line: time, temperature, throttle flags, clocks
   echo "== memory"; free -m
   echo "== v3d render node: ${NODE:-NOT FOUND}"; ls -l /dev/dri
   echo "== $GOV_NOTE"
+  echo "== $CMA_NOTE"
   echo "== start: $(snapshot)"
   echo "== cooling"; ls /sys/devices/platform/cooling_fan* -d 2>/dev/null || echo "no fan device found: use an active cooler, the Pi 5 throttles at 80-85C"
   echo "== dmabuf allocators"; ls -l /dev/udmabuf /dev/dma_heap 2>&1
@@ -161,14 +175,26 @@ for clip in "${CLIPS[@]}"; do
 
   # 4. Where the Vulkan engine's GPU time goes (GPU timestamps, reported every
   # 120 frames of the throughput run).
-  DVVK_PROFILE=1 bench "$OUT/$tag-vk-profile.log" "${hw[@]}" --engines vk --frames 24 --throughput 15 "$clip"
+  DVVK_PROFILE=1 DVVK_PROFILE_WINDOW=24 bench "$OUT/$tag-vk-profile.log" "${hw[@]}" --engines vk \
+    --frames "$FRAMES" --throughput 15 "$clip"
   grep "^dvvk profile" "$OUT/$tag-vk-profile.log" | tail -2 | sed 's/^/   /'
+
+  # The V3D compiler's view of every shader (caches off so all compile).
+  cache=$(mktemp -d)
+  V3D_DEBUG=shaderdb DVVK_PIPELINE_PROFILE=1 MESA_SHADER_CACHE_DISABLE=true XDG_CACHE_HOME="$cache" \
+    bench "$OUT/$tag-shaderdb.log" "${hw[@]}" --frames 2 --warmup 0 "$clip"
+  rm -rf "$cache"
+  python3 "$HERE/shader-stats.py" "$OUT/$tag-shaderdb.log" >"$OUT/$tag-shader-stats.txt"
+  echo "   shaders (instructions, threads, spills): $OUT/$tag-shader-stats.txt"
+  grep -E "SPILLS|1 thread|2 threads" "$OUT/$tag-shader-stats.txt" | head -8 | sed 's/^/     /'
 
   # 5. Software decoding, for reference (once, both engines).
   if [ $SW = 1 ]; then
-    bench "$OUT/$tag-sw.log" --source sw --layout sand --frames "$FRAMES" --throughput "$THROUGHPUT" \
-      --json "$OUT/$tag-sw.json" "$clip"
-    grep -E "^(decode|cb1 |yblod)" "$OUT/$tag-sw.log" | sed 's/^/   sw  /'
+    for layout in sand p010; do
+      bench "$OUT/$tag-sw-$layout.log" --source sw --layout $layout --frames "$FRAMES" --throughput "$THROUGHPUT" \
+        --json "$OUT/$tag-sw-$layout.json" "$clip"
+      grep -E "^(cb1 |yblod)" "$OUT/$tag-sw-$layout.log" | sed "s/^/   sw $layout  /"
+    done
   fi
 done | tee "$OUT/summary.txt"
 echo "== end: $(snapshot)" >>"$OUT/system.txt"

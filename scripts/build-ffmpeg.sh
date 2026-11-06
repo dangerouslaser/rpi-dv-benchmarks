@@ -4,8 +4,9 @@
 # FFmpeg patches (a superset of yblod's three metadata patches, byte-identical).
 # Runs inside the build container.
 set -euo pipefail
-TP=/work/third_party
-SRC=/work/build/ffmpeg-src
+W=${WORK:-/work}   # this repo: /work in the build container, the checkout natively
+TP=$W/third_party
+SRC=$W/build/ffmpeg-src
 LE=$TP/cb1/packages/multimedia/ffmpeg/patches
 DV=$TP/cb1/projects/Generic/patches/ffmpeg
 
@@ -20,7 +21,7 @@ if [ ! -f "$SRC/.patched" ]; then
   touch "$SRC/.patched"
 fi
 
-mkdir -p /work/build/ffmpeg && cd /work/build/ffmpeg
+mkdir -p $W/build/ffmpeg && cd $W/build/ffmpeg
 if [ ! -f config.h ]; then
   "$SRC/configure" --prefix="$PREFIX" \
     --cpu=cortex-a76 --arch=aarch64 --target-os=linux \

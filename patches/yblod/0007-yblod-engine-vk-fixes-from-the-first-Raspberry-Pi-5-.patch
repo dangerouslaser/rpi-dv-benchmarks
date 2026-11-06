@@ -1,0 +1,156 @@
+From 35926f7cdb97dff329a258d5a9bec976d04ee6eb Mon Sep 17 00:00:00 2001
+From: Bryan Hoban <bryan.hoban@gmail.com>
+Date: Fri, 6 Nov 2026 13:10:06 -0500
+Subject: [PATCH 7/7] yblod-engine-vk: fixes from the first Raspberry Pi 5 run
+
+Found by the first run on a Pi 500 (Raspberry Pi OS trixie, Mesa 26.2.2):
+
+- dmabuf import: v3dv pads every buffer requirement by its 64-byte TFU
+  read-ahead, so a buffer covering a whole dmabuf needs more memory than the
+  dmabuf has and the import failed. SAND buffers are now sized to the bytes
+  the unpack reads (the padding then fits the decoder's page slack), and the
+  import allocates exactly the requirement (a dedicated allocation must
+  match it). A requirement beyond the dmabuf (a producer with no room)
+  falls back to the dmabuf's size, with a warning: outside the spec but
+  harmless, compute never touches the padding.
+- Startup: v3dv can't export timeline semaphores; the timeline falls back
+  to a plain one (only dvvk_timelines, i.e. Wayland's drm-syncobj, needs
+  the export).
+- DVVK_PROFILE_WINDOW: frames per DVVK_PROFILE report (default 120), so
+  slow devices print within a short run.
+
+Clean under the Khronos validation layer; outputs unchanged on lavapipe.
+---
+ yblod-engine/vk/src/engine.rs         | 33 ++++++++++++++++++++++-----
+ yblod-engine/vk/src/interop/dmabuf.rs | 26 ++++++++++++++++++---
+ yblod-engine/vk/src/interop/va.rs     | 20 +++++++++++++++-
+ 3 files changed, 69 insertions(+), 10 deletions(-)
+
+diff --git a/yblod-engine/vk/src/engine.rs b/yblod-engine/vk/src/engine.rs
+index 78ecb2e..9b669f8 100644
+--- a/yblod-engine/vk/src/engine.rs
++++ b/yblod-engine/vk/src/engine.rs
+@@ -665,6 +665,15 @@ const PROFILE_POINTS: u32 = 4;
+ const PROFILE_FEL_POINTS: u32 = 11;
+ const PROFILE_TOTAL_POINTS: u32 = 11; // 7: reconstruction entry, 8: overlay entry, 9: bounds end, 10: FEL dispatch
+ const PROFILE_WINDOW: usize = 120;
++
++/// Frames per DVVK_PROFILE report: DVVK_PROFILE_WINDOW, default 120 (slow
++/// devices, e.g. a Pi 5 at a few fps, want a smaller window).
++fn profile_window() -> usize {
++    static W: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
++    *W.get_or_init(|| {
++        std::env::var("DVVK_PROFILE_WINDOW").ok().and_then(|v| v.parse().ok()).filter(|&n| n > 0).unwrap_or(PROFILE_WINDOW)
++    })
++}
+ // cb1_tiles.comp: CB1's overlay occupancy per 32x32 tile.
+ const CB1_TILE: u32 = 32;
+ const CB1_TILES: (u32, u32) = (CANVAS_W.div_ceil(CB1_TILE), CANVAS_H.div_ceil(CB1_TILE));
+@@ -696,7 +705,7 @@ impl Profile {
+         if let Some(f) = fel {
+             self.fel.push(f);
+         }
+-        if self.stages.len() < PROFILE_WINDOW {
++        if self.stages.len() < profile_window() {
+             return;
+         }
+         if !self.fel.is_empty() {
+@@ -1146,11 +1155,23 @@ impl Engine {
+             vk::SemaphoreTypeCreateInfo::default().semaphore_type(vk::SemaphoreType::TIMELINE).initial_value(0);
+         let mut export =
+             vk::ExportSemaphoreCreateInfo::default().handle_types(vk::ExternalSemaphoreHandleTypeFlags::OPAQUE_FD);
+-        let mut timeline_info = vk::SemaphoreCreateInfo::default().push_next(&mut type_info);
+-        if d.semaphore_fd.is_some() {
+-            timeline_info = timeline_info.push_next(&mut export);
+-        }
+-        let timeline = unsafe { d.device.create_semaphore(&timeline_info, None) }?;
++        // Exportable (opaque fd) only for dvvk_timelines (Wayland's
++        // linux-drm-syncobj); v3dv can't export timelines: a plain one then.
++        let plain = vk::SemaphoreCreateInfo::default().push_next(&mut type_info);
++        let timeline = match d.semaphore_fd.is_some().then(|| unsafe {
++            let mut type_info =
++                vk::SemaphoreTypeCreateInfo::default().semaphore_type(vk::SemaphoreType::TIMELINE).initial_value(0);
++            d.device.create_semaphore(
++                &vk::SemaphoreCreateInfo::default().push_next(&mut type_info).push_next(&mut export),
++                None,
++            )
++        }) {
++            Some(Ok(s)) => s,
++            _ => {
++                eprintln!("dv-engine-vk: timeline semaphore not exportable here: no dvvk_timelines");
++                unsafe { d.device.create_semaphore(&plain, None) }?
++            }
++        };
+         construction.watch(&timeline);
+         if crate::fault::hit("construct-final") {
+             return Err(Error::Vk(vk::Result::ERROR_UNKNOWN));
+diff --git a/yblod-engine/vk/src/interop/dmabuf.rs b/yblod-engine/vk/src/interop/dmabuf.rs
+index cf81db0..785367b 100644
+--- a/yblod-engine/vk/src/interop/dmabuf.rs
++++ b/yblod-engine/vk/src/interop/dmabuf.rs
+@@ -77,9 +77,29 @@ fn import_memory(
+     let owned = dup(fd)?;
+     let mut import = vk::ImportMemoryFdInfoKHR::default().handle_type(handle).fd(owned);
+     let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().image(image).buffer(buffer);
+-    // The dmabuf may be larger than this image needs (another plane follows).
+-    let size = unsafe { libc::lseek(fd, 0, libc::SEEK_END) };
+-    let size = if size > 0 { (size as u64).max(requirements.size) } else { requirements.size };
++    // Exactly the requirement (a dedicated allocation must match it), which
++    // may be less than the dmabuf (another plane follows). Never more than the
++    // dmabuf holds: v3dv pads every requirement by its 64-byte TFU read-ahead
++    // and an import larger than the dmabuf fails. Callers size resources so the
++    // padding fits; a producer that leaves no room (a buffer exactly as large as
++    // its dmabuf) gets the dmabuf's size, outside the spec but working: compute
++    // never touches the padding.
++    let fd_size = unsafe { libc::lseek(fd, 0, libc::SEEK_END) };
++    let size = if fd_size > 0 && requirements.size > fd_size as u64 {
++        let fd_size = fd_size as u64;
++        {
++            static WARNED: std::sync::Once = std::sync::Once::new();
++            WARNED.call_once(|| {
++                eprintln!(
++                    "dv-engine-vk: importing a dmabuf of {fd_size} bytes for a requirement of {} (driver padding)",
++                    requirements.size
++                )
++            });
++        }
++        fd_size
++    } else {
++        requirements.size
++    };
+     let info = vk::MemoryAllocateInfo::default()
+         .allocation_size(size)
+         .memory_type_index(index)
+diff --git a/yblod-engine/vk/src/interop/va.rs b/yblod-engine/vk/src/interop/va.rs
+index d4c30b0..fd398d0 100644
+--- a/yblod-engine/vk/src/interop/va.rs
++++ b/yblod-engine/vk/src/interop/va.rs
+@@ -386,9 +386,27 @@ impl ExportedSurface {
+                 unsafe { libc::close(f) };
+             }
+         };
++        // Bytes each object is read to: per plane on it, from the plane's
++        // offset, (columns - 1) whole columns plus the plane's rows of the last
++        // one. Not the object's size: v3dv pads buffer requirements by 64 bytes,
++        // which must still fit in the dmabuf.
++        let column = sand128_column_height(desc.objects[0].drm_format_modifier).unwrap_or(0);
++        let columns = width.div_ceil(96) as u64;
++        let mut used = [0u64; 2];
++        for p in 0..2 {
++            let l = &desc.layers[p];
++            let colh = if column != 0 { column } else { l.pitch[0] } as u64;
++            let rows = if p == 0 { height } else { height / 2 } as u64;
++            let end = l.offset[0] as u64 + (columns - 1) * 128 * colh + rows * 128;
++            let o = l.object_index[0] as usize;
++            if o < 2 {
++                used[o] = used[o].max(end);
++            }
++        }
+         let mut buffers: Vec<dmabuf::ImportedBuffer> = Vec::new();
+         for (i, o) in desc.objects[..n].iter().enumerate() {
+-            match dmabuf::import_buffer(d, fds[i], o.size as u64) {
++            let size = if used[i] > 0 { used[i].min(o.size as u64) } else { o.size as u64 };
++            match dmabuf::import_buffer(d, fds[i], size) {
+                 Ok(b) => buffers.push(b),
+                 Err(e) => {
+                     for b in &buffers {

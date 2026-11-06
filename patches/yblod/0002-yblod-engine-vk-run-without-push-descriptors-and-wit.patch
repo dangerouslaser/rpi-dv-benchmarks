@@ -1,7 +1,7 @@
 From 107beb3272b778a41b9f1d768590635eb3ef4691 Mon Sep 17 00:00:00 2001
 From: Bryan Hoban <bryan.hoban@gmail.com>
 Date: Fri, 6 Nov 2026 10:47:33 -0500
-Subject: [PATCH 2/6] yblod-engine-vk: run without push descriptors and without
+Subject: [PATCH 2/7] yblod-engine-vk: run without push descriptors and without
  VAAPI (Raspberry Pi 5)
 
 - VK_KHR_push_descriptor is optional: without it (v3dv) each dispatch binds a

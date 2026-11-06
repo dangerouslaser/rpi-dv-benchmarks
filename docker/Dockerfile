@@ -4,13 +4,9 @@
 # runs without the Pi; performance numbers come only from the Pi itself.
 FROM --platform=linux/arm64 debian:trixie
 
+COPY packages.txt /tmp/packages.txt
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-      build-essential cmake ninja-build meson pkg-config git curl ca-certificates xz-utils patch \
-      python3 python3-jinja2 python3-markupsafe \
-      glslc spirv-tools \
-      libdrm-dev libgbm-dev libegl-dev libgles-dev libudev-dev libva-dev \
-      libvulkan-dev vulkan-tools mesa-vulkan-drivers libegl-mesa0 libgl1-mesa-dri libgbm1 \
-      zlib1g-dev \
+      $(grep -v '^#' /tmp/packages.txt) \
     && rm -rf /var/lib/apt/lists/*
 
 ENV RUSTUP_HOME=/opt/rustup PATH=/opt/cargo/bin:$PATH

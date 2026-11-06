@@ -5,6 +5,11 @@ on the same decoded pictures. No Kodi, no display, no audio.
 
 ## Setup (Raspberry Pi OS trixie, 64-bit)
 
+The decoder needs more contiguous memory than the default (64 MB on some
+boards): add `dtoverlay=vc4-kms-v3d,cma-512` to `/boot/firmware/config.txt`
+(replacing the existing `vc4-kms-v3d` line) and reboot. `run-bench.sh` warns
+if CMA is under 256 MB.
+
 ```sh
 sudo apt install mesa-vulkan-drivers libvulkan1 libegl1 libgles2 vulkan-tools mesa-utils-bin v4l-utils
 tar xzf dvbench-rpi5-*.tar.gz && cd dvbench-rpi5-*

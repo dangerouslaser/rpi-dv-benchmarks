@@ -1,7 +1,7 @@
 From 46d69fcd4d58a43d5dd6663abea2601f83191954 Mon Sep 17 00:00:00 2001
 From: Bryan Hoban <bryan.hoban@gmail.com>
 Date: Fri, 6 Nov 2026 12:32:28 -0500
-Subject: [PATCH 6/6] yblod-engine-vk: no integer division in the Pi's
+Subject: [PATCH 6/7] yblod-engine-vk: no integer division in the Pi's
  per-sample paths
 
 V3D has no integer divider: a runtime divisor becomes a software division,

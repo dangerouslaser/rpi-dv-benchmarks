@@ -14,7 +14,7 @@ Everything below runs on aarch64 today; only the Pi's own hardware paths
 | --- | --- |
 | FFmpeg 9.0, LibreELEC RPi5 config (`rpi` patch, V4L2 request HEVC, SAND) + CB1's DV patches | builds; all 14 patches apply |
 | libplacebo e2972fd + CB1's 21 patches; CB1 `dvbridge_core` (CroqueMr RC3 00615a5) | builds; ABI probes pass |
-| yblod Vulkan engine (libreelec-yblod 0.3.3 + `patches/yblod/`, 6 commits) | builds; `cargo test` 34/34; C CPU tests 4/4 |
+| yblod Vulkan engine (libreelec-yblod 0.3.3 + `patches/yblod/`, 7 commits) | builds; `cargo test` 34/34; C CPU tests 4/4 |
 | `dvbench` (port of `dvvk-mr-compare` to DRM PRIME frames) | runs both engines in a Debian arm64 VM (lavapipe / llvmpipe) |
 | Pi bundle `out/dvbench-rpi5-*.tar.gz` + `run-bench.sh` | self-contained; smoke-tested in the VM |
 
@@ -135,6 +135,37 @@ validation layer. Core validation is proven to fire (planted misaligned
 fill); synchronization validation is enabled but did not report a planted
 transfer->dispatch hazard on lavapipe with layers 1.4.309, so it is not
 relied on.
+
+## First Pi run (2026-11, Pi 500, RPi OS trixie, Mesa 26.2.2)
+
+Hardware decode works; CB1 == Vulkan byte for byte on all three clips (12/12).
+Decode 33-63 fps. Per picture: CB1 63-124 ms, Vulkan 297-737 ms (~5x slower).
+Vulkan GPU time: pack 251-385 ms, reconstruction 40 ms (P5/MEL) / 344 ms
+(FEL: chroma 174, luma_phase_guide 105, vertical_pair 11, phase_vertical_uv 6).
+
+Fixes it needed, now in the repo: dmabuf import vs v3dv's 64-byte requirement
+padding (patch 0007), non-exportable timeline semaphore (0007), the decoder's
+32-buffer pool (bench caps hardware preloads at 12), CMA (needs
+`dtoverlay=vc4-kms-v3d,cma-512`; run-bench warns), native builds on the Pi
+(`scripts/install-native-deps.sh`, then `build-all.sh` runs without Docker).
+
+Leading explanations for the gap, from Mesa's V3D compiler (to confirm with
+the per-shader stats run-bench now collects, `*-shader-stats.txt`):
+
+- **No on-chip shared memory**: `load_shared`/`store_shared` are ordinary TMU
+  memory accesses on V3D. The engine's tiled passes (pack's EL/chroma/GUI
+  tiles, fel_chroma's EL tile) stage data through shared memory with
+  barriers, a win on desktop GPUs and pure extra traffic here.
+- **Register pressure**: V3D runs 4/2/1 threads per QPU depending on a
+  shader's registers, and only threads hide memory latency; big shaders
+  (pack, fel_chroma with emulated 64-bit maths) may drop to 1 thread or
+  spill. `V3D_DEBUG=shaderdb` shows threads and spills per pipeline.
+- **Scalar 16-bit loads**: every `uint16_t` SSBO element is its own TMU
+  access; CB1 reads the same planes as textures (TMU texture path, cached,
+  4 samples per gather) and writes through the tile buffer.
+
+CB1's own time: the bench now times its SAND->P010 GLES pass separately, and
+the software-decode reference runs P010 and SAND input for both engines.
 
 ## Untested until the board arrives
 

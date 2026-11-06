@@ -122,7 +122,9 @@ struct out_buf {
 static int out_alloc(struct out_buf *o)
 {
     o->stride = W * 4;
-    if (dv_dmabuf_alloc(&o->buf, (size_t)o->stride * H))
+    /* A page more than the picture: drivers pad buffer requirements (v3dv:
+     * a 64-byte read-ahead), which must fit in the dmabuf. */
+    if (dv_dmabuf_alloc(&o->buf, (size_t)o->stride * H + 4096))
         return -1;
     o->fd = o->buf.fd;
     return 0;
@@ -472,6 +474,9 @@ static struct dvbridge_renderer *g_cb1;
 static pl_tex g_target;
 static dvvk_engine *g_vke;
 static int g_profile, g_fel = 1, g_contract = 1;
+/* Per-picture mode: time CB1's SAND unpack on its own (GPU finished around it). */
+static int g_time_unpack;
+static double g_unpack_ms;
 
 /* CB1 renders picture q (Master Reference) into its target; GL work queued,
  * not finished. 1 on success. */
@@ -483,9 +488,18 @@ static int cb1_render(const struct dv_picture *q, double pts)
     struct cb1_input *bi = cb1_input(g_gl->gpu, q->bl), *ei = el ? cb1_input(g_gl->gpu, el) : NULL;
     if (!bi || (el && !ei))
         return 0;
+    double u0 = 0;
+    if (g_time_unpack && bi->sand) {
+        glFinish();
+        u0 = now_ms();
+    }
     cb1_unpack(bi);
     if (ei)
         cb1_unpack(ei);
+    if (g_time_unpack && bi->sand) {
+        glFinish();
+        g_unpack_ms = now_ms() - u0;
+    }
     struct dvbridge_gl_frame bl = bi->frame, elf = {0};
     dvbridge_gl_frame_set_chroma(&bl, cb1_chroma(q->bl->chroma_location, g_profile));
     bl.frame.enhancement_layer = NULL;
@@ -757,8 +771,14 @@ int main(int argc, char **argv)
                         "[--throughput S] [--hash] [--json FILE] FILE\n");
         return 2;
     }
+    /* The Pi's HEVC decoder has at most 32 capture buffers (Raspberry Pi OS
+     * kernel) and the bench holds every preloaded picture: keep it under. */
+    if (so.kind == DV_SOURCE_V4L2 && frames > 12) {
+        fprintf(stderr, "dvbench: --frames %d -> 12 (the hardware decoder's buffer pool)\n", frames);
+        frames = 12;
+    }
     if (warmup >= frames)
-        warmup = 0;
+        warmup = frames > 4 ? 2 : 0;
     /* CB1's SAND input holds an EGL image (an fd) per 128-byte column, per
      * plane, per decoded buffer: thousands, beyond the usual 1024. */
     struct rlimit nofile;
@@ -766,7 +786,7 @@ int main(int argc, char **argv)
         nofile.rlim_cur = nofile.rlim_max;
         setrlimit(RLIMIT_NOFILE, &nofile);
     }
-    so.extra_frames = frames + 8;
+    so.extra_frames = so.kind == DV_SOURCE_V4L2 ? frames + 2 : frames + 8;
 
     /* 1. Decode: every picture first, timed, held for the engines. */
     struct dv_source *src = dv_source_open(file, &so);
@@ -891,7 +911,8 @@ int main(int argc, char **argv)
         if ((engine == 0 && !run_cb1) || (engine == 1 && !run_vk))
             continue;
         const char *name = engine == 0 ? "cb1" : "yblod-vulkan";
-        int timed = 0, failed = 0;
+        int timed = 0, failed = 0, unpacks = 0;
+        double *unpack_times = calloc((size_t)count, sizeof(double));
         for (int i = 0; i < count; i++) {
             struct dv_picture *q = &pics[i];
             double pts = i * period;
@@ -899,8 +920,13 @@ int main(int argc, char **argv)
             const struct out_buf *out = engine == 0 ? &cb_out : &vk_out[0];
             double t0 = now_ms();
             if (engine == 0) {
+                g_time_unpack = 1;
+                g_unpack_ms = -1;
                 ok = cb1_render(q, pts);
+                g_time_unpack = 0;
                 glFinish();
+                if (ok && i >= warmup && g_unpack_ms >= 0)
+                    unpack_times[unpacks++] = g_unpack_ms;
             } else {
                 uint64_t ticket = 0;
                 ok = vk_submit(q, pts, i, 0, &ticket) && vk.wait(vke, ticket, 10000000000ull) == 1;
@@ -921,6 +947,11 @@ int main(int argc, char **argv)
         printf("%-13s per picture: median %.2f ms, p95 %.2f, mean %.2f (%d pictures%s), %.1f fps%s\n", name, s.median,
                s.p95, s.mean, s.n, warmup ? " after warmup" : "", s.median > 0 ? 1e3 / s.median : 0,
                failed ? " FAILURES" : "");
+        struct stats us = summarize(unpack_times, unpacks);
+        if (unpacks)
+            printf("%-13s of which the bench's SAND->P010 GLES pass: median %.2f ms (CB1 itself: %.2f ms)\n", name,
+                   us.median, s.median - us.median);
+        free(unpack_times);
         if (failed) {
             printf("%-13s %d pictures failed\n", name, failed);
             status = 1;
@@ -929,6 +960,8 @@ int main(int argc, char **argv)
             fprintf(js, "%s\"%s\": {\"median_ms\": %.3f, \"p95_ms\": %.3f, \"mean_ms\": %.3f, \"timed\": %d, "
                         "\"failed\": %d",
                     first_engine ? "" : ", ", name, s.median, s.p95, s.mean, s.n, failed);
+            if (unpacks)
+                fprintf(js, ", \"sand_unpack_ms\": %.3f", us.median);
             first_engine = 0;
         }
 
