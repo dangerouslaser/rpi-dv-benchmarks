@@ -25,6 +25,8 @@ git clone <this repo> && cd librelec-rpi5-dv
 ./scripts/vm-setup.sh       # create the VM from vm/rpi5dv.yaml, provision it, verify dmabuf import
 scripts/vm.sh tests/check.sh    # all byte-identical checks (needs clips/, below)
 scripts/vm.sh tests/check.sh --validate   # plus the Pi configuration under the Vulkan validation layer
+scripts/in-docker.sh bash scripts/build-mesa-shim.sh mesa      # once: Mesa's V3D compiler (as on the Pi)
+DVVK_PREPARE_VARIANTS=1 scripts/shader-stats.sh mesa           # V3D threads/registers/spills per pipeline, no Pi
 ```
 
 `scripts/vm-setup.sh` is idempotent. `--recreate` deletes and rebuilds the VM

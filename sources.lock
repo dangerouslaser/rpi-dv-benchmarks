@@ -5,3 +5,8 @@ x86dvvk           https://github.com/dangerouslaser/intel-dv-libreelec.git 36246
 cb1               https://github.com/CroqueMr/libreelec-x86-DV.git         00615a5a5ea02a49acde5fa992b19ee64065ab25
 ffmpeg            https://ffmpeg.org/releases/ffmpeg-9.0.tar.xz            7f607a00dd0d28a729d5a4811205812eef01cf6ef6155025febb6f36a9062d52
 libplacebo        https://github.com/haasn/libplacebo.git                  e2972fdd09adacd383656738d7d280f0cd84a761
+# Mesa, built only by scripts/build-mesa-shim.sh: the V3D compiler offline
+# (drm-shim) for shader statistics without a Pi. "mesa": as on the Pi (RPi OS
+# trixie 26.2.2); "mesa-main": 27.0-devel, to measure its V3D compiler changes.
+mesa              https://gitlab.freedesktop.org/mesa/mesa.git             3281a69a8bfd9f997e91c15ed0e6290cae12dd32
+mesa-main         https://gitlab.freedesktop.org/mesa/mesa.git             09e600cd279bfab8d323cedf2fbd07888519458e

@@ -71,15 +71,17 @@ def main(out):
 
     plays = []
     for path in sorted(glob.glob(os.path.join(out, "*-play-*.json"))):
-        m = re.match(r"(.+)-play-(cb1|vk)\.json$", os.path.basename(path))
+        m = re.match(r"(.+)-play-(.+)\.json$", os.path.basename(path))
+        if not m:
+            continue
         try:
             data = json.load(open(path))
         except (OSError, ValueError):
             continue
-        name = "cb1" if m.group(2) == "cb1" else "yblod-vulkan"
-        e = data.get("engines", {}).get(name, {})
+        engines = data.get("engines", {})
+        e = next(iter(engines.values()), {})
         if "play_shown" in e:
-            plays.append((m.group(1), name, e, throttled(path[:-5] + ".log")))
+            plays.append((m.group(1), m.group(2), e, throttled(path[:-5] + ".log")))
     if plays:
         print(f"\nreal-time playback (decode thread + stream frame clock)")
         print(f"{'clip':34} {'engine':13} {'shown':>6} {'late':>5} {'late %':>7} {'worst ms':>9} "
@@ -91,5 +93,30 @@ def main(out):
                   f"{e['play_decode_stalls']:>13} {e['play_cpu_ms']:>9.2f}  {'throttled' if hot else ''}")
 
 
+def options(out):
+    rows = {}
+    for path in sorted(glob.glob(os.path.join(out, "*-opt-*.json"))):
+        m = re.match(r"(.+)-opt-(.+)\.json$", os.path.basename(path))
+        try:
+            data = json.load(open(path))
+        except (OSError, ValueError):
+            continue
+        e = next(iter(data.get("engines", {}).values()), {})
+        rows.setdefault(m.group(1), []).append((m.group(2), e.get("median_ms", 0), e.get("failed", 0),
+                                                 throttled(path[:-5] + ".log")))
+    if not rows:
+        return
+    print("\noptions, per picture (median ms; lower is better)")
+    for tag, opts in rows.items():
+        print(f"  {tag}")
+        base = {n: ms for n, ms, _, _ in opts}
+        for name, ms, failed, hot in opts:
+            ref = base.get("vk-annexb") if name.startswith("vk") else base.get("cb1-master")
+            rel = f"{100 * ms / ref:6.0f}%" if ref and ms else "       "
+            note = ("FAILED " if failed or not ms else "") + ("throttled" if hot else "")
+            print(f"    {name:22} {ms:9.2f} {rel}  {note}")
+
+
 if __name__ == "__main__":
     main(sys.argv[1] if len(sys.argv) > 1 else ".")
+    options(sys.argv[1] if len(sys.argv) > 1 else ".")

@@ -19,4 +19,4 @@ if [ "${DV_NATIVE:-}" = 1 ] || { [ "$(uname -s)" = Linux ] && [ "$(uname -m)" = 
 fi
 docker image inspect rpi5-dv-build >/dev/null 2>&1 || docker build -t rpi5-dv-build "$ROOT/docker"
 exec docker run --rm ${DOCKER_TTY:-} -v "$ROOT":/work -v "$ROOT/build/prefix":/opt/dv \
-  -e DV_THREADS rpi5-dv-build "$@"
+  -e DV_THREADS ${DOCKER_ENV:-} rpi5-dv-build "$@"

@@ -14,6 +14,13 @@
  *     --start S          seek to S seconds first
  *     --fel 0|1          give both engines the EL (default 1)
  *     --yblod            Vulkan engine as YBLOD runs it, not CB1's contract
+ *     --el-scaler S      Vulkan engine's FEL EL upscale: annexb (default, as
+ *                        Master Reference) or bilinear (cheaper)
+ *     --cb1-mode M       CB1: master (Master Reference, default) or reference
+ *                        (its performance mode; output not comparable byte
+ *                        for byte with the Vulkan engine's)
+ *     --cb1-fel F        CB1 reference mode's FEL EL filter: default,
+ *                        bilinear, reference
  *     --throughput S     then each engine flat out over the decoded pictures
  *                        for S seconds, pipelined as in playback
  *     --play S           then real-time playback for S seconds: a decoding
@@ -474,6 +481,14 @@ static struct dvbridge_renderer *g_cb1;
 static pl_tex g_target;
 static dvvk_engine *g_vke;
 static int g_profile, g_fel = 1, g_contract = 1;
+/* The Vulkan engine's FEL EL upscale: 1 Annex B (Master Reference) or 2
+ * bilinear (the cheaper compromise). */
+static unsigned g_el_scaler = 1;
+/* CB1: 0 Master Reference (bit-exact, its exact EL filter), 1 Reference
+ * (CB1's performance mode, dvbridge_render_packed) with g_cb1_fel as its FEL
+ * EL filter (DVBRIDGE_FEL_DEFAULT / BILINEAR / REFERENCE). */
+static int g_cb1_mode;
+static enum dvbridge_fel_filter g_cb1_fel = DVBRIDGE_FEL_DEFAULT;
 /* Per-picture mode: time CB1's SAND unpack on its own (GPU finished around it). */
 static int g_time_unpack;
 static double g_unpack_ms;
@@ -513,7 +528,15 @@ static int cb1_render(const struct dv_picture *q, double pts)
     dvbridge_renderer_set_optimized_dv(g_cb1, true);
     dvbridge_renderer_set_processing_optimizations(g_cb1, false);
     dvbridge_renderer_set_overlay_visible(g_cb1, false);
-    int ok = dvbridge_render_master_reference(g_cb1, &bl.frame, q->dovi->data, q->dovi->size, pts,
+    int ok;
+    if (g_cb1_mode == 1) {
+        while (glGetError() != GL_NO_ERROR)
+            ;   /* the packed path refuses to start with a pending GL error */
+        dvbridge_renderer_set_fel_filter(g_cb1, g_cb1_fel);
+        ok = dvbridge_render_packed(g_cb1, &bl.frame, q->dovi->data, q->dovi->size, pts, el ? pts : NAN, g,
+                                    g_target, false);
+    } else
+        ok = dvbridge_render_master_reference(g_cb1, &bl.frame, q->dovi->data, q->dovi->size, pts,
                                               el ? pts : NAN, g, g_target, false, NULL) == CB1_MASTER_READY;
     if (ok)
         dvbridge_render_commit(g_cb1);
@@ -534,7 +557,7 @@ static int vk_submit(const struct dv_picture *q, double pts, long i, unsigned sl
         return 0;
     int top_left = cb1_chroma(q->bl->chroma_location, g_profile) == PL_CHROMA_TOP_LEFT;
     dvvk_frame f = {.plan = {.width = w, .height = h, .x = x, .y = y, .dw = w, .dh = h,
-                             .chroma_top_left = (uint32_t)top_left, .has_el = el != NULL, .el_scaler = 1,
+                             .chroma_top_left = (uint32_t)top_left, .has_el = el != NULL, .el_scaler = g_el_scaler,
                              .fel = (uint32_t)g_fel, .packet_id = 0, .refresh = i == 0,
                              .pts = (int64_t)(pts * 1e6), .white_nits = 203.0, .cb1_contract = (uint32_t)g_contract},
                     .bl_surface = bl_id, .el_surface = el_id, .metadata = q->dovi->data,
@@ -747,6 +770,16 @@ int main(int argc, char **argv)
             fel = atoi(argv[++i]);
         else if (!strcmp(a, "--yblod"))
             contract = 0;
+        else if (!strcmp(a, "--cb1-mode") && v)
+            g_cb1_mode = !strcmp(argv[++i], "reference");
+        else if (!strcmp(a, "--cb1-fel") && v) {
+            const char *e = argv[++i];
+            g_cb1_fel = !strcmp(e, "bilinear") ? DVBRIDGE_FEL_BILINEAR
+                      : !strcmp(e, "reference") ? DVBRIDGE_FEL_REFERENCE : DVBRIDGE_FEL_DEFAULT;
+        } else if (!strcmp(a, "--el-scaler") && v) {
+            const char *e = argv[++i];
+            g_el_scaler = !strcmp(e, "bilinear") ? 2 : 1;
+        }
         else if (!strcmp(a, "--throughput") && v)
             throughput = atof(argv[++i]);
         else if (!strcmp(a, "--play") && v)

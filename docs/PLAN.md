@@ -14,7 +14,7 @@ Everything below runs on aarch64 today; only the Pi's own hardware paths
 | --- | --- |
 | FFmpeg 9.0, LibreELEC RPi5 config (`rpi` patch, V4L2 request HEVC, SAND) + CB1's DV patches | builds; all 14 patches apply |
 | libplacebo e2972fd + CB1's 21 patches; CB1 `dvbridge_core` (CroqueMr RC3 00615a5) | builds; ABI probes pass |
-| yblod Vulkan engine (libreelec-yblod 0.3.3 + `patches/yblod/`, 7 commits) | builds; `cargo test` 34/34; C CPU tests 4/4 |
+| yblod Vulkan engine (libreelec-yblod 0.3.3 + `patches/yblod/`, 14 commits) | builds; `cargo test` 34/34; C CPU tests 4/4 |
 | `dvbench` (port of `dvvk-mr-compare` to DRM PRIME frames) | runs both engines in a Debian arm64 VM (lavapipe / llvmpipe) |
 | Pi bundle `out/dvbench-rpi5-*.tar.gz` + `run-bench.sh` | self-contained; smoke-tested in the VM |
 
@@ -166,6 +166,79 @@ the per-shader stats run-bench now collects, `*-shader-stats.txt`):
 
 CB1's own time: the bench now times its SAND->P010 GLES pass separately, and
 the software-decode reference runs P010 and SAND input for both engines.
+
+## Engine work for the Pi without hardware (patches 0008-0012)
+
+Measured with the V3D compiler offline (`scripts/shader-stats.sh`, Mesa
+26.2.2's V3D 7.1 through the drm-shim). On V3D every memory access waits;
+threads per QPU hide the wait, and 4 threads need <= 32 registers each.
+
+**FEL upscale: Master Reference or bilinear** (`dvvk_plan_in.el_scaler`: 1
+Annex B, 2 bilinear; 0, formerly nearest, now plans as bilinear: nearest was
+removed (patch 0014); `dvbench --el-scaler`). Bilinear keeps Annex
+B's siting and rounding (EL co-sited horizontally, rows at 1/4 and 3/4,
+Annex B's EL chroma phase step), 2 taps instead of 8 / 4. vs Annex B: 64 dB
+PSNR (the removed nearest: 50.6 dB). Works with CB1's contract too (CB1 itself offers
+bilinear only in its non-Master Reference mode: `dvbench --cb1-mode
+reference --cb1-fel bilinear`, needs GL fragment subgroups: v3d has them,
+llvmpipe not).
+
+**Specialized pipelines**: a frame's selectors (EL filter, chroma method,
+dual MMR, MMR kinds, siting, CB1 chroma) as specialization constants, so the
+compiler drops every other path; generic pipelines kept (`DVVK_SPECIALIZE=0`).
+
+**Register pressure**, the V3D compiler's view of each route's pipelines:
+
+| Route | Pipeline | Before | Now |
+| --- | --- | --- | --- |
+| single layer, CB1 contract | pack (Annex B tile) | 1053 inst/loop body, 13 loops, 2 threads, 64 regs | 2322 inst (unrolled), 2 threads, 37 regs |
+| FEL Annex B | fel_vertical_pair / luma_phase_guide / phase_vertical_uv | 4 threads | 4 threads |
+| | fel_mmr_dual_horizontal | 1359 inst, 2 threads, 64 regs | narrow, per-channel MMR: 1292, 2 threads, 62 regs |
+| | pack (staged) | 1229 inst/loop body, 2 threads, 64 regs | 2314 (unrolled), 2 threads, 33 regs |
+| FEL bilinear | fel_chroma | generic: 6612 inst, 2 threads, 64 regs, 23:13 spills | **1156 inst, 4 threads, 32 regs, no spills** |
+| | pack (fused) | 2377 inst/loop body, 2 threads, 64 regs | 3018 (unrolled), 2 threads, 61 regs |
+
+Every change keeps the output byte-identical (Annex B and bilinear vs before,
+bilinear's fused path vs its staged reference, CB1 == Vulkan, validation
+layer clean).
+
+**Switches for the Pi's A/B** (run-bench.sh runs each, per picture):
+`DVVK_SPECIALIZE=0`, `DVVK_NARROW=0` (fewer samples per invocation; default
+on with the portable shaders), `DVVK_ANNEXB_TILE=0` (no shared-memory chroma
+tile), `DVVK_PACK_ONE_ROW=1` (pack: 4 x 1 blocks; bilinear pack 61 -> 54
+registers, staged 33 -> 42, still 2 threads: off by default), `--el-scaler bilinear`, and CB1 Reference with bilinear FEL. Real-time
+playback runs Master Reference and the bilinear compromise for both engines.
+
+**Left for hardware data** (can't be judged offline: memory latency, not
+instructions, decides on V3D):
+- `pack` at 2 threads in every variant: fewer pixels per invocation, or a
+  fragment-shader pack (V3D's tile buffer writes the output; inputs through
+  the texture cache, as CB1). A rewrite, worth it only if the Pi's profile
+  still shows pack dominating with the bilinear route.
+- Intermediate planes as images (2D-tiled, texture cache) for the vertical
+  filters.
+- fel_mmr_dual_horizontal (Annex B FEL) at 62 registers: its EL window loads.
+
+## V3D compiler statistics without a Pi (scripts/shader-stats.sh)
+
+Mesa's V3D drm-shim (emulates the Pi 5's V3D 7.1, submits nothing) lets the
+real V3D compiler build every engine pipeline offline; `V3D_DEBUG=shaderdb`
+gives instructions, threads per QPU and register spills
+(`scripts/build-mesa-shim.sh mesa|mesa-main`, then `scripts/shader-stats.sh`).
+
+Mesa 26.2.2 (as on the Pi), 47 pipelines:
+- **every `pack` variant: 2 threads, most spilling** (worst 8709
+  instructions, 149:159 spills:fills); `fel_chroma` 4828 instructions,
+  2 threads, 21:13; `piecewise` 2 threads, spilling. Small passes: 4 threads,
+  no spills. Register pressure in the big shaders is the main suspect.
+
+Mesa main (27.0-devel, 09e600cd) vs 26.2.2: still Vulkan 1.3 (no push
+descriptors), same int16/int64; register-allocator work brings spills 805 ->
+696 overall (piecewise stops spilling, fel_mmr_single halves) but
+fel_luma_phase_guide grows 1348 -> 2354 instructions and `pack` stays at 2
+threads and ~100+ spills. Not the fix; the shader structure is. LibreELEC
+builds its own Mesa (26.2.5 in the yblod tree), so a newer one could ship if
+a later main helps.
 
 ## Untested until the board arrives
 

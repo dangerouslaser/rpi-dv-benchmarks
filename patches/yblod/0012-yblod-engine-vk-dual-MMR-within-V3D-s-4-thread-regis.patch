@@ -1,0 +1,113 @@
+From 062aa211c26e019e556061a4afe867c2c0d62c28 Mon Sep 17 00:00:00 2001
+From: Bryan Hoban <bryan.hoban@gmail.com>
+Date: Fri, 6 Nov 2026 15:21:49 -0500
+Subject: [PATCH 12/14] yblod-engine-vk: dual MMR within V3D's 4-thread
+ register budget
+
+- fel_chroma (the fused FEL chroma pass; with the bilinear EL upscale, the
+  Pi 5's likely FEL route): the 64-bit-LUT MMR's term loop is kept rolled
+  ([[dont_unroll]]). Unrolled, the scheduler hoisted every term's 64-bit
+  product together: 64 registers, 2 threads. Now the dual-MMR variants
+  compile to 32 registers and 4 threads (bilinear + CB1 contract: 1156
+  instructions, 4 threads, no spills).
+- fel_mmr_dual_horizontal, narrow variant: the two channels' MMR sums one
+  after the other (mmr64_dual_pixel_sequential; exact integer sums, same
+  results). 64 -> 62 registers: still 2 threads (the EL window loads).
+
+Outputs identical (Annex B and nearest vs before; bilinear's fused path vs
+its staged reference; CB1 == Vulkan; clean under the validation layer).
+---
+ yblod-engine/vk/shaders/fel_chroma.comp       |  3 +-
+ .../vk/shaders/fel_mmr_dual_horizontal.comp   | 44 ++++++++++++++++++-
+ 2 files changed, 45 insertions(+), 2 deletions(-)
+
+diff --git a/yblod-engine/vk/shaders/fel_chroma.comp b/yblod-engine/vk/shaders/fel_chroma.comp
+index ab7189c..a6794b7 100644
+--- a/yblod-engine/vk/shaders/fel_chroma.comp
++++ b/yblod-engine/vk/shaders/fel_chroma.comp
+@@ -9,6 +9,7 @@
+ #define ERROR_OR(v) atomicOr(error, v)
+ layout(binding = 10, std430) buffer Error { uint error; };
+ #include "dv_common.glsl"
++#extension GL_EXT_control_flow_attributes : require
+ layout(local_size_x = 64, local_size_y = 1) in;
+ layout(binding = 0) uniform sampler2D bl_luma;
+ layout(binding = 1) uniform sampler2D bl_uv;
+@@ -136,7 +137,7 @@ uint mmr_mapped(uint P0, uint T0, uint kind, uvec3 s)
+     if (kind == 3u) {
+         I64_T v = WORDS64(p[P0 + 8], p[P0 + 9]);
+         ACC64(v, table[T0 + s.x]); ACC64(v, table[T0 + 1024u + s.y]); ACC64(v, table[T0 + 2048u + s.z]);
+-        for (uint k = 3; k < 7; k++) {
++        [[dont_unroll]] for (uint k = 3; k < 7; k++) {
+             uint a = feature(k, s, xy);
+             ACC64(v, term(p[P0 + 12 + 4 * k], a));
+             if (p[P0] > 1u) {
+diff --git a/yblod-engine/vk/shaders/fel_mmr_dual_horizontal.comp b/yblod-engine/vk/shaders/fel_mmr_dual_horizontal.comp
+index 71e9887..c1cee7c 100644
+--- a/yblod-engine/vk/shaders/fel_mmr_dual_horizontal.comp
++++ b/yblod-engine/vk/shaders/fel_mmr_dual_horizontal.comp
+@@ -6,6 +6,7 @@
+ #define ERROR_OR(v) atomicOr(error, v)
+ layout(binding = 11, std430) buffer Error { uint error; };
+ #include "dv_common.glsl"
++#extension GL_EXT_control_flow_attributes : require
+ layout(local_size_x = 64, local_size_y = 1) in;
+ layout(constant_id = 0) const uint HORIZONTAL_FUSED = 1;   // 0: mmr64_lut_dual (EL planes already scaled)
+ layout(binding = 0, std430) readonly buffer Y { uint16_t yg[]; };      // guide
+@@ -100,6 +101,47 @@ void mmr64_dual_pixel(uvec3 s, uvec2 enhancement, out uvec2 o, out bvec2 ok)
+     }
+ }
+ 
++// mmr64_dual_pixel one channel at a time (the narrow variant): channel c's
++// 64-bit MMR sum alone, features recomputed per channel. Exact integer sums,
++// so identical results; half the live 64-bit state (V3D: 4 threads).
++bool mmr64_channel(uvec3 s, uint P, uint T, uint el, uint channel, out uint value)
++{
++    I64_T v = constant64(P);
++    ACC64(v, table[T + s.x]); ACC64(v, table[T + 1024u + s.y]); ACC64(v, table[T + 2048u + s.z]);
++    uint xy = s.x * s.y;
++    [[dont_unroll]] for (uint k = 3; k < 7; k++) {
++        uint a = k == 3u ? xy : k == 4u ? s.x * s.z : k == 5u ? s.y * s.z : feature_product(xy, s.z << 10);
++        ACC64(v, term(p[P + 12 + 4 * k], a));
++        if (p[P] > 1u) {
++            uint b = feature_product(a, a);
++            ACC64(v, term(p[P + 40 + 4 * k], b));
++            if (p[P] > 2u) ACC64(v, term(p[P + 68 + 4 * k], feature_product(a, b)));
++        }
++    }
++    uint m = MAP16(v, p[P + 1] + 4u);
++    return recon32(m, rt[(1u + channel) * 1024u + el], value);
++}
++
++void mmr64_dual_pixel_sequential(uvec3 s, uvec2 enhancement, out uvec2 o, out bvec2 ok)
++{
++    // both channels take the guide clamped by channel 0's bounds, as mmr64_dual_pixel
++    s.x = clamp(s.x, p[2], p[3]);
++    s.y = clamp(s.y, p[4], p[5]);
++    s.z = clamp(s.z, p[6], p[7]);
++    [[dont_unroll]] for (uint channel = 0; channel < 2; ++channel) {
++        uint el = enhancement[channel];
++        if (el > 1023u) {               // reported, clamped
++            atomicOr(error, 1u);
++            el = 1023u;
++        }
++        uint value;
++        ok[channel] = mmr64_channel(s, channel * 96u, channel * 3072u, el, channel, value);
++        o[channel] = value;
++        if (!ok[channel])
++            atomicOr(error, 2u);
++    }
++}
++
+ uint half16(uint d, uint k) { return k == 0u ? d & 0xffffu : d >> 16; }
+ 
+ // The EL chroma at sample pair (e0 even sample, its odd neighbour) of one
+@@ -158,7 +200,7 @@ void main()
+         uvec2 o[2];
+         bvec2 ok[2];
+         for (uint l = 0; l < 2; ++l)
+-            mmr64_dual_pixel(uvec3(half16(g, l), half16(pb, l), half16(pr, l)), e[l], o[l], ok[l]);
++            mmr64_dual_pixel_sequential(uvec3(half16(g, l), half16(pb, l), half16(pr, l)), e[l], o[l], ok[l]);
+         if (all(ok[0]) && all(ok[1])) {
+             out0d[first >> 1] = o[0].x | (o[1].x << 16);
+             out1d[first >> 1] = o[0].y | (o[1].y << 16);

@@ -1,0 +1,487 @@
+From 366058f9d3ad5ca32056cac1fcad49abfb80e3af Mon Sep 17 00:00:00 2001
+From: Bryan Hoban <bryan.hoban@gmail.com>
+Date: Fri, 6 Nov 2026 15:32:25 -0500
+Subject: [PATCH 14/14] yblod-engine-vk: no nearest EL upscale (bilinear
+ instead)
+
+The FEL EL upscale is now Annex B (Master Reference, el_scaler 1) or
+bilinear (el_scaler 2). el_scaler 0, which was nearest, plans as bilinear,
+so callers that still ask for it (Kodi's dvbridge.elnearest, DV_EL_SCALER=
+nearest) get the cheaper upscale instead of failing. Every nearest branch
+is gone from the shaders (EL filter codes: 0 Annex B, 2 bilinear).
+
+Tests: nearest_requests_plan_bilinear (el_scaler 0 and 2 give identical
+plans, every fixture and configuration); the planner's golden digests for
+the configurations that requested nearest (0, 4, 5) regenerated, config 0
+now el_scaler 2 and equal to the previous bilinear plan's digest; Annex B
+and bilinear GPU output byte-identical to before. yblod's OpenCL engine and
+CPU reference keep their own nearest.
+---
+ yblod-engine/vk/include/dvvk_plan.h           |  2 +-
+ yblod-engine/vk/shaders/common/dv_common.glsl | 19 +++---
+ yblod-engine/vk/shaders/fel_chroma.comp       |  6 +-
+ .../vk/shaders/fel_luma_phase_guide.comp      |  3 -
+ .../vk/shaders/fel_mmr_dual_horizontal.comp   |  7 +-
+ .../vk/shaders/fel_phase_vertical_uv.comp     | 10 +--
+ .../vk/shaders/fel_scale_horizontal.comp      |  2 +-
+ .../vk/shaders/fel_vertical_pair.comp         |  8 +--
+ .../vk/shaders/fel_vertical_pair_w32.comp     |  4 --
+ yblod-engine/vk/shaders/pack.comp             |  4 +-
+ yblod-engine/vk/src/engine.rs                 | 16 ++---
+ yblod-engine/vk/src/plan.rs                   | 65 +++++++++++++------
+ yblod-engine/vk/yblod/plan.c                  | 12 ++--
+ 13 files changed, 75 insertions(+), 83 deletions(-)
+
+diff --git a/yblod-engine/vk/include/dvvk_plan.h b/yblod-engine/vk/include/dvvk_plan.h
+index e0d16f1..a1c6aed 100644
+--- a/yblod-engine/vk/include/dvvk_plan.h
++++ b/yblod-engine/vk/include/dvvk_plan.h
+@@ -22,7 +22,7 @@ typedef struct {
+     uint32_t width, height;             /* decoded */
+     uint32_t x, y, dw, dh;              /* destination in the canvas; dw/dh 0: no resize */
+     uint32_t chroma_top_left, has_el, nv12;
+-    uint32_t el_scaler, fel;            /* 0 nearest / 1 Annex B / 2 bilinear; 0 FEL off */
++    uint32_t el_scaler, fel;            /* 1 Annex B / 2 bilinear (0, formerly nearest: bilinear); 0 FEL off */
+     uint32_t packet_id, refresh, overlay, overlay_visible_before;
+     int64_t pts;
+     double rgb_to_lms[9];               /* overlay: linear GUI RGB -> the source's LMS */
+diff --git a/yblod-engine/vk/shaders/common/dv_common.glsl b/yblod-engine/vk/shaders/common/dv_common.glsl
+index cbe0e4f..f5e8a6d 100644
+--- a/yblod-engine/vk/shaders/common/dv_common.glsl
++++ b/yblod-engine/vk/shaders/common/dv_common.glsl
+@@ -147,12 +147,13 @@ uint recon12(int64_t total) { return uint(clamp(total > -8 ? (total + 8) / 16 :
+ bool overflows32(int64_t total) { return total > int64_t(2147483647) || total < int64_t(-2147483647) - 1; }
+ #endif
+ 
+-// The FEL EL upscale (the push constant `nearest` carries it): 0 CCM Annex B
+-// (Master Reference: 8-tap horizontal, 4-tap vertical), 1 nearest (2x2
+-// replication), 2 bilinear (2-tap both ways, same siting as Annex B: EL
+-// co-sited horizontally, rows at 1/4 and 3/4 vertically; the EL chroma keeps
+-// Annex B's chroma phase filter and 64/192 vertical step, which is bilinear).
+-const uint EL_ANNEXB = 0u, EL_NEAREST = 1u, EL_BILINEAR = 2u;
++// The FEL EL upscale (the push constant `nearest`, a historical name, carries
++// it): 0 CCM Annex B (Master Reference: 8-tap horizontal, 4-tap vertical), 2
++// bilinear (2-tap both ways, same siting as Annex B: EL co-sited horizontally,
++// rows at 1/4 and 3/4 vertically; the EL chroma keeps Annex B's chroma phase
++// filter and 64/192 vertical step, which is bilinear). Nearest (1) is gone:
++// the plan sends its requests to bilinear.
++const uint EL_ANNEXB = 0u, EL_BILINEAR = 2u;
+ 
+ // A frame's uniform selector (EL filter, chroma method, MMR kinds, ...): a
+ // specialization constant (ids 20.., gpu.rs SPEC_*) when the engine built a
+@@ -165,13 +166,13 @@ uint bilinear_mid(uint a, uint b) { return (a + b + 1u) >> 1; }
+ uint bilinear_quarter(uint near, uint far) { return (3u * near + far + 2u) >> 2; }
+ 
+ // horizontal(): the EL's 2x upsample (even samples passed through; odd ones
+-// 8-tap Annex B, 2-tap bilinear or nearest); HORIZONTAL(name, buffer) defines
+-// one for a given source buffer.
++// 8-tap Annex B or 2-tap bilinear); HORIZONTAL(name, buffer) defines one for
++// a given source buffer.
+ #define HORIZONTAL(NAME, BUF)                                                              \
+     uint NAME(uint w, uint x, uint y, uint el_filter)                                        \
+     {                                                                                      \
+         uint ix = x / 2;                                                                   \
+-        if ((x & 1u) == 0u || el_filter == EL_NEAREST)                                       \
++        if ((x & 1u) == 0u)                                                                \
+             return uint(BUF[y * w + ix]);                                                  \
+         if (el_filter == EL_BILINEAR)                                                        \
+             return bilinear_mid(uint(BUF[y * w + ix]), uint(BUF[y * w + uint(edge(int(ix) + 1, w))])); \
+diff --git a/yblod-engine/vk/shaders/fel_chroma.comp b/yblod-engine/vk/shaders/fel_chroma.comp
+index a6794b7..43e8bf2 100644
+--- a/yblod-engine/vk/shaders/fel_chroma.comp
++++ b/yblod-engine/vk/shaders/fel_chroma.comp
+@@ -37,8 +37,6 @@ layout(constant_id = 24) const uint S_KIND1 = 255u;
+ uvec2 el_vertical(uint xe, uint cy)
+ {
+     uint ch4 = h / 4, r = cy / 2;
+-    if (nearest == EL_NEAREST)
+-        return input_uv(el_uv, xe, r);
+     uvec2 b = phase_uv_sample(el_uv, xe, int(r), ch4, method);
+     if ((cy & 1u) == 0u) {
+         uvec2 a = phase_uv_sample(el_uv, xe, int(r) - 1, ch4, method);
+@@ -48,7 +46,7 @@ uvec2 el_vertical(uint xe, uint cy)
+     return (192u * b + 64u * c + 128u) / 256u;
+ }
+ 
+-// Annex B (not nearest): the workgroup's EL chroma, upsampled vertically,
++// Annex B: the workgroup's EL chroma, upsampled vertically,
+ // once per column it needs (its 32 + the 8-tap halo), as el_vertical computes it.
+ shared uvec2 el_tile[39];
+ int el_tile_base;   // the EL chroma column of el_tile[0]
+@@ -68,7 +66,7 @@ uvec2 el_chroma_tiled(uint cx)
+ uvec2 el_chroma(uint cx, uint cy)
+ {
+     uint ix = cx / 2, ew = w / 4;
+-    if ((cx & 1u) == 0u || nearest == EL_NEAREST)
++    if ((cx & 1u) == 0u)
+         return el_vertical(ix, cy);
+     if (nearest == EL_BILINEAR) {
+         uvec2 a = el_vertical(ix, cy), b = el_vertical(uint(edge(int(ix) + 1, ew)), cy);
+diff --git a/yblod-engine/vk/shaders/fel_luma_phase_guide.comp b/yblod-engine/vk/shaders/fel_luma_phase_guide.comp
+index 1b70533..24b1a3c 100644
+--- a/yblod-engine/vk/shaders/fel_luma_phase_guide.comp
++++ b/yblod-engine/vk/shaders/fel_luma_phase_guide.comp
+@@ -72,9 +72,6 @@ void main()
+         if (nearest == EL_BILINEAR) {
+             el[1] = bilinear_mid(t[4], t[5]);
+             el[3] = bilinear_mid(t[5], t[6]);
+-        } else if (nearest != 0u) {
+-            el[1] = t[4];
+-            el[3] = t[5];
+         } else {
+             int s1 = 0, s3 = 0;
+             for (int k = 0; k < 8; k++) {
+diff --git a/yblod-engine/vk/shaders/fel_mmr_dual_horizontal.comp b/yblod-engine/vk/shaders/fel_mmr_dual_horizontal.comp
+index c1cee7c..f95f8d5 100644
+--- a/yblod-engine/vk/shaders/fel_mmr_dual_horizontal.comp
++++ b/yblod-engine/vk/shaders/fel_mmr_dual_horizontal.comp
+@@ -145,14 +145,12 @@ void mmr64_dual_pixel_sequential(uvec3 s, uvec2 enhancement, out uvec2 o, out bv
+ uint half16(uint d, uint k) { return k == 0u ? d & 0xffffu : d >> 16; }
+ 
+ // The EL chroma at sample pair (e0 even sample, its odd neighbour) of one
+-// channel's row: Annex B's 8-tap (EL e0-3 .. e0+4), bilinear or nearest.
++// channel's row: Annex B's 8-tap (EL e0-3 .. e0+4) or bilinear.
+ // Words loaded where the 10-sample window e0-4|e0-3 .. fits, the filter
+ // accumulated at once (no window kept); edge() samples otherwise.
+ uvec2 el_pair_narrow(uint rb, uint e0, uint ew, bool second)
+ {
+     uint even = second ? uint(el1[rb + e0]) : uint(el0[rb + e0]);
+-    if (nearest == EL_NEAREST)
+-        return uvec2(even);
+     if (nearest == EL_BILINEAR) {
+         uint j = rb + uint(edge(int(e0) + 1, ew));
+         return uvec2(even, bilinear_mid(even, second ? uint(el1[j]) : uint(el0[j])));
+@@ -244,9 +242,6 @@ void main()
+         if (nearest == EL_BILINEAR) {
+             e[1] = uvec2(bilinear_mid(t0[4], t0[5]), bilinear_mid(t1[4], t1[5]));
+             e[3] = uvec2(bilinear_mid(t0[5], t0[6]), bilinear_mid(t1[5], t1[6]));
+-        } else if (nearest != 0u) {
+-            e[1] = e[0];
+-            e[3] = e[2];
+         } else {
+             ivec2 s1 = ivec2(0), s3 = ivec2(0);
+             for (int k = 0; k < 8; k++) {
+diff --git a/yblod-engine/vk/shaders/fel_phase_vertical_uv.comp b/yblod-engine/vk/shaders/fel_phase_vertical_uv.comp
+index eecbd81..852357c 100644
+--- a/yblod-engine/vk/shaders/fel_phase_vertical_uv.comp
++++ b/yblod-engine/vk/shaders/fel_phase_vertical_uv.comp
+@@ -1,5 +1,5 @@
+ // phase_vertical_uv (DV_INPUT_P010): the EL chroma (RG, w x h) chroma-phase
+-// filtered, then upsampled vertically 64/192 (or repeated, nearest): Cb -> V,
++// filtered, then upsampled vertically 64/192 (Annex B and bilinear alike): Cb -> V,
+ // Cr -> VP, each w x 2h.
+ #version 460
+ #define ERROR_OR(v) atomicOr(error, v)
+@@ -16,14 +16,6 @@ void main()
+     uint x = gl_GlobalInvocationID.x, y = gl_GlobalInvocationID.y + row_offset;
+     if (x >= w || y >= h)
+         return;
+-    if (nearest == EL_NEAREST) {
+-        uvec2 v = input_uv(src, x, y);
+-        cb[y * 2 * w + x] = uint16_t(v.x);
+-        cb[(y * 2 + 1) * w + x] = uint16_t(v.x);
+-        cr[y * 2 * w + x] = uint16_t(v.y);
+-        cr[(y * 2 + 1) * w + x] = uint16_t(v.y);
+-        return;
+-    }
+     uvec2 a = phase_uv_sample(src, x, int(y) - 1, h, method);
+     uvec2 b = phase_uv_sample(src, x, int(y), h, method);
+     uvec2 c = phase_uv_sample(src, x, int(y) + 1, h, method);
+diff --git a/yblod-engine/vk/shaders/fel_scale_horizontal.comp b/yblod-engine/vk/shaders/fel_scale_horizontal.comp
+index 2f60ccc..9c295e2 100644
+--- a/yblod-engine/vk/shaders/fel_scale_horizontal.comp
++++ b/yblod-engine/vk/shaders/fel_scale_horizontal.comp
+@@ -1,4 +1,4 @@
+-// scale_horizontal: the EL chroma upsampled horizontally (8-tap / nearest)
++// scale_horizontal: the EL chroma upsampled horizontally (8-tap Annex B / bilinear)
+ // into a full chroma-resolution plane; samples over 1023 flag the frame.
+ #version 460
+ #define ERROR_OR(v) atomicOr(error, v)
+diff --git a/yblod-engine/vk/shaders/fel_vertical_pair.comp b/yblod-engine/vk/shaders/fel_vertical_pair.comp
+index daef247..4387465 100644
+--- a/yblod-engine/vk/shaders/fel_vertical_pair.comp
++++ b/yblod-engine/vk/shaders/fel_vertical_pair.comp
+@@ -1,5 +1,5 @@
+ // vertical_pair (DV_INPUT_P010): the EL luma (w x h, half size) upsampled
+-// vertically, 4-tap {-3,29,111,-9}/128 (or rows repeated, nearest) -> w x 2h.
++// vertically, 4-tap {-3,29,111,-9}/128 (Annex B) or bilinear -> w x 2h.
+ #version 460
+ #define ERROR_OR(v) atomicOr(error, v)
+ layout(binding = 2, std430) buffer Error { uint error; };
+@@ -21,12 +21,6 @@ void main()
+         dst[(y * 2 + 1) * w + x] = uint16_t(bilinear_quarter(b, c));
+         return;
+     }
+-    if (nearest != 0u) {
+-        LOCAL_U16 v = LOCAL_U16(input_sample(src, x, y, channel));
+-        dst[y * 2 * w + x] = uint16_t(v);
+-        dst[(y * 2 + 1) * w + x] = uint16_t(v);
+-        return;
+-    }
+     int s0 = int(input_sample(src, x, uint(edge(int(y) - 2, h)), channel));
+     int s1 = int(input_sample(src, x, uint(edge(int(y) - 1, h)), channel));
+     int s2 = int(input_sample(src, x, y, channel));
+diff --git a/yblod-engine/vk/shaders/fel_vertical_pair_w32.comp b/yblod-engine/vk/shaders/fel_vertical_pair_w32.comp
+index 1e4767d..852eeb6 100644
+--- a/yblod-engine/vk/shaders/fel_vertical_pair_w32.comp
++++ b/yblod-engine/vk/shaders/fel_vertical_pair_w32.comp
+@@ -20,10 +20,6 @@ uvec2 rows(uint x, uint y)
+         uint c = input_sample(src, x, uint(edge(int(y) + 1, h)), channel);
+         return uvec2(bilinear_quarter(b, a), bilinear_quarter(b, c));
+     }
+-    if (nearest != 0u) {
+-        uint v = input_sample(src, x, y, channel);
+-        return uvec2(v);
+-    }
+     int s0 = int(input_sample(src, x, uint(edge(int(y) - 2, h)), channel));
+     int s1 = int(input_sample(src, x, uint(edge(int(y) - 1, h)), channel));
+     int s2 = int(input_sample(src, x, y, channel));
+diff --git a/yblod-engine/vk/shaders/pack.comp b/yblod-engine/vk/shaders/pack.comp
+index f3f5cc4..8e0171c 100644
+--- a/yblod-engine/vk/shaders/pack.comp
++++ b/yblod-engine/vk/shaders/pack.comp
+@@ -92,8 +92,6 @@ uint unorm16_code(float v)
+ uint el_v(uint x, uint row, uint el_h)
+ {
+     uint r = row / 2;
+-    if (nearest == EL_NEAREST)
+-        return unorm16_code(texelFetch(el_luma, ivec2(x, r), 0).r);
+     if (nearest == EL_BILINEAR) {
+         uint b = unorm16_code(texelFetch(el_luma, ivec2(x, r), 0).r);
+         int o = (row & 1u) == 0u ? -1 : 1;
+@@ -131,7 +129,7 @@ uint fel_luma(uint x, uint y, uint sw, uint sh)
+                 v += taps[k] * int(el_tile[t][j + k - 3]);
+             el = rounded(v, 4096);
+         }
+-    } else if ((x & 1u) == 0u || nearest == EL_NEAREST)
++    } else if ((x & 1u) == 0u)
+         el = el_v(ix, y, sh / 2);
+     else if (nearest == EL_BILINEAR)
+         el = bilinear_mid(el_v(ix, y, sh / 2), el_v(uint(edge(int(ix) + 1, ew)), y, sh / 2));
+diff --git a/yblod-engine/vk/src/engine.rs b/yblod-engine/vk/src/engine.rs
+index 55c2350..df8c3bd 100644
+--- a/yblod-engine/vk/src/engine.rs
++++ b/yblod-engine/vk/src/engine.rs
+@@ -199,7 +199,7 @@ mod pack_tests {
+         let mut v = Vec::new();
+         for route in [plan::ROUTE_DUAL, plan::ROUTE_SINGLE, plan::ROUTE_PIECEWISE] {
+             for equal in 0..2 {
+-                for nearest in 0..3 {
++                for nearest in [0, 2] {
+                     for pack in [plan::PACK_SITED, plan::PACK_422, plan::PACK_RESIZED] {
+                         for chroma_filter in 0..2 {
+                             v.push(PackRoute { route, equal, nearest, pack, chroma_filter });
+@@ -239,9 +239,9 @@ mod pack_tests {
+         let r = |route, equal, nearest, pack| PackRoute { route, equal, nearest, pack, chroma_filter: 0 };
+         assert_eq!(pack_source(&r(plan::ROUTE_SINGLE, 0, 0, plan::PACK_SITED)), 1);
+         assert_eq!(pack_source(&r(plan::ROUTE_SINGLE, 0, 0, plan::PACK_RESIZED)), 0);
+-        assert_eq!(pack_source(&r(plan::ROUTE_DUAL, 0, 1, plan::PACK_RESIZED)), 2);
++        assert_eq!(pack_source(&r(plan::ROUTE_DUAL, 0, 2, plan::PACK_RESIZED)), 2);
+         assert_eq!(pack_source(&r(plan::ROUTE_DUAL, 0, 0, plan::PACK_SITED)), 0);
+-        assert_eq!(pack_source(&r(plan::ROUTE_DUAL, 1, 1, plan::PACK_SITED)), 0);
++        assert_eq!(pack_source(&r(plan::ROUTE_DUAL, 1, 2, plan::PACK_SITED)), 0);
+         assert_eq!(pack_source(&r(plan::ROUTE_PIECEWISE, 0, 1, plan::PACK_422)), 0);
+     }
+ 
+@@ -313,12 +313,8 @@ mod pack_tests {
+         let (equal, nearest, pack) = match r.route {
+             // NV12 pictures are piecewise only
+             plan::ROUTE_DUAL if !r.nv12 => {
+-                // the EL filter: 0 Annex B, 1 nearest, 2 bilinear
+-                let filter = match r.el_scaler {
+-                    0 => 1,
+-                    2 => 2,
+-                    _ => 0,
+-                };
++                // the EL filter: 0 Annex B (el_scaler 1), 2 bilinear (0 and 2)
++                let filter = if r.el_scaler == 1 { 0 } else { 2 };
+                 ((r.el_flag == 0) as u32, filter, resized_pack)
+             }
+             plan::ROUTE_SINGLE if !r.nv12 => (0, 0, resized_pack),
+@@ -1911,7 +1907,7 @@ impl Engine {
+     fn prepare_variants(&mut self) {
+         // FEL with a half-size EL (each EL filter, CB1's contract or not,
+         // dual MMR or polynomial chroma) and single layer, sited pack.
+-        for nearest in 0..3 {
++        for nearest in [0, 2] {
+             for contract in 0..2u32 {
+                 for (dual, kinds) in [(1, [3, 3]), (0, [0, 0])] {
+                     for top_left in 0..2 {
+diff --git a/yblod-engine/vk/src/plan.rs b/yblod-engine/vk/src/plan.rs
+index 3a08e56..d61385e 100644
+--- a/yblod-engine/vk/src/plan.rs
++++ b/yblod-engine/vk/src/plan.rs
+@@ -348,7 +348,8 @@ mod tests {
+         bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3))
+     }
+ 
+-    /// Config k of the oracle harness: 0 FEL nearest, 1 Annex B, 2 FEL off,
++    /// Config k of the oracle harness: 0 FEL bilinear (el_scaler 2; 0, which
++    /// was nearest, now plans the same), 1 Annex B, 2 FEL off,
+     /// 3 CB1 contract with the overlay, 4 a 1920x1080 box with the overlay,
+     /// 5 the same in desktop mode.
+     fn plan_in(has_el: bool, k: u32) -> (PlanIn, Option<PlanDesktop>) {
+@@ -372,7 +373,7 @@ mod tests {
+             chroma_top_left: 1,
+             has_el: has_el as u32,
+             nv12: 0,
+-            el_scaler: 0,
++            el_scaler: if k == 0 { 2 } else { 0 },
+             fel: 1,
+             packet_id: 3,
+             refresh: 1,
+@@ -409,36 +410,36 @@ mod tests {
+             "1917-fel.0",
+             true,
+             [
+-                0x6c27182b02b5bc08,
++                0x95e66696f6292403,
+                 0xa46251f948e221e1,
+                 0x2f8d56853d7b260b,
+                 0x07003dbe2510b2b1,
+-                0xef24bb6de157c8ce,
+-                0xa355d1f82c07f695,
++                0x8e3d990c600e037d,
++                0x4009036152912e0a,
+             ],
+         ),
+         (
+             "1917-fel.1",
+             true,
+             [
+-                0x58b1649710bcaaa4,
++                0xfb35c4a5e3f71a9b,
+                 0xdb311f604af675a5,
+                 0xdc2d708f053a5816,
+                 0x2c53da27bb40a651,
+-                0x538aed247984c4ca,
+-                0x8ce91e699b0bc8b8,
++                0x73b4428d480f1bd5,
++                0x15b42a60ca55e033,
+             ],
+         ),
+         (
+             "1917-fel.2",
+             true,
+             [
+-                0xeca979ce2ab9122b,
++                0x1d5e7939afa155d4,
+                 0xf534770eb974efc6,
+                 0xcd211b6f5ee36869,
+                 0xc5083797f43440a2,
+-                0x2721122f0803f9c5,
+-                0x63ff49dc2195965c,
++                0x54d3d3c87a8f381a,
++                0xc3d40d90db5534e7,
+             ],
+         ),
+         (
+@@ -471,6 +472,30 @@ mod tests {
+         std::fs::read(format!("{}/yblod/fixtures/{name}.bin", env!("CARGO_MANIFEST_DIR"))).unwrap()
+     }
+ 
++    #[test]
++    fn nearest_requests_plan_bilinear() {
++        // el_scaler 0 (formerly nearest) plans exactly as 2 (bilinear),
++        // every fixture and configuration
++        let mut a = Plan::boxed();
++        let mut b = Plan::boxed();
++        for (name, has_el, _) in ROUTES {
++            let md = fixture(name);
++            for k in 0..6u32 {
++                let (mut input, desktop) = plan_in(has_el, k);
++                if input.el_scaler == 1 {
++                    continue; // Annex B configurations
++                }
++                input.el_scaler = 0;
++                let mut st = PlanState::new().unwrap();
++                assert_eq!(a.fill(&input, desktop.as_ref(), &mut st, &md), 0, "{name} config {k}");
++                input.el_scaler = 2;
++                let mut st = PlanState::new().unwrap();
++                assert_eq!(b.fill(&input, desktop.as_ref(), &mut st, &md), 0, "{name} config {k}");
++                assert_eq!(digest(&a), digest(&b), "{name} config {k}");
++            }
++        }
++    }
++
+     #[test]
+     fn routes_match_head() {
+         let mut plan = Plan::boxed();
+@@ -904,12 +929,12 @@ mod tests {
+             true,
+             0x2,
+             [
+-                0xf632b4898b495969,
++                0x96f56f68411a96ca,
+                 0xcc3748aed83d3444,
+                 0x83ef5ca9f978a132,
+                 0x897f7cf277a86844,
+-                0x4a206d0bd15cb887,
+-                0xa355d1f82c07f695,
++                0xecccb619c54dcac4,
++                0x4009036152912e0a,
+             ],
+         ),
+         (
+@@ -917,12 +942,12 @@ mod tests {
+             true,
+             0x1002,
+             [
+-                0x55e70634841864c5,
++                0x2cb0be563e036b16,
+                 0xb8f074aef4761a20,
+                 0xec74717c3e62665e,
+                 0x68d7f51d35912089,
+-                0x489714f802d710b2,
+-                0xa355d1f82c07f695,
++                0xa8e5324ab8d0984d,
++                0x4009036152912e0a,
+             ],
+         ),
+         (
+@@ -930,12 +955,12 @@ mod tests {
+             true,
+             0x1000,
+             [
+-                0x5c9dcd6e94c8bf19,
++                0xb93e8c34377b51be,
+                 0x0ede6c408ea00924,
+                 0xe39f916c3432e18a,
+                 0xcd1b157aee5a9218,
+-                0x4d2d7e308539480a,
+-                0xa355d1f82c07f695,
++                0xc36bbfbcbc413931,
++                0x4009036152912e0a,
+             ],
+         ),
+         (
+diff --git a/yblod-engine/vk/yblod/plan.c b/yblod-engine/vk/yblod/plan.c
+index 0a4edca..fd7b718 100644
+--- a/yblod-engine/vk/yblod/plan.c
++++ b/yblod-engine/vk/yblod/plan.c
+@@ -610,9 +610,10 @@ int dvvk_plan_frame_state(const dvvk_plan_in *in, const dvvk_plan_desktop *deskt
+     int status = dv_transport_settings_from_ffmpeg(metadata, metadata_size, w, h, id, &settings, dm, &bytes);
+     int single = !in->has_el, use_piecewise = 0;
+     if (status == DV_OK) {
+-        /* 2 bilinear: to yblod's host code (tables, routes, siting) it is
+-         * Annex B; only the GPU taps differ (o->nearest below). */
+-        settings.el_scaler = in->el_scaler == 2 ? 1 : in->el_scaler;
++        /* The EL upscale: 1 Annex B, else (2, and 0 which was nearest) bilinear.
++         * To yblod's host code (tables, routes, siting) bilinear is Annex B;
++         * only the GPU taps differ (o->nearest below). */
++        settings.el_scaler = 1;
+         if (!single && !in->fel && settings.composer.residual_enabled) {
+             dv_intel_composer_config *cfg = &settings.composer;
+             cfg->residual_enabled = 0;
+@@ -716,9 +717,8 @@ int dvvk_plan_frame_state(const dvvk_plan_in *in, const dvvk_plan_desktop *deskt
+         o->route = DVVK_ROUTE_DUAL;
+         if ((status = plan_dual_cached(state, &settings, contract, o)) != DV_OK)
+             return status;
+-        /* The shaders' EL filter: 0 Annex B, 1 nearest, 2 bilinear. */
+-        if (in->el_scaler == 2 && !o->nearest)
+-            o->nearest = 2;
++        /* The shaders' EL filter: 0 Annex B, 2 bilinear (nearest requests too). */
++        o->nearest = in->el_scaler == 1 ? 0 : 2;
+     }
+     /* The tables are a function of the route and its cache entry: the same
+      * generation, the same bytes (every other table is zero). */

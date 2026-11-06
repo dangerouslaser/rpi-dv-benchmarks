@@ -1,0 +1,178 @@
+From b9b3e66eae535f36c5e39449f582bf969b4a9294 Mon Sep 17 00:00:00 2001
+From: Bryan Hoban <bryan.hoban@gmail.com>
+Date: Fri, 6 Nov 2026 15:26:37 -0500
+Subject: [PATCH 13/14] yblod-engine-vk: DVVK_PACK_ONE_ROW=1 (pack: one output
+ row per invocation)
+
+S_ROWS (constant 28) = 1: the regular pack variants (not the Annex B or GUI
+tiles, which assume two rows) write a 4 x 1 block per invocation instead of
+4 x 2; each block fetches its chroma rows itself. Fewer pixels in flight:
+the bilinear fused pack 61 -> 54 registers (V3D), but the staged Annex B
+pack 33 -> 42; neither reaches 4 threads, so it is a switch for the Pi's
+measurement, off by default. The engine sizes the dispatch by the variant
+in use. Outputs identical.
+---
+ yblod-engine/vk/shaders/pack.comp | 17 ++++++++++++-----
+ yblod-engine/vk/src/engine.rs     | 30 +++++++++++++++++++++++++-----
+ yblod-engine/vk/src/gpu.rs        |  2 ++
+ yblod-engine/vk/src/options.rs    |  5 +++++
+ 4 files changed, 44 insertions(+), 10 deletions(-)
+
+diff --git a/yblod-engine/vk/shaders/pack.comp b/yblod-engine/vk/shaders/pack.comp
+index a902e01..f3f5cc4 100644
+--- a/yblod-engine/vk/shaders/pack.comp
++++ b/yblod-engine/vk/shaders/pack.comp
+@@ -72,6 +72,11 @@ layout(constant_id = 26) const uint S_CHROMA_FILTER = 255u;
+ #define nearest SPEC_OR_PUSH(S_NEAREST, p_nearest)
+ #define top_left SPEC_OR_PUSH(S_TOP_LEFT, p_top_left)
+ #define chroma_filter SPEC_OR_PUSH(S_CHROMA_FILTER, p_chroma_filter)
++// Output rows per invocation: 2 (a 4 x 2 block sharing its chroma rows, the
++// original) or 1 (4 x 1: about half the pixels in flight, each block fetching
++// its chroma rows itself; for GPUs short of registers, e.g. V3D). Not with
++// the Annex B tile or the fused GUI layer (their workgroup tiles assume 2).
++layout(constant_id = 28) const uint S_ROWS = 2;
+ #include "overlay_colour.glsl"
+ 
+ uint unorm16_code(float v)
+@@ -545,7 +550,8 @@ void chroma_rows_at(uint cx, uint k, uint sw, uint sh, out uvec2 rows[8])
+ // One invocation: 4 pixels x 2 rows (x0 % 4 == 0, y0 even), stored 16 bytes a row.
+ void main()
+ {
+-    uint x0 = (gl_GlobalInvocationID.x + origin_x * 32u) * 4u, y0 = (gl_GlobalInvocationID.y + origin_y * gl_WorkGroupSize.y) * 2u;
++    uint x0 = (gl_GlobalInvocationID.x + origin_x * 32u) * 4u,
++         y0 = (gl_GlobalInvocationID.y + origin_y * gl_WorkGroupSize.y) * S_ROWS;
+     uint lx = gl_LocalInvocationID.x, ly = gl_LocalInvocationID.y;
+     if (OVERLAY == 2u) {
+         // Before any return: the barriers need the whole workgroup.
+@@ -606,9 +612,10 @@ void main()
+             rows[j][r] = uvec2(0);
+     if (PACK == 0) {
+         uint ly0 = y0 - placement.y;
+-        bool any_inside = x0 + 3u >= placement.x && y0 + 1u >= placement.y && x0 < placement.x + placement.z &&
++        bool any_inside = x0 + 3u >= placement.x && y0 + S_ROWS - 1u >= placement.y && x0 < placement.x + placement.z &&
+                           y0 < placement.y + placement.w;
+-        bool any_shown = x0 + 3u >= active_area.x && x0 < active_area.z && y0 + 1u >= active_area.y && y0 < active_area.w;
++        bool any_shown = x0 + 3u >= active_area.x && x0 < active_area.z && y0 + S_ROWS - 1u >= active_area.y &&
++                         y0 < active_area.w;
+         if (ANNEXB != 0u && any_inside && any_shown)
+             // tile row of chroma row k (= ly0 / 2) is k - k0 + 0 .. 7 = local y + i;
+             // column of the pair at x0 + 2j is its offset in the workgroup
+@@ -636,11 +643,11 @@ void main()
+     // Filter now: from here only these 2 x 2 (cb, cr) results stay live.
+     uint sited[2][2];
+     for (uint j = 0; j < 2; j++)
+-        for (uint r = 0; r < 2; r++) {
++        for (uint r = 0; r < S_ROWS; r++) {
+             uvec2 c = PACK == 0 ? sited_chroma(rows[j], (y0 + r - placement.y) & 1u) : uvec2(0);
+             sited[j][r] = c.x | (c.y << 16);
+         }
+-    for (uint r = 0; r < 2; r++) {
++    for (uint r = 0; r < S_ROWS; r++) {
+         uint y = y0 + r;
+         if (y >= h)
+             break;
+diff --git a/yblod-engine/vk/src/engine.rs b/yblod-engine/vk/src/engine.rs
+index 0ba6fd9..55c2350 100644
+--- a/yblod-engine/vk/src/engine.rs
++++ b/yblod-engine/vk/src/engine.rs
+@@ -594,8 +594,20 @@ impl PlanSelectors {
+ 
+ /// Each pipeline's frame selectors as specialization constants (shaders:
+ /// SPEC_OR_PUSH, the same values the push constants carry).
+-fn pack_spec(p: &PlanSelectors) -> Vec<(u32, u32)> {
+-    vec![(gpu::SPEC_EL_FILTER, p.nearest), (gpu::SPEC_TOP_LEFT, p.top_left), (gpu::SPEC_CHROMA_FILTER, p.chroma_filter)]
++fn pack_spec(p: &PlanSelectors, one_row: bool) -> Vec<(u32, u32)> {
++    let mut v =
++        vec![(gpu::SPEC_EL_FILTER, p.nearest), (gpu::SPEC_TOP_LEFT, p.top_left), (gpu::SPEC_CHROMA_FILTER, p.chroma_filter)];
++    if one_row {
++        v.push((gpu::SPEC_ROWS, 1));
++    }
++    v
++}
++
++/// The pack's narrow form (one output row per invocation) applies to the
++/// regular variants without the fused GUI layer (overlay 2): the Annex B tile
++/// and the GUI tile assume two rows.
++fn pack_one_row(enabled: bool, variant: PackVariant, overlay: u32) -> bool {
++    enabled && matches!(variant, PackVariant::Regular(_)) && overlay != 2
+ }
+ fn fel_chroma_spec(p: &PlanSelectors) -> Vec<(u32, u32)> {
+     vec![
+@@ -1873,7 +1885,7 @@ impl Engine {
+                 PackVariant::Annexb(i) => Some(&e.pack_annexb[i]),
+                 PackVariant::Regular(i) => e.pack[i].as_ref(),
+             },
+-            pack_spec(plan),
++            pack_spec(plan, pack_one_row(self.d.options.pack_one_row, variant, overlay)),
+         );
+         if plan.route == plan::ROUTE_DUAL && plan.equal == 0 {
+             if pack_source(&plan.route()) == 2 {
+@@ -2637,7 +2649,8 @@ impl Engine {
+                 None => return Err(Error::Missing("a pack variant")),
+             },
+         };
+-        let pack = self.specialized(pack, &pack_spec(&PlanSelectors::of(p)));
++        let pack =
++            self.specialized(pack, &pack_spec(&PlanSelectors::of(p), pack_one_row(self.d.options.pack_one_row, variant, overlay_kind)));
+         let fused_tables = if source == 1 {
+             Bind::Range(slot.tables, T_SINGLE, 6144)
+         } else {
+@@ -2698,7 +2711,14 @@ impl Engine {
+         // Output rows a workgroup covers: 4, or 16 with the Annex B chroma tile
+         // (damage rectangles rounded out to it; a pixel written twice gets the
+         // same value).
+-        let wg_h = if matches!(variant, PackVariant::Annexb(_)) { 16 } else { 4 };
++        // rows per workgroup: invocation rows (local size y) x output rows each
++        let wg_h = if matches!(variant, PackVariant::Annexb(_)) {
++            16
++        } else if pack.spec.contains(&(gpu::SPEC_ROWS, 1)) {
++            2
++        } else {
++            4
++        };
+         self.dispatch_partitioned(cmd, pack, &push, regions.as_deref(), wg_h);
+         stamp(cmd, 3);
+         if check {
+diff --git a/yblod-engine/vk/src/gpu.rs b/yblod-engine/vk/src/gpu.rs
+index 2b03cff..4c9abdc 100644
+--- a/yblod-engine/vk/src/gpu.rs
++++ b/yblod-engine/vk/src/gpu.rs
+@@ -90,6 +90,8 @@ pub const SPEC_TOP_LEFT: u32 = 25;
+ pub const SPEC_CHROMA_FILTER: u32 = 26;
+ /// Samples per invocation where a shader offers fewer (fel_mmr_dual_horizontal: 4 or 2).
+ pub const SPEC_PIXELS: u32 = 27;
++/// pack: output rows per invocation (2, or 1 when narrow).
++pub const SPEC_ROWS: u32 = 28;
+ 
+ impl Pipeline {
+     /// `bindings[i]` is binding i of set 0; `spec` are (id, u32 value).
+diff --git a/yblod-engine/vk/src/options.rs b/yblod-engine/vk/src/options.rs
+index 9557036..2e724da 100644
+--- a/yblod-engine/vk/src/options.rs
++++ b/yblod-engine/vk/src/options.rs
+@@ -76,6 +76,9 @@ pub struct EngineOptions {
+     /// DVVK_ANNEXB_TILE=0: no shared-memory chroma tile for CB1's Annex B
+     /// filter in the fused single-layer pack (the regular variant instead).
+     pub annexb_tile: bool,
++    /// DVVK_PACK_ONE_ROW=1: specialized regular pack variants write one output
++    /// row per invocation (fewer pixels in flight, chroma rows fetched twice).
++    pub pack_one_row: bool,
+     pub resize_fma: u32,
+     pub blend_fma: u32,
+     pub lazy_resized_pack: bool,
+@@ -108,6 +111,7 @@ impl Default for EngineOptions {
+             prepare_variants: false,
+             narrow: None,
+             annexb_tile: true,
++            pack_one_row: false,
+             resize_fma: 1,
+             blend_fma: 1,
+             lazy_resized_pack: false,
+@@ -142,6 +146,7 @@ impl EngineOptions {
+             prepare_variants: flag("DVVK_PREPARE_VARIANTS"),
+             narrow: var("DVVK_NARROW").map(|v| v == "1"),
+             annexb_tile: not_zero("DVVK_ANNEXB_TILE"),
++            pack_one_row: flag("DVVK_PACK_ONE_ROW"),
+             resize_fma: number("DVVK_RESIZE_FMA", 1),
+             blend_fma: number("DVVK_BLEND_FMA", 1),
+             lazy_resized_pack: flag("DVVK_LAZY_RESIZED_PACK"),

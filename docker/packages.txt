@@ -6,3 +6,5 @@ glslc spirv-tools
 libdrm-dev libgbm-dev libegl-dev libgles-dev libudev-dev libva-dev
 libvulkan-dev vulkan-tools mesa-vulkan-drivers libegl-mesa0 libgl1-mesa-dri libgbm1
 zlib1g-dev
+# Mesa (scripts/build-mesa-shim.sh)
+python3-mako python3-yaml python3-packaging python3-ply bison flex glslang-tools libexpat1-dev libzstd-dev libelf-dev

@@ -1,7 +1,8 @@
 From 35926f7cdb97dff329a258d5a9bec976d04ee6eb Mon Sep 17 00:00:00 2001
 From: Bryan Hoban <bryan.hoban@gmail.com>
 Date: Fri, 6 Nov 2026 13:10:06 -0500
-Subject: [PATCH 7/7] yblod-engine-vk: fixes from the first Raspberry Pi 5 run
+Subject: [PATCH 07/14] yblod-engine-vk: fixes from the first Raspberry Pi 5
+ run
 
 Found by the first run on a Pi 500 (Raspberry Pi OS trixie, Mesa 26.2.2):
 

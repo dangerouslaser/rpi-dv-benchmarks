@@ -35,8 +35,13 @@ Per clip, with the Pi's hardware decoder (V4L2 request, SAND128 frames):
 - each performance run 3 times, engine order alternating, with clocks,
   temperature and throttling recorded (throttled runs are left out of the
   medians in `table.txt`);
-- real-time playback for 30 s per engine: decoding on its own thread,
-  rendering at the stream's frame rate; late pictures and decode stalls;
+- the engines' options, per picture: the Vulkan engine's switches
+  (specialized pipelines, narrow variants, the Annex B chroma tile) and its
+  FEL upscale (Master Reference's Annex B or bilinear), CB1 Master Reference
+  and CB1 Reference with bilinear FEL (`table.txt`, "options");
+- real-time playback for 30 s per engine and setting (Master Reference and
+  the bilinear compromise): decoding on its own thread, rendering at the
+  stream's frame rate; late pictures and decode stalls;
 - the Vulkan engine's per-stage GPU times;
 - the same with software decoding, for reference.
 

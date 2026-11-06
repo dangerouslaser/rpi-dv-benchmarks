@@ -20,8 +20,13 @@
 #      layout handling end to end)
 #   2. performance: each engine alone, REPEAT times, alternating which goes
 #      first, clocks / temperature / throttling recorded around every run
-#   3. real-time playback: decoding on its own thread, rendering on the
-#      stream's frame clock; pictures that missed their display deadline
+#   3. options, per picture: the Vulkan engine's switches (specialized
+#      pipelines, narrow variants, the Annex B tile) and FEL EL upscale
+#      (Master Reference's Annex B or bilinear), CB1's Reference mode with
+#      bilinear FEL
+#   3b. real-time playback: decoding on its own thread, rendering on the
+#      stream's frame clock; pictures that missed their display deadline;
+#      each engine as Master Reference and with the bilinear compromise
 #   4. the Vulkan engine's per-stage GPU times (DVVK_PROFILE), and the V3D
 #      compiler's statistics for every shader both engines use (threads,
 #      register spills: shader-stats.txt per clip)
@@ -163,14 +168,41 @@ for clip in "${CLIPS[@]}"; do
     done
   done
 
-  # 3. Real-time playback, each engine.
+  # 3. Options, per picture (each its own process; one run, --frames pictures).
+  #    name | environment | dvbench options
+  while IFS='|' read -r oname oenv oargs; do
+    [ -n "$oname" ] || continue
+    name=$tag-opt-$oname
+    env $oenv "$BENCH" ${NODE:+--node $NODE} "${hw[@]}" --frames "$FRAMES" $oargs --json "$OUT/$name.json" "$clip" \
+      >"$OUT/$name.log" 2>&1 || echo "   FAIL  option $oname, see $OUT/$name.log"
+    printf '   %-22s %s\n' "$oname" "$(grep -E "per picture" "$OUT/$name.log" | sed 's/.*per picture: //' | head -1)"
+  done <<'OPTIONS'
+vk-annexb||--engines vk
+vk-generic|DVVK_SPECIALIZE=0|--engines vk
+vk-wide|DVVK_NARROW=0|--engines vk
+vk-no-tile|DVVK_ANNEXB_TILE=0|--engines vk
+vk-one-row|DVVK_PACK_ONE_ROW=1|--engines vk
+vk-bilinear||--engines vk --el-scaler bilinear
+vk-bilinear-one-row|DVVK_PACK_ONE_ROW=1|--engines vk --el-scaler bilinear
+vk-bilinear-generic|DVVK_SPECIALIZE=0|--engines vk --el-scaler bilinear
+cb1-master||--engines cb1
+cb1-ref-bilinear||--engines cb1 --cb1-mode reference --cb1-fel bilinear
+OPTIONS
+
+  # 3b. Real-time playback: Master Reference and the bilinear compromise.
   if [ "$PLAY" != 0 ]; then
-    for e in cb1 vk; do
-      name=$tag-play-$e
-      bench "$OUT/$name.log" "${hw[@]}" --engines $e --frames 1 --warmup 0 --play "$PLAY" \
+    while IFS='|' read -r pname pargs; do
+      [ -n "$pname" ] || continue
+      name=$tag-play-$pname
+      bench "$OUT/$name.log" "${hw[@]}" $pargs --frames 1 --warmup 0 --play "$PLAY" \
         --json "$OUT/$name.json" "$clip" || echo "   FAIL  $name, see $OUT/$name.log"
-      grep -E "play:" "$OUT/$name.log" | sed 's/^/   /'
-    done
+      grep -E "play:" "$OUT/$name.log" | sed "s/^/   $pname  /"
+    done <<'PLAYS'
+cb1|--engines cb1
+vk|--engines vk
+vk-bilinear|--engines vk --el-scaler bilinear
+cb1-ref-bilinear|--engines cb1 --cb1-mode reference --cb1-fel bilinear
+PLAYS
   fi
 
   # 4. Where the Vulkan engine's GPU time goes (GPU timestamps, reported every
