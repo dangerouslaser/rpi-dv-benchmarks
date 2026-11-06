@@ -1,0 +1,7 @@
+# Pinned inputs. scripts/fetch-sources.sh reads this file.
+# name            url                                                  commit / archive sha256
+yblod             https://github.com/dangerouslaser/libreelec-yblod.git   00d9aa1a7241f2af00255a759ae02a9a34db699c
+x86dvvk           https://github.com/dangerouslaser/intel-dv-libreelec.git 3624692dc195df7d91bc5d336af941dac48e2461
+cb1               https://github.com/CroqueMr/libreelec-x86-DV.git         00615a5a5ea02a49acde5fa992b19ee64065ab25
+ffmpeg            https://ffmpeg.org/releases/ffmpeg-9.0.tar.xz            7f607a00dd0d28a729d5a4811205812eef01cf6ef6155025febb6f36a9062d52
+libplacebo        https://github.com/haasn/libplacebo.git                  e2972fdd09adacd383656738d7d280f0cd84a761
