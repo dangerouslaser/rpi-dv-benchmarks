@@ -40,6 +40,7 @@
 #define _GNU_SOURCE
 #include "source.h"
 #include "alloc.h"
+#include "pi_engine.h"
 #include "dv_engine_vk.h"
 #include "dvbridge_render.h"
 #include "dvbridge_dmabuf.h"
@@ -131,7 +132,9 @@ static int out_alloc(struct out_buf *o)
     o->stride = W * 4;
     /* A page more than the picture: drivers pad buffer requirements (v3dv:
      * a 64-byte read-ahead), which must fit in the dmabuf. */
-    if (dv_dmabuf_alloc(&o->buf, (size_t)o->stride * H + 4096))
+    /* and a row more: the Pi engine sees the buffer as two images of every
+     * other row, the odd rows' starting a row in (stride + 2 stride * H/2). */
+    if (dv_dmabuf_alloc(&o->buf, (size_t)o->stride * (H + 1) + 4096))
         return -1;
     o->fd = o->buf.fd;
     return 0;
@@ -569,6 +572,21 @@ static int vk_submit(const struct dv_picture *q, double pts, long i, unsigned sl
     return rc == 0;
 }
 
+/* ---- the Pi FEL engine (pi_engine.c) ------------------------------------- */
+static struct pi_engine *g_pi;
+static enum pi_mmr_mode g_pi_mode = PI_MMR_EXACT64;   /* the faster exact mode on V3D */
+
+static int pi_frame(const struct dv_picture *q, double pts, long i, unsigned slot)
+{
+    int top_left = cb1_chroma(q->bl->chroma_location, g_profile) == PL_CHROMA_TOP_LEFT;
+    int rc = pi_submit(g_pi, q->bl, g_fel ? q->el : NULL, q->dovi->data, q->dovi->size, top_left,
+                       (int64_t)(pts * 1e6), i == 0, slot);
+    static int reported;
+    if (rc && !reported++)
+        fprintf(stderr, "pi: submit returned %d (>0: the planner's status, or a frame outside this engine)\n", rc);
+    return rc == 0;
+}
+
 /* ---- real-time playback ------------------------------------------------------ */
 
 /* --play: a decode thread fills a player-sized queue while the render loop
@@ -662,7 +680,9 @@ static int play(const char *file, struct dv_source_options so, int engine, doubl
             if (engine == 0) {
                 glClientWaitSync(fences[slot], GL_SYNC_FLUSH_COMMANDS_BIT, UINT64_MAX);
                 glDeleteSync(fences[slot]);
-            } else
+            } else if (engine == 2)
+                pi_wait(g_pi, slot);
+            else
                 vk.wait(g_vke, tickets[slot], UINT64_MAX);
             dv_picture_free(&held[slot]);
             pending[slot] = 0;
@@ -670,12 +690,15 @@ static int play(const char *file, struct dv_source_options so, int engine, doubl
         /* Deadline check of the previous picture: due at this tick. */
         unsigned prev = (unsigned)((k + 2) % 3);
         if (k > 0 && pending[prev]) {
-            int done = engine == 0 ? glClientWaitSync(fences[prev], GL_SYNC_FLUSH_COMMANDS_BIT, 0) != GL_TIMEOUT_EXPIRED
-                                   : vk.wait(g_vke, tickets[prev], 0) == 1;
+            int done = engine == 0   ? glClientWaitSync(fences[prev], GL_SYNC_FLUSH_COMMANDS_BIT, 0) != GL_TIMEOUT_EXPIRED
+                       : engine == 2 ? pi_done(g_pi, prev)
+                                     : vk.wait(g_vke, tickets[prev], 0) == 1;
             if (!done) {
                 res->late++;
                 if (engine == 0)
                     glClientWaitSync(fences[prev], GL_SYNC_FLUSH_COMMANDS_BIT, UINT64_MAX);
+                else if (engine == 2)
+                    pi_wait(g_pi, prev);
                 else
                     vk.wait(g_vke, tickets[prev], UINT64_MAX);
                 double l = now_ms() - due[prev];
@@ -705,7 +728,9 @@ static int play(const char *file, struct dv_source_options so, int engine, doubl
             ok = cb1_render(&p, pts);
             fences[slot] = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
             glFlush();
-        } else
+        } else if (engine == 2)
+            ok = pi_frame(&p, pts, k, slot);
+        else
             ok = vk_submit(&p, pts, k, slot, &tickets[slot]);
         if (!ok) {
             res->failed++;
@@ -724,7 +749,9 @@ static int play(const char *file, struct dv_source_options so, int engine, doubl
             if (engine == 0) {
                 glClientWaitSync(fences[s], GL_SYNC_FLUSH_COMMANDS_BIT, UINT64_MAX);
                 glDeleteSync(fences[s]);
-            } else
+            } else if (engine == 2)
+                pi_wait(g_pi, (unsigned)s);
+            else
                 vk.wait(g_vke, tickets[s], UINT64_MAX);
             dv_picture_free(&held[s]);
         }
@@ -746,9 +773,77 @@ static int play(const char *file, struct dv_source_options so, int engine, doubl
 
 /* ---- main ---------------------------------------------------------------- */
 
+/* --compare: each picture through yblod's engine and the Pi engine; the
+ * tunnel frames decoded back to 12-bit codes and compared. Luma, the
+ * metadata rows and (exact MMR) chroma must match bit for bit. */
+static int compare_run(struct dv_picture *pics, int count, double period, const struct out_buf *a,
+                       const struct out_buf *b)
+{
+    long total_px = 0, y_diff = 0, c_diff = 0, c_hist[4] = {0};
+    int max_dy = 0, max_dc = 0, failed = 0;
+    for (int i = 0; i < count; i++) {
+        uint64_t ticket = 0;
+        double pts = i * period;
+        if (!vk_submit(&pics[i], pts, i, 0, &ticket) || vk.wait(g_vke, ticket, 10000000000ull) != 1 ||
+            !pi_frame(&pics[i], pts, i, 0) || pi_wait(g_pi, 0)) {
+            printf("compare %03d: an engine failed\n", i);
+            failed++;
+            continue;
+        }
+        dv_dmabuf_cpu(&a->buf, 1, 0);
+        dv_dmabuf_cpu(&b->buf, 1, 0);
+        long fy = 0, fc = 0;
+        int fdy = 0, fdc = 0;
+        uint32_t bx0 = W, bx1 = 0, by0 = H, by1 = 0;
+        for (uint32_t y = 0; y < H; y++) {
+            const uint8_t *pa = (const uint8_t *)a->buf.map + (size_t)y * a->stride;
+            const uint8_t *pb = (const uint8_t *)b->buf.map + (size_t)y * b->stride;
+            if (!memcmp(pa, pb, (size_t)W * 4))
+                continue;
+            for (uint32_t x = 0; x < W; x++) {
+                const uint8_t *qa = pa + 4 * x, *qb = pb + 4 * x;
+                int ya = (qa[1] << 4) | (qa[0] & 15), yb = (qb[1] << 4) | (qb[0] & 15);
+                int ca = (qa[2] << 4) | (qa[0] >> 4), cb = (qb[2] << 4) | (qb[0] >> 4);
+                int dy = abs(ya - yb), dc = abs(ca - cb);
+                if (dy) {
+                    if (fy < 4 && getenv("COMPARE_WHERE"))
+                        printf("  luma differs at (%u, %u): yblod %d, pi %d\n", x, y, ya, yb);
+                    fy++;
+                    fdy = dy > fdy ? dy : fdy;
+                    bx0 = x < bx0 ? x : bx0;
+                    bx1 = x > bx1 ? x : bx1;
+                    by0 = y < by0 ? y : by0;
+                    by1 = y > by1 ? y : by1;
+                }
+                if (dc) {
+                    fc++;
+                    fdc = dc > fdc ? dc : fdc;
+                    c_hist[dc > 3 ? 3 : dc - 1]++;
+                }
+            }
+        }
+        dv_dmabuf_cpu(&a->buf, 0, 0);
+        dv_dmabuf_cpu(&b->buf, 0, 0);
+        printf("compare %03d: luma %ld differ (max %d), chroma %ld differ (max %d)", i, fy, fdy, fc, fdc);
+        if (fy)
+            printf(", luma differences within x %u..%u, y %u..%u", bx0, bx1, by0, by1);
+        printf("\n");
+        total_px += (long)W * H;
+        y_diff += fy;
+        c_diff += fc;
+        max_dy = fdy > max_dy ? fdy : max_dy;
+        max_dc = fdc > max_dc ? fdc : max_dc;
+    }
+    printf("compare: %d pictures, luma %ld of %ld samples differ (max %d), chroma %ld differ (max %d; "
+           "by 1: %ld, 2: %ld, 3: %ld, more: %ld)%s\n",
+           count - failed, y_diff, total_px, max_dy, c_diff, max_dc, c_hist[0], c_hist[1], c_hist[2], c_hist[3],
+           failed ? ", FAILURES" : "");
+    return failed || y_diff || (g_pi_mode != PI_MMR_FLOAT && c_diff);
+}
+
 int main(int argc, char **argv)
 {
-    int frames = 48, warmup = 8, fel = 1, contract = 1, hash = 0, run_cb1 = 1, run_vk = 1;
+    int frames = 48, warmup = 8, fel = 1, contract = 1, hash = 0, run_cb1 = 1, run_vk = 1, run_pi = 0, compare = 0;
     double throughput = 0, play_seconds = 0;
     struct dv_source_options so = {.kind = DV_SOURCE_SW, .layout = DV_LAYOUT_SAND30, .extra_frames = 8};
     const char *file = NULL, *node = NULL, *dump = NULL, *json = NULL;
@@ -763,7 +858,13 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--engines") && v) {
             run_cb1 = strstr(v, "cb1") != NULL;
             run_vk = strstr(v, "vk") != NULL;
+            run_pi = strstr(v, "pi") != NULL;
             i++;
+        } else if (!strcmp(a, "--pi-mmr") && v) {
+            const char *m = argv[++i];
+            g_pi_mode = !strcmp(m, "float") ? PI_MMR_FLOAT : !strcmp(m, "exact32") ? PI_MMR_EXACT32 : PI_MMR_EXACT64;
+        } else if (!strcmp(a, "--compare")) {
+            compare = 1;
         } else if (!strcmp(a, "--frames") && v)
             frames = atoi(argv[++i]);
         else if (!strcmp(a, "--warmup") && v)
@@ -880,6 +981,21 @@ int main(int argc, char **argv)
                 return 1;
             }
     }
+    struct out_buf pi_out[3];
+    memset(pi_out, 0, sizeof(pi_out));
+    if (run_pi) {
+        g_pi = pi_create(getenv("PI_DEVICE"), g_pi_mode, contract);
+        if (!g_pi) {
+            fprintf(stderr, "pi: engine didn't start\n");
+            return 1;
+        }
+        for (int i = 0; i < 3; i++)
+            if (out_alloc(&pi_out[i]) || pi_set_output(g_pi, (unsigned)i, pi_out[i].fd, pi_out[i].stride)) {
+                fprintf(stderr, "pi: output %d failed\n", i);
+                return 1;
+            }
+        printf("pi: %s\n", pi_describe(g_pi));
+    }
     pl_opengl gl = NULL;
     struct dvbridge_renderer *cb1 = NULL;
     pl_tex target = NULL;
@@ -932,6 +1048,22 @@ int main(int argc, char **argv)
     g_fel = fel;
     g_contract = contract;
 
+    g_fel = fel;
+    if (compare) {
+        if (!run_vk || !run_pi) {
+            fprintf(stderr, "dvbench: --compare needs --engines vk,pi\n");
+            return 2;
+        }
+        int bad = compare_run(pics, count, period, &vk_out[0], &pi_out[0]);
+        for (int i = 0; i < count; i++)
+            dv_picture_free(&pics[i]);
+        pi_destroy(g_pi);
+        if (vke && vk.destroy)
+            vk.destroy(vke);
+        dv_source_close(src);
+        return bad;
+    }
+
     /* 3. Per picture, synchronous. */
     FILE *js = json ? fopen(json, "w") : NULL;
     if (js)
@@ -944,17 +1076,18 @@ int main(int argc, char **argv)
                 decode_cpu / count, copy_ms / count);
     int status = 0, first_engine = 1;
     double *times = calloc((size_t)count, sizeof(double));
-    for (int engine = 0; engine < 2; engine++) {
-        if ((engine == 0 && !run_cb1) || (engine == 1 && !run_vk))
+    for (int engine = 0; engine < 3; engine++) {
+        if ((engine == 0 && !run_cb1) || (engine == 1 && !run_vk) || (engine == 2 && !run_pi))
             continue;
-        const char *name = engine == 0 ? "cb1" : "yblod-vulkan";
+        const char *name = engine == 0 ? "cb1" : engine == 1 ? "yblod-vulkan" : "pi-fel";
+        double pass_sum[3] = {0}, plan_sum = 0;
         int timed = 0, failed = 0, unpacks = 0;
         double *unpack_times = calloc((size_t)count, sizeof(double));
         for (int i = 0; i < count; i++) {
             struct dv_picture *q = &pics[i];
             double pts = i * period;
             int ok = 0;
-            const struct out_buf *out = engine == 0 ? &cb_out : &vk_out[0];
+            const struct out_buf *out = engine == 0 ? &cb_out : engine == 2 ? &pi_out[0] : &vk_out[0];
             double t0 = now_ms();
             if (engine == 0) {
                 g_time_unpack = 1;
@@ -964,6 +1097,15 @@ int main(int argc, char **argv)
                 glFinish();
                 if (ok && i >= warmup && g_unpack_ms >= 0)
                     unpack_times[unpacks++] = g_unpack_ms;
+            } else if (engine == 2) {
+                ok = pi_frame(q, pts, i, 0) && pi_wait(g_pi, 0) == 0;
+                if (ok && i >= warmup) {
+                    double pm[3], plm;
+                    pi_times(g_pi, 0, pm, &plm);
+                    for (int k = 0; k < 3; k++)
+                        pass_sum[k] += pm[k];
+                    plan_sum += plm;
+                }
             } else {
                 uint64_t ticket = 0;
                 ok = vk_submit(q, pts, i, 0, &ticket) && vk.wait(vke, ticket, 10000000000ull) == 1;
@@ -984,6 +1126,13 @@ int main(int argc, char **argv)
         printf("%-13s per picture: median %.2f ms, p95 %.2f, mean %.2f (%d pictures%s), %.1f fps%s\n", name, s.median,
                s.p95, s.mean, s.n, warmup ? " after warmup" : "", s.median > 0 ? 1e3 / s.median : 0,
                failed ? " FAILURES" : "");
+        if (engine == 2 && s.n) {
+            printf("%-13s of which planning (CPU): %.2f ms", name, plan_sum / s.n);
+            if (pass_sum[0] + pass_sum[1] + pass_sum[2] > 0)
+                printf("; GPU passes (mean, PI_PROFILE): P1 chroma %.2f, P2 4:2:2+pack %.2f ms", pass_sum[0] / s.n,
+                       pass_sum[1] / s.n);
+            printf("\n");
+        }
         struct stats us = summarize(unpack_times, unpacks);
         if (unpacks)
             printf("%-13s of which the bench's SAND->P010 GLES pass: median %.2f ms (CB1 itself: %.2f ms)\n", name,
@@ -1014,6 +1163,8 @@ int main(int argc, char **argv)
                 int ok = 0;
                 if (engine == 0) {
                     ok = cb1_render(q, pts);
+                } else if (engine == 2) {
+                    ok = pi_frame(q, pts, i, (unsigned)(i % 3));
                 } else {
                     unsigned slot = (unsigned)(i % 3);
                     if (tickets[slot] && vk.wait(vke, tickets[slot], UINT64_MAX) != 1)
@@ -1026,6 +1177,9 @@ int main(int argc, char **argv)
             }
             if (engine == 0)
                 glFinish();
+            else if (engine == 2)
+                for (unsigned k = 0; k < 3; k++)
+                    pi_wait(g_pi, k);
             else
                 for (int k = 0; k < 3; k++)
                     if (tickets[k])

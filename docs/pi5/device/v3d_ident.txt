@@ -1,0 +1,53 @@
+cat: /sys/kernel/debug/dri/1/v3d_ident: No such file or directory
+Revision:   7.1.10.16
+MMU:        yes
+TFU:        no
+MSO:        yes
+L3C:        no (0kb)
+Core 0:
+  Revision:     7.1
+  Slices:       3
+  TMUs:         3
+  QPUs:         12
+  Semaphores:   0
+/sys/kernel/debug/dri/0:
+bo_stats
+clients
+gem_names
+measure_clock
+name
+v3d_ident
+v3d_mm
+v3d_regs
+
+/sys/kernel/debug/dri/1:
+clients
+crtc-0
+crtc0_regs
+crtc-1
+crtc1_regs
+crtc-2
+crtc-3
+encoder-0
+encoder-1
+encoder-2
+encoder-3
+framebuffer
+gem_names
+hdmi0_regs
+hdmi1_regs
+HDMI-A-1
+HDMI-A-2
+hvs_dlist_allocs
+hvs_dlists
+hvs_lbm
+hvs_regs
+hvs_underrun
+hvs_upm
+internal_clients
+moplet_regs
+mop_regs
+name
+state
+Writeback-1
+Writeback-2
