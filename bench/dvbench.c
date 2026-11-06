@@ -562,7 +562,11 @@ static int vk_submit(const struct dv_picture *q, double pts, long i, unsigned sl
                              .pts = (int64_t)(pts * 1e6), .white_nits = 203.0, .cb1_contract = (uint32_t)g_contract},
                     .bl_surface = bl_id, .el_surface = el_id, .metadata = q->dovi->data,
                     .metadata_size = q->dovi->size, .output = slot};
-    return vk.submit(g_vke, &f, ticket) == 0;
+    int rc = vk.submit(g_vke, &f, ticket);
+    static int reported;
+    if (rc && !reported++)
+        fprintf(stderr, "vk: dvvk_submit returned %d (-1 invalid, -2 unsupported by the planner, -8 backend)\n", rc);
+    return rc == 0;
 }
 
 /* ---- real-time playback ------------------------------------------------------ */

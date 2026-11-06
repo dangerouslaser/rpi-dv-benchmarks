@@ -1,0 +1,25 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// vk-micro, compute: IN_BUF|IN_TEX, OUT_BUF (RGBA8 words) | OUT_IMG (storage image)
+layout(local_size_x_id = 0, local_size_y_id = 1) in;
+#include "fetch.glsl"
+#include "core.glsl"
+
+#ifdef OUT_BUF
+layout(std430, binding = 4) writeonly buffer Out { uint outp[]; };
+#else
+layout(binding = 5, rgba8) uniform writeonly image2D out_img;
+#endif
+
+void main()
+{
+    uvec2 p = gl_GlobalInvocationID.xy;
+    if (p.x >= pc.width || p.y >= pc.height)
+        return;
+    vec4 c = dv_pixel(fetch(p), pc.work, pc.mode);
+#ifdef OUT_BUF
+    outp[p.y * pc.width + p.x] = packUnorm4x8(c);
+#else
+    imageStore(out_img, ivec2(p), c);
+#endif
+}

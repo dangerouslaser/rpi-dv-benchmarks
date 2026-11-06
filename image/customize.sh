@@ -48,6 +48,10 @@ users:
     passwd: "$HASH"
     sudo: ["ALL=(ALL) NOPASSWD:ALL"]
 ssh_pwauth: true
+# Raspberry Pi OS ships the first user's home already populated, so /etc/skel
+# isn't copied into it: add the shortcuts here.
+runcmd:
+  - [su, ${DV_USER:-dv}, -c, "cp -an /etc/skel/dvbench /etc/skel/clips /etc/skel/README-dvbench.txt ~/"]
 EOF
 touch "$R/boot/firmware/ssh"
 chroot "$R" systemctl enable ssh >/dev/null 2>&1 || true

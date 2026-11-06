@@ -19,3 +19,29 @@ add_executable(vk-compile vk-compile.c)
 target_include_directories(vk-compile PRIVATE ${DVVK_INCLUDE_DIR})
 target_link_libraries(vk-compile PRIVATE ${CMAKE_DL_LIBS})
 install(TARGETS dvbench probe-dmabuf vk-compile RUNTIME DESTINATION bin)
+
+# vk-micro: one synthetic 4K pass as Vulkan compute (buffers / images),
+# Vulkan fragment, GLES fragment and GLES compute (is it Vulkan, or the design?)
+find_program(GLSLC glslc REQUIRED)
+set(MICRO ${CMAKE_CURRENT_SOURCE_DIR}/micro)
+set(MICRO_OUT ${CMAKE_CURRENT_BINARY_DIR}/micro)
+file(MAKE_DIRECTORY ${MICRO_OUT})
+set(MICRO_HEADERS)
+foreach(spec "comp_buf_buf micro.comp -DIN_BUF -DOUT_BUF" "comp_tex_buf micro.comp -DIN_TEX -DOUT_BUF"
+             "comp_tex_img micro.comp -DIN_TEX -DOUT_IMG" "frag_buf micro.frag -DIN_BUF"
+             "frag_tex micro.frag -DIN_TEX" "vert micro.vert")
+  separate_arguments(args UNIX_COMMAND "${spec}")
+  list(POP_FRONT args name src)
+  add_custom_command(OUTPUT ${MICRO_OUT}/${name}.h
+    COMMAND ${GLSLC} --target-env=vulkan1.1 -O -mfmt=c -I${MICRO} ${args} ${MICRO}/${src} -o ${MICRO_OUT}/${name}.h
+    DEPENDS ${MICRO}/${src} ${MICRO}/core.glsl ${MICRO}/fetch.glsl VERBATIM)
+  list(APPEND MICRO_HEADERS ${MICRO_OUT}/${name}.h)
+endforeach()
+add_custom_command(OUTPUT ${MICRO_OUT}/core_glsl.h
+  COMMAND ${CMAKE_COMMAND} -DIN=${MICRO}/core.glsl -DOUT=${MICRO_OUT}/core_glsl.h -DNAME=core_glsl -P ${MICRO}/embed.cmake
+  DEPENDS ${MICRO}/core.glsl ${MICRO}/embed.cmake VERBATIM)
+add_executable(vk-micro vk-micro.c ${MICRO_HEADERS} ${MICRO_OUT}/core_glsl.h)
+target_include_directories(vk-micro PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+target_compile_options(vk-micro PRIVATE -O2 -Wall)
+target_link_libraries(vk-micro PRIVATE vulkan PkgConfig::DEPS)
+install(TARGETS vk-micro RUNTIME DESTINATION bin)
