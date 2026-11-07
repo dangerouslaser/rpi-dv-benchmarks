@@ -35,7 +35,7 @@ terms).
 | `engine/` | The engine, `libpi_engine`: `pi_engine.h` (the API), `pi_engine.c`, `pi_input.c` (a player's input glue: the Profile 7 split, BL / EL pairing), its shaders (`shaders/`: two fragment passes; `spirv/`: their committed SPIR-V), the planner (`planner/`: the CPU half, vendored from yblod) |
 | `bench/` | `dvbench`: decode (the Pi's V4L2 decoder, or software into the same SAND128 layout) + the engine, timed, with playback, sync_file fences and output hashes; `--probe` checks a machine |
 | `patches/ffmpeg/` | FFmpeg 9.0 as LibreELEC builds it for the Pi 5, plus Dolby Vision stream patches for the bench (`patches/ffmpeg/README.md`) |
-| `patches/linux/` | The Raspberry Pi kernel's `vc4` HDMI driver: the Dolby Vision vendor infoframe (`patches/linux/README.md`) |
+| `patches/linux/` | The Raspberry Pi kernel: the HDMI connector property `Dolby Vision`, attached by `vc4` (`patches/linux/README.md`) |
 | `tests/` | `check.sh`: the engine must reproduce `golden/hashes.txt` (verified identical to yblod); `make-test-clips.sh`: profile 8.1 / MEL / MMR clips from Profile 7 sources |
 | `bundle/` | What goes onto the Pi: `run-bench.sh` (correctness, speed, MMR modes, real-time playback, shader statistics), `summarize.py` |
 | `image/`, `scripts/make-image.sh` | A flashable Raspberry Pi OS image with the bundle and clips |

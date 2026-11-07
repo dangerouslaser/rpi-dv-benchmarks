@@ -136,10 +136,13 @@ Vision (`dvbench --kms-play` sets all of it):
   Blu-ray), no scaling.
 - **RGB, full range, 8 bits per channel:** the connector's `Broadcast RGB` =
   Full and `max bpc` = 8. Limited range would rewrite the packed bits.
-- **The Dolby Vision vendor infoframe:** the HDMI 1.4 VSIF (OUI 00-0C-03)
-  with a 24-byte payload, zero but for the OUI. The Raspberry Pi kernel has no
-  way to send it; `patches/linux/` adds one to `vc4`. Without it the TV shows
-  the frame as SDR RGB.
+- **A Dolby Vision vendor infoframe:** the HDMI 1.4 VSIF (OUI 00-0C-03)
+  padded to 24 bytes, or Dolby's (OUI 00-D0-46). The Raspberry Pi kernel has
+  no way to send one; `patches/linux/` adds the HDMI connector property
+  `Dolby Vision` (`Off`, `Standard (HDMI VSIF)`, `Standard (Dolby VSIF)`),
+  which the player sets with the mode and sets back to `Off` after. Without
+  it the TV shows the frame as SDR RGB. A TV may stay in Dolby Vision when
+  the infoframe just stops; `Off` sends the ordinary one.
 - **The output behind its sync_file** (`IN_FENCE_FD`), as above.
 
 On an LG B4 (webOS 9.1), the TV then reports `hdrType` DolbyVision for its
@@ -298,7 +301,8 @@ reads no environment. `--measure` takes the same names, comma-separated.
 | `PI_COPY_OUTPUT=1` | `copy_output` | render to an image and copy it to the dmabuf, as on devices without linear DRM-modifier attachments (lavapipe) |
 | `PI_FORCE_WIDE=1` | `force_wide` | compute 64-bit LUT MMRs in the 128-bit path |
 | `PI_DEVICE=NAME` | | Vulkan device (as `dvbench --device`) |
-| `DVBENCH_ALLOC=udmabuf\|cma\|system` | | the bench's dmabuf allocator (default: the first that works) |
+| `DVBENCH_ALLOC=udmabuf\|cma\|system` | | the bench's dmabuf allocator (default: the first that works, in the order udmabuf, system, cma: CMA is the Pi decoder's) |
+| `DVBENCH_DV_VSIF=hdmi\|dolby` | | `--kms-play`'s `Dolby Vision` value: the HDMI VSIF (default) or Dolby's |
 
 `dvbench --probe` checks the allocator, the device and an output import.
 `--no-fences` makes `--play` wait on the engine instead of the sync_files.

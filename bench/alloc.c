@@ -58,12 +58,13 @@ static int allocate(size_t size)
         kind = "udmabuf";
         return fd;
     }
-    if ((!want || !strcmp(want, "cma")) && (fd = heap("linux,cma", size)) >= 0) {
-        kind = "cma";
-        return fd;
-    }
+    /* the system heap before CMA, which the Pi's decoder allocates from */
     if ((!want || !strcmp(want, "system")) && (fd = heap("system", size)) >= 0) {
         kind = "system";
+        return fd;
+    }
+    if ((!want || !strcmp(want, "cma")) && (fd = heap("linux,cma", size)) >= 0) {
+        kind = "cma";
         return fd;
     }
     fprintf(stderr, "alloc: no udmabuf or DMA heap%s%s\n", want ? " for DVBENCH_ALLOC=" : "", want ? want : "");

@@ -32,7 +32,9 @@
  *                        import release, teardown with renders in flight
  *     --kms-play S       then play S seconds on the HDMI output (KMS): the
  *                        stream's size and frame rate, RGB full range, 8 bits
- *                        per channel, each frame behind its sync_file
+ *                        per channel, the connector's Dolby Vision property
+ *                        on (where the kernel has it), each frame behind its
+ *                        sync_file
  *     --kms-writeback    then show the output on a KMS plane with the render's
  *                        sync_file as IN_FENCE_FD, captured by a writeback
  *                        connector (no display needed), and compare the
@@ -679,6 +681,7 @@ static void kms_close(struct kms *k)
 struct kms_out {
     int fd;
     uint32_t crtc, conn, plane, mode_blob, fb[3];
+    uint32_t dv;   /* the connector's "Dolby Vision" property, set while shown; 0 none */
 };
 
 /* The connected HDMI connector, its CRTC and primary plane, a mode of the
@@ -785,6 +788,14 @@ static int kms_out_show(struct kms_out *k, const struct out_buf *o, int i, int f
         drmModeAtomicAddProperty(r, k->conn, prop_id(k->fd, k->conn, N, "Broadcast RGB"),
                                  enum_value(k->fd, k->conn, N, "Broadcast RGB", "Full"));
         drmModeAtomicAddProperty(r, k->conn, prop_id(k->fd, k->conn, N, "max bpc"), 8);
+        /* TV-led Dolby Vision signalling (patches/linux): DVBENCH_DV_VSIF=dolby
+         * for the Dolby VSIF, else the HDMI one */
+        const char *vsif = getenv("DVBENCH_DV_VSIF");
+        if ((k->dv = prop_id(k->fd, k->conn, N, "Dolby Vision")))
+            drmModeAtomicAddProperty(r, k->conn, k->dv,
+                                     enum_value(k->fd, k->conn, N, "Dolby Vision",
+                                                vsif && !strcmp(vsif, "dolby") ? "Standard (Dolby VSIF)"
+                                                                               : "Standard (HDMI VSIF)"));
         drmModeAtomicAddProperty(r, k->plane, prop_id(k->fd, k->plane, P, "CRTC_ID"), k->crtc);
         drmModeAtomicAddProperty(r, k->plane, prop_id(k->fd, k->plane, P, "SRC_X"), 0);
         drmModeAtomicAddProperty(r, k->plane, prop_id(k->fd, k->plane, P, "SRC_Y"), 0);
@@ -809,6 +820,14 @@ static void kms_out_close(struct kms_out *k)
 {
     if (k->fd < 0)
         return;
+    if (k->dv) {   /* Off again, or the console stays flagged as Dolby Vision */
+        drmModeAtomicReq *r = drmModeAtomicAlloc();
+        drmModeAtomicAddProperty(r, k->conn, k->dv,
+                                 enum_value(k->fd, k->conn, DRM_MODE_OBJECT_CONNECTOR, "Dolby Vision", "Off"));
+        if (drmModeAtomicCommit(k->fd, r, DRM_MODE_ATOMIC_ALLOW_MODESET, NULL))
+            fprintf(stderr, "kms: Dolby Vision off: %s\n", strerror(errno));
+        drmModeAtomicFree(r);
+    }
     for (int i = 0; i < 3; i++)
         if (k->fb[i])
             drmModeRmFB(k->fd, k->fb[i]);
