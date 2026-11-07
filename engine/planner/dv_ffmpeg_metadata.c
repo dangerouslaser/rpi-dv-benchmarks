@@ -5,13 +5,11 @@
 #include <limits.h>
 #include <string.h>
 
-#ifdef DV_FFMPEG_RAW_EXTENSIONS
-/* This feature is compiled only against the matching private FFmpeg header.
- * The public prefix still accepts unextended metadata for CM2.9. */
-#define EXT_PREFIX offsetof(AVDOVIDmData,dvbridge_raw_magic)
-#else
+#include <stddef.h>
+
 #define EXT_PREFIX sizeof(AVDOVIDmData)
-#endif
+_Static_assert(EXT_PREFIX<=DV_FFMPEG_EXT_PARSED,"dv_ffmpeg_ext_pair.parsed holds an AVDOVIDmData");
+_Static_assert(AV_DOVI_MAX_EXT_BLOCKS<=DV_FFMPEG_EXT_MAX,"dv_ffmpeg_ext holds every block");
 
 static int span(size_t offset,size_t length,size_t total)
 {return offset>=sizeof(AVDOVIMetadata)&&offset<=total&&length<=total-offset;}
@@ -35,10 +33,65 @@ static void put16(unsigned char *p,uint32_t value)
 static void put32(unsigned char *p,uint32_t value)
 {put16(p,value>>16);put16(p+2,value&65535u);}
 
+static int cm4_level(unsigned level)
+{return level==3||level==8||level==9||level==10||level==11||level==254;}
+static const dv_rpu_ext_block *cached(const dv_ffmpeg_ext_pair *pair,int count,const unsigned char *block)
+{
+    for(int i=0;i<count;++i)if(!memcmp(pair[i].parsed,block,EXT_PREFIX))return &pair[i].raw;
+    return NULL;
+}
+static void keep(dv_ffmpeg_ext_pair *pair,int *count,const unsigned char *block,const dv_rpu_ext_block *raw)
+{
+    if(*count>=DV_FFMPEG_EXT_MAX)return;
+    memset(pair[*count].parsed,0,sizeof(pair[*count].parsed));
+    memcpy(pair[*count].parsed,block,EXT_PREFIX);pair[(*count)++].raw=*raw;
+}
+
+void dv_ffmpeg_ext_resolve(const void *data,size_t bytes,const uint8_t *rpu,size_t rpu_size,
+                           dv_ffmpeg_ext_cache *cache,dv_ffmpeg_ext *out)
+{
+    memset(out,0,sizeof(*out));
+    if(!data||!cache||bytes<sizeof(AVDOVIMetadata))return;
+    AVDOVIMetadata m;memcpy(&m,data,sizeof(m));
+    if(m.num_ext_blocks<=0||m.num_ext_blocks>AV_DOVI_MAX_EXT_BLOCKS||m.ext_block_size<EXT_PREFIX||
+       m.ext_block_size>bytes/(size_t)m.num_ext_blocks||
+       !span(m.ext_block_offset,m.ext_block_size*(size_t)m.num_ext_blocks,bytes))return;
+    const unsigned char *base=(const unsigned char *)data+m.ext_block_offset;
+    out->count=m.num_ext_blocks;
+    if(!rpu){   /* FFmpeg repeats the last RPU's metadata */
+        for(int i=0;i<m.num_ext_blocks;++i){const unsigned char *block=base+(size_t)i*m.ext_block_size;
+            const dv_rpu_ext_block *b=cm4_level(block[0])?cached(cache->prev,cache->last,block):NULL;
+            if(b)out->block[i]=*b;}
+        return;
+    }
+    dv_rpu_ext x;
+    if(dv_rpu_ext_parse(rpu,rpu_size,&x)||!x.dm_present)return;
+    /* a level's blocks pair in stream order, when both have as many (FFmpeg
+     * keeps a static one with dm_compression from the cache, not the RPU) */
+    unsigned have[256]={0},raw[256]={0},seen[256]={0};
+    for(int i=0;i<m.num_ext_blocks;++i)++have[base[(size_t)i*m.ext_block_size]];
+    for(int i=0;i<x.count;++i)
+        if(!x.dm_compression||!dv_rpu_ext_static(x.block[i].level))++raw[x.block[i].level];
+    if(!x.dm_compression)cache->statics=0;
+    cache->last=0;
+    for(int i=0;i<m.num_ext_blocks;++i){const unsigned char *block=base+(size_t)i*m.ext_block_size;
+        unsigned level=block[0],k=seen[level]++;
+        if(!cm4_level(level))continue;
+        const dv_rpu_ext_block *b;
+        if(x.dm_compression&&dv_rpu_ext_static(level))b=cached(cache->stat,cache->statics,block);
+        else b=have[level]==raw[level]?dv_rpu_ext_find(&x,level,k):NULL;
+        if(!b)continue;
+        out->block[i]=*b;
+        if(!x.dm_compression&&dv_rpu_ext_static(level))keep(cache->stat,&cache->statics,block,b);
+        keep(cache->prev,&cache->last,block,b);
+    }
+}
+
 static dv_status settings_from_ffmpeg(const void *data,size_t bytes,unsigned width,unsigned height,
                                  dv_identity identity,dv_frame_settings *out,
                                  unsigned char source_dm[512],size_t *source_bytes,
-                                 dv_single_reshape *single,int source_transport,unsigned sample_depth)
+                                 dv_single_reshape *single,int source_transport,unsigned sample_depth,
+                                 const dv_ffmpeg_ext *original)
 {
     if(!data||!out||!source_dm||!source_bytes||bytes<sizeof(AVDOVIMetadata)||
        !width||!height||width>4096||height>4096||width%4||height%4)return DV_INVALID;
@@ -126,20 +179,16 @@ static dv_status settings_from_ffmpeg(const void *data,size_t bytes,unsigned wid
             result.active[0]=fields[0];result.active[1]=fields[2];result.active[2]=width-fields[1];result.active[3]=height-fields[3];break;
         case 6:continue;
         case 3:case 8:case 9:case 10:case 11:case 254:{
-#ifdef DV_FFMPEG_RAW_EXTENSIONS
-            if(metadata.ext_block_size<sizeof(ext))return DV_UNSUPPORTED;
-            memcpy(&ext,block,sizeof(ext));
-            if(ext.dvbridge_raw_magic!=UINT32_C(0x41424456))return DV_UNSUPPORTED;
+            /* CM v4.0: re-encoded from the block's original bytes */
+            const dv_rpu_ext_block *x=original&&i<original->count?&original->block[i]:NULL;
+            if(!x||x->level!=ext.level||!x->whole)return DV_UNSUPPORTED;
             unsigned char converted[32];size_t converted_bytes=0;
-            if(dv_cm4_extension(ext.level,ext.dvbridge_original_bytes,
-                ext.dvbridge_original_length,converted,sizeof(converted),&converted_bytes))return DV_UNSUPPORTED;
+            if(dv_cm4_extension(ext.level,x->bytes,x->length,converted,sizeof(converted),&converted_bytes))
+                return DV_UNSUPPORTED;
             if(used+5+converted_bytes>sizeof(payload))return DV_UNSUPPORTED;
             put32(payload+used,(uint32_t)converted_bytes);payload[used+4]=ext.level;
             memcpy(payload+used+5,converted,converted_bytes);used+=5+converted_bytes;++payload[70];
             continue;
-#else
-            return DV_UNSUPPORTED;
-#endif
         }
         default:return DV_UNSUPPORTED;
         }
@@ -153,25 +202,28 @@ static dv_status settings_from_ffmpeg(const void *data,size_t bytes,unsigned wid
 }
 
 dv_status dv_settings_from_ffmpeg(const void *data,size_t bytes,unsigned width,unsigned height,
-    dv_identity identity,dv_frame_settings *out,unsigned char source_dm[512],size_t *source_bytes)
+    dv_identity identity,dv_frame_settings *out,unsigned char source_dm[512],size_t *source_bytes,
+    const dv_ffmpeg_ext *original)
 {
-    return settings_from_ffmpeg(data,bytes,width,height,identity,out,source_dm,source_bytes,NULL,0,10);
+    return settings_from_ffmpeg(data,bytes,width,height,identity,out,source_dm,source_bytes,NULL,0,10,original);
 }
 dv_status dv_transport_settings_from_ffmpeg(const void *data,size_t bytes,unsigned width,unsigned height,
-    dv_identity identity,dv_frame_settings *out,unsigned char source_dm[512],size_t *source_bytes)
+    dv_identity identity,dv_frame_settings *out,unsigned char source_dm[512],size_t *source_bytes,
+    const dv_ffmpeg_ext *original)
 {
-    return settings_from_ffmpeg(data,bytes,width,height,identity,out,source_dm,source_bytes,NULL,1,10);
+    return settings_from_ffmpeg(data,bytes,width,height,identity,out,source_dm,source_bytes,NULL,1,10,original);
 }
 
 dv_status dv_single_settings_from_ffmpeg_for_depth(const void *data,size_t bytes,unsigned width,unsigned height,
     unsigned sample_depth,
-    dv_identity identity,dv_single_frame_settings *out,unsigned char source_dm[512],size_t *source_bytes)
+    dv_identity identity,dv_single_frame_settings *out,unsigned char source_dm[512],size_t *source_bytes,
+    const dv_ffmpeg_ext *original)
 {
     if(!out||!source_dm||!source_bytes)return DV_INVALID;
     if(sample_depth!=8&&sample_depth!=10)return DV_UNSUPPORTED;
     dv_frame_settings common;dv_single_frame_settings result={0};
     unsigned char payload[512];size_t used=0;
-    dv_status status=settings_from_ffmpeg(data,bytes,width,height,identity,&common,payload,&used,&result.mapping,1,sample_depth);
+    dv_status status=settings_from_ffmpeg(data,bytes,width,height,identity,&common,payload,&used,&result.mapping,1,sample_depth,original);
     if(status!=DV_OK)return status;
     if(dv_single_reshape_narrow_mask(&result.mapping,result.narrow_mask))return DV_UNSUPPORTED;
     result.identity=common.identity;result.source=common.source;
@@ -179,5 +231,6 @@ dv_status dv_single_settings_from_ffmpeg_for_depth(const void *data,size_t bytes
     *out=result;memcpy(source_dm,payload,used);*source_bytes=used;return DV_OK;
 }
 dv_status dv_single_settings_from_ffmpeg(const void *data,size_t bytes,unsigned width,unsigned height,
-    dv_identity identity,dv_single_frame_settings *out,unsigned char source_dm[512],size_t *source_bytes)
-{return dv_single_settings_from_ffmpeg_for_depth(data,bytes,width,height,10,identity,out,source_dm,source_bytes);}
+    dv_identity identity,dv_single_frame_settings *out,unsigned char source_dm[512],size_t *source_bytes,
+    const dv_ffmpeg_ext *original)
+{return dv_single_settings_from_ffmpeg_for_depth(data,bytes,width,height,10,identity,out,source_dm,source_bytes,original);}

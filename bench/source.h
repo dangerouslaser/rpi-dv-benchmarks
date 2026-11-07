@@ -5,7 +5,7 @@
  *     (alloc.h) in the Pi decoder's exact SAND128 P030 layout, so the
  *     engine's input path runs on any Linux box.
  * Profile 7's BL and EL are decoded separately (single-track: split by
- * pi_p7_split) and paired by display time (source.c take()). This is the
+ * pi_p7_split) and paired by display time (pi_pairer). This is the
  * template for a player's input glue.
  * SPDX-License-Identifier: GPL-2.0-or-later */
 #pragma once

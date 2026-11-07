@@ -67,6 +67,7 @@
 #include "alloc.h"
 #include "pi_engine.h"
 #include <errno.h>
+#include <libavutil/dovi_meta.h>
 #include <math.h>
 #include <poll.h>
 #include <drm_fourcc.h>
@@ -214,10 +215,16 @@ static struct pi_engine *g_pi;
 static int g_profile, g_fel = 1, g_fences = 1, g_implicit, g_reopen, g_kms, g_selftest;
 static double g_kms_play;
 
+/* The frame carrying the picture's RPU when it's the EL's (source.c). */
+static const AVFrame *rpu_frame(const struct dv_picture *q)
+{
+    return q->el && !av_frame_get_side_data(q->bl, AV_FRAME_DATA_DOVI_METADATA) ? q->el : NULL;
+}
+
 /* acquire_fd: taken; release_fd: NULL, or the render's sync_file (-1 none). */
 static int render_fenced(const struct dv_picture *q, double pts, struct out_buf *o, int acquire_fd, int *release_fd)
 {
-    struct pi_frame f = {.bl = q->bl, .el = g_fel ? q->el : NULL, .rpu = q->dovi->data, .rpu_size = q->dovi->size,
+    struct pi_frame f = {.bl = q->bl, .el = g_fel ? q->el : NULL, .rpu_frame = rpu_frame(q),
                          .chroma_top_left = pi_chroma_top_left(q->bl, g_profile), .pts_us = (int64_t)(pts * 1e6),
                          .acquire_fd = acquire_fd};
     int rc = pi_render(g_pi, &f, o->out, release_fd);
@@ -969,6 +976,100 @@ static void st_check(int ok, const char *what, int got)
     printf("selftest: %s  %s (%d)\n", ok ? "ok  " : "FAIL", what, got);
 }
 
+/* A frame for the pairer's checks: its pts, and an RPU with a residual (1),
+ * without one (0), or none (-1). */
+static AVFrame *pair_frame(int64_t pts, int residual)
+{
+    AVFrame *f = av_frame_alloc();
+    if (!f)
+        return NULL;
+    f->pts = pts;
+    if (residual >= 0) {
+        size_t size;
+        AVDOVIMetadata *m = av_dovi_metadata_alloc(&size);
+        AVBufferRef *b = m ? av_buffer_create((uint8_t *)m, size, NULL, NULL, 0) : NULL;
+        if (!b) {
+            av_free(m);
+            av_frame_free(&f);
+            return NULL;
+        }
+        av_dovi_get_header(m)->disable_residual_flag = !residual;
+        if (!av_frame_new_side_data_from_buf(f, AV_FRAME_DATA_DOVI_METADATA, b)) {
+            av_buffer_unref(&b);
+            av_frame_free(&f);
+        }
+    }
+    return f;
+}
+
+/* Pops every pair (end), each as "bl/el" pts ("-" none), into out. */
+static void pair_drain(struct pi_pairer *pp, int end, char *out, size_t room)
+{
+    AVFrame *bl, *el;
+    out[0] = 0;
+    while (pi_pairer_pop(pp, end, &bl, &el) == 1) {
+        size_t n = strlen(out);
+        if (el)
+            snprintf(out + n, room - n, "%s%lld/%lld", n ? " " : "", (long long)bl->pts, (long long)el->pts);
+        else
+            snprintf(out + n, room - n, "%s%lld/-", n ? " " : "", (long long)bl->pts);
+        av_frame_free(&bl);
+        av_frame_free(&el);
+    }
+}
+
+/* The BL / EL pairer and pi_frame_needs_el, on synthetic frames. */
+static void pair_selftest(void)
+{
+    AVFrame *a = pair_frame(0, 1), *b = pair_frame(0, 0), *c = pair_frame(0, -1);
+    st_check(pi_frame_needs_el(a) == 1 && pi_frame_needs_el(b) == 0 && pi_frame_needs_el(c) == PI_E_BAD_RPU,
+             "pi_frame_needs_el: a residual 1, none 0, no RPU PI_E_BAD_RPU", pi_frame_needs_el(a));
+    av_frame_free(&a);
+    av_frame_free(&b);
+    av_frame_free(&c);
+
+    struct pi_pairer *pp;
+    char got[256];
+    int ok = !pi_pairer_create(2, &pp);
+    /* the EL decoder's output, in display order, carries its packets' times */
+    static const int64_t el_pts[8] = {0, 3, 1, 2, 6, 4, 5, 7};
+    for (int i = 0; ok && i < 8; i++)
+        ok = !pi_pairer_push(pp, 0, pair_frame(i, 1), 0) && !pi_pairer_push(pp, 1, pair_frame(el_pts[i], -1), 2);
+    pair_drain(pp, 1, got, sizeof(got));
+    st_check(ok && !strcmp(got, "0/0 1/1 2/2 3/3 4/4 5/5 6/6 7/7"),
+             "pairer: an EL in another coding order pairs by display time", ok);
+    if (strcmp(got, "0/0 1/1 2/2 3/3 4/4 5/5 6/6 7/7"))
+        printf("selftest: pairs %s\n", got);
+    pi_pairer_destroy(pp);
+
+    /* lost: EL 2 (BL needs it), EL 3 (BL doesn't: MEL), BL 4 */
+    ok = !pi_pairer_create(2, &pp);
+    static const int64_t bls[5] = {0, 1, 2, 3, 5}, els[4] = {0, 1, 4, 5};
+    for (int i = 0; ok && i < 5; i++)
+        ok = !pi_pairer_push(pp, 0, pair_frame(bls[i], bls[i] != 3), 0);
+    for (int i = 0; ok && i < 4; i++)
+        ok = !pi_pairer_push(pp, 1, pair_frame(els[i], -1), 0);
+    pair_drain(pp, 1, got, sizeof(got));
+    struct pi_pair_stats st;
+    pi_pairer_stats(pp, &st);
+    int lost = ok && !strcmp(got, "0/0 1/1 3/- 5/5") && st.bl_dropped == 1 && st.bl_alone == 1 && st.el_dropped == 1;
+    st_check(lost, "pairer: a lost EL drops its FEL BL, gives a MEL BL alone; a lost BL drops its EL", ok);
+    if (!lost)
+        printf("selftest: pairs %s (BLs dropped %u, alone %u, ELs dropped %u)\n", got, st.bl_dropped, st.bl_alone,
+               st.el_dropped);
+    pi_pairer_destroy(pp);
+
+    /* an EL decoder that gives nothing */
+    ok = !pi_pairer_create(2, &pp);
+    for (int i = 0; ok && i < 8; i++)
+        ok = !pi_pairer_push(pp, 0, pair_frame(i, 1), 0);
+    pair_drain(pp, 0, got, sizeof(got));
+    pi_pairer_stats(pp, &st);
+    st_check(ok && st.el_absent && !strcmp(got, "0/- 1/- 2/- 3/- 4/- 5/- 6/- 7/-"),
+             "pairer: no EL pictures by the 8th BL: BLs alone", st.el_absent);
+    pi_pairer_destroy(pp);
+}
+
 static int selftest(struct pi_options base, struct dv_picture *pics, int count, uint32_t W, uint32_t H, double period)
 {
     struct logcount lc = {0};
@@ -980,6 +1081,16 @@ static int selftest(struct pi_options base, struct dv_picture *pics, int count, 
     if (pi_engine_create(&po, &e))
         return 1;
     g_pi = e;
+    pair_selftest();
+    struct pi_probe_info info;
+    const AVFrame *rf = pics[0].el && !av_frame_get_side_data(pics[0].bl, AV_FRAME_DATA_DOVI_METADATA) ? pics[0].el
+                                                                                                      : pics[0].bl;
+    int needs = pi_frame_needs_el(rf);
+    st_check(pics[0].el ? needs == 0 || needs == 1 : needs == 0,
+             "pi_frame_needs_el on the clip: 0 or 1, 0 without an EL", needs);
+    int probed = pi_probe(&po, &info);
+    st_check(!probed && !strncmp(pi_engine_describe(e), info.device, strlen(info.device)),
+             "pi_probe: the engine's device", probed);
     struct out_buf o[2];
     memset(o, 0, sizeof(o));
     struct pi_stream_info si = {.width = W, .height = H, .profile = g_profile};
@@ -1008,8 +1119,8 @@ static int selftest(struct pi_options base, struct dv_picture *pics, int count, 
              "output claiming more bytes than the dmabuf: PI_E_INVALID", (int)(real & 0x7fffffff));
     rc = pi_output_import(e, o[1].buf.fd, W / 2, H / 2, o[1].stride / 2, o[1].buf.size, &bad);
     if (!rc) {
-        f = (struct pi_frame){.bl = pics[0].bl, .el = g_fel ? pics[0].el : NULL, .rpu = pics[0].dovi->data,
-                              .rpu_size = pics[0].dovi->size, .acquire_fd = -1};
+        f = (struct pi_frame){.bl = pics[0].bl, .el = g_fel ? pics[0].el : NULL, .rpu_frame = rpu_frame(&pics[0]),
+                              .acquire_fd = -1};
         st_check(pi_render(e, &f, bad, NULL) == PI_E_INVALID, "render into an output of another size: PI_E_INVALID", 0);
         pi_output_release(e, bad);
     } else
@@ -1020,7 +1131,7 @@ static int selftest(struct pi_options base, struct dv_picture *pics, int count, 
     fake->format = AV_PIX_FMT_YUV420P10;
     fake->width = (int)W;
     fake->height = (int)H;
-    f = (struct pi_frame){.bl = fake, .rpu = pics[0].dovi->data, .rpu_size = pics[0].dovi->size, .acquire_fd = -1};
+    f = (struct pi_frame){.bl = fake, .acquire_fd = -1};
     st_check(pi_render(e, &f, o[0].out, NULL) == PI_E_UNSUPPORTED_FORMAT, "a software frame: PI_E_UNSUPPORTED_FORMAT", 0);
     fake->format = AV_PIX_FMT_DRM_PRIME;
     fake->width = (int)W / 2;
@@ -1028,11 +1139,16 @@ static int selftest(struct pi_options base, struct dv_picture *pics, int count, 
     fake->width = (int)W;   /* DRM PRIME, no descriptor */
     st_check(pi_render(e, &f, o[0].out, NULL) == PI_E_UNSUPPORTED_FORMAT, "DRM PRIME without a descriptor: PI_E_UNSUPPORTED_FORMAT", 0);
     av_frame_free(&fake);
-    static const uint8_t junk[64];
-    f = (struct pi_frame){.bl = pics[0].bl, .el = g_fel ? pics[0].el : NULL, .rpu = junk, .rpu_size = sizeof(junk),
-                          .acquire_fd = -1};
+    AVFrame *meta = av_frame_alloc();   /* carries the RPU (pi_frame.rpu_frame) */
+    f = (struct pi_frame){.bl = pics[0].bl, .el = g_fel ? pics[0].el : NULL, .rpu_frame = meta, .acquire_fd = -1};
+    rc = pi_render(e, &f, o[0].out, NULL);
+    st_check(rc == PI_E_BAD_RPU, "a frame without an RPU: PI_E_BAD_RPU", rc);
+    AVFrameSideData *junk = av_frame_new_side_data(meta, AV_FRAME_DATA_DOVI_METADATA, 64);
+    if (junk)
+        memset(junk->data, 0, junk->size);
     rc = pi_render(e, &f, o[0].out, NULL);
     st_check(rc == PI_E_BAD_RPU || rc == PI_E_UNSUPPORTED_PLAN, "a junk RPU: refused, PI_E_BAD_RPU or _UNSUPPORTED_PLAN", rc);
+    av_frame_free(&meta);
 
     /* frame lifetime: the engine holds the frames until the GPU is done */
     uint64_t want = 0, got = 0;
@@ -1101,8 +1217,16 @@ static int selftest(struct pi_options base, struct dv_picture *pics, int count, 
 /* --probe: what dvbench and the engine need from this machine. */
 static int probe(struct pi_options *po)
 {
+    struct pi_probe_info info;
+    int rc = pi_probe(po, &info);
+    if (rc) {
+        printf("probe: no device: %s\n", pi_strerror(rc));
+        return 1;
+    }
+    printf("probe: device %s%s, output %s, release sync_file %s\n", info.device, info.cpu ? " (CPU)" : "",
+           info.in_place ? "rendered in place" : "copied", info.release_fence ? "yes" : "no");
     struct pi_engine *e;
-    int rc = pi_engine_create(po, &e);
+    rc = pi_engine_create(po, &e);
     if (rc) {
         printf("probe: engine: %s\n", pi_strerror(rc));
         return 1;

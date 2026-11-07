@@ -1,8 +1,7 @@
 #!/bin/bash
 # FFmpeg 9.0 as LibreELEC builds it for PROJECT=RPi DEVICE=RPi5 (the postproc,
 # libreelec and rpi patch sets: V4L2 request decoding of the Pi's HEVC into
-# SAND128), plus the Dolby Vision metadata patches the planner reads
-# (patches/ffmpeg/README.md). Runs inside the build container.
+# SAND128), plus the Dolby Vision stream patches (patches/ffmpeg/README.md). Runs inside the build container.
 # Rebuilds from a fresh tree whenever the tarball, the patches (names, order or
 # contents) or the configure flags change (a stamp of all three).
 set -euo pipefail

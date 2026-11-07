@@ -79,6 +79,7 @@ struct dvvk_plan_state {
         unsigned depth;
         uint16_t luma[1024];
     } piecewise;
+    dv_ffmpeg_ext_cache ext;   /* the CM v4.0 blocks' original bytes across pictures */
 };
 
 uint32_t dvvk_dm_cm4(unsigned char dm[512], size_t *bytes, uint32_t options);   /* yblod/dm_cm4.c */
@@ -403,12 +404,11 @@ static int luma_table_cached(dvvk_plan_state *st, const dv_single_reshape *mappi
     return 0;
 }
 
-/* CB1's metadata serializer (docs/history/SYNC-CB1-2026-10-30.md; the LibreELEC port's
- * 725da4749b did this in yblod's host C for every picture, here only in the
- * contract): extension blocks by level with the DM v2 blocks (L3, L8-L11,
- * L254) after the others, ties in stream order (dvbridge_metadata.h
- * cb1_wire_block), and an L5 always (the placement fills in the raster's
- * margins). The source payload's blocks are yblod's conversions of the
+/* CB1's metadata serializer (the LibreELEC port's 725da4749b did this in
+ * yblod's host C for every picture, here only in the contract): extension
+ * blocks by level with the DM v2 blocks (L3, L8-L11, L254) after the others,
+ * ties in stream order (dvbridge_metadata.h cb1_wire_block), and an L5
+ * always (the placement fills in the raster's margins). The source payload's blocks are yblod's conversions of the
  * stream's, one each in stream order (L6 dropped), so ordering them here is
  * ordering the stream's. */
 static int cb1_wire(unsigned char dm[512], size_t *bytes)
@@ -584,9 +584,18 @@ int dvvk_plan_frame_ex(const dvvk_plan_in *in, const dvvk_plan_desktop *desktop,
 int dvvk_plan_frame_state(const dvvk_plan_in *in, const dvvk_plan_desktop *desktop, dvvk_plan_state *state,
                           const void *metadata, size_t metadata_size, dvvk_plan *o)
 {
-    if (!in || !o || !state || (!metadata && metadata_size))
+    return dvvk_plan_frame_state_rpu(in, desktop, state, metadata, metadata_size, NULL, 0, o);
+}
+
+int dvvk_plan_frame_state_rpu(const dvvk_plan_in *in, const dvvk_plan_desktop *desktop, dvvk_plan_state *state,
+                              const void *metadata, size_t metadata_size, const void *rpu, size_t rpu_size,
+                              dvvk_plan *o)
+{
+    if (!in || !o || !state || (!metadata && metadata_size) || (!rpu && rpu_size))
         return DV_INVALID;
     memset(o, 0, sizeof(*o));
+    dv_ffmpeg_ext original;
+    dv_ffmpeg_ext_resolve(metadata, metadata_size, rpu, rpu_size, &state->ext, &original);
     dv_source_geometry g = {
         .width = in->width, .height = in->height, .canvas_width = 3840, .canvas_height = 2160,
         .x = in->x, .y = in->y,
@@ -607,7 +616,7 @@ int dvvk_plan_frame_state(const dvvk_plan_in *in, const dvvk_plan_desktop *deskt
     unsigned char dm[512];
     size_t bytes = 0;
     dv_identity id = {0, in->pts};
-    int status = dv_transport_settings_from_ffmpeg(metadata, metadata_size, w, h, id, &settings, dm, &bytes);
+    int status = dv_transport_settings_from_ffmpeg(metadata, metadata_size, w, h, id, &settings, dm, &bytes, &original);
     int single = !in->has_el, use_piecewise = 0;
     if (status == DV_OK) {
         /* The EL upscale: 1 Annex B, else (2, and 0 which was nearest) bilinear.
@@ -640,7 +649,8 @@ int dvvk_plan_frame_state(const dvvk_plan_in *in, const dvvk_plan_desktop *deskt
             return DV_UNSUPPORTED;
         if (full && resized)
             return DV_UNSUPPORTED;
-        status = dv_single_settings_from_ffmpeg_for_depth(metadata, metadata_size, w, h, depth, id, &general, dm, &bytes);
+        status = dv_single_settings_from_ffmpeg_for_depth(metadata, metadata_size, w, h, depth, id, &general, dm, &bytes,
+                                                          &original);
         if (status)
             return status;
         single = 1;

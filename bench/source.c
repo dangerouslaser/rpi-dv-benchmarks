@@ -15,7 +15,6 @@
 #include <string.h>
 #include <time.h>
 
-#define QUEUE 32   /* decoded pictures held per layer */
 #define POOL 160   /* the software path's dmabufs */
 
 /* A dmabuf the software path copies pictures into; reused once released. */
@@ -31,12 +30,11 @@ struct dv_source {
     AVRational time_base;
     AVBufferRef *device;
     AVCodecContext *dec[2];
-    AVPacket *pending[2];   /* a packet the decoder couldn't take yet (its output queue full) */
-    AVFrame *queue[2][QUEUE];
-    int queued[2];
+    AVPacket *pending[2];   /* a packet the decoder couldn't take yet (the pairer full) */
+    struct pi_pairer *pair;
     int el_out, drop_el;   /* EL pictures output; test: discard the drop_el-th (DVBENCH_DROP_EL) */
-    int el_timed;   /* EL pictures at the queue's front whose pts is their display time */
-    int profile, el_present, el_seen, eof, nal_size, warned;
+    int profile, el_present, eof, nal_size;
+    struct pi_pair_stats told;   /* the pairer's losses, as reported */
     struct pooled pool[POOL];
     double copy_ms;
 };
@@ -249,6 +247,8 @@ struct dv_source *dv_source_open(const char *path, const struct dv_source_option
         if (!s->dec[1])
             goto fail;
     }
+    if (pi_pairer_create(s->dec[1] ? 2 : 1, &s->pair))
+        goto fail;
     if (o->start > 0) {
         prime_parameter_sets(s, par);
         av_seek_frame(s->fmt, s->stream, (int64_t)(o->start / av_q2d(s->time_base)), AVSEEK_FLAG_BACKWARD);
@@ -304,43 +304,19 @@ AVRational dv_source_rate(const struct dv_source *s)
     return s->fmt->streams[s->stream]->avg_frame_rate;
 }
 
-/* The EL pictures' display times. An EL picture's pts is its packet's, which
- * isn't its display time where the EL's coding order differs from the
- * packets' (the "All Layers" test clip). But the decoder outputs in display
- * order, and the output pictures' packet times, within the EL's reorder
- * depth, are their display times in another order: the earliest of those not
- * yet given out is the next picture's. Pictures the decoder discarded
- * (leading pictures after a seek) never come out, so they take no time. At
- * the end (flush) every picture is given one. */
-static void el_display_times(struct dv_source *s, int flush)
-{
-    int depth = s->dec[1] ? s->dec[1]->has_b_frames + 2 : 1;
-    if (depth > QUEUE / 2)
-        depth = QUEUE / 2;
-    while (s->el_timed < s->queued[1] && (flush || s->queued[1] - s->el_timed > depth)) {
-        AVFrame **q = s->queue[1];
-        int m = s->el_timed;
-        for (int i = s->el_timed + 1; i < s->queued[1]; i++)
-            if (q[i]->pts != AV_NOPTS_VALUE && (q[m]->pts == AV_NOPTS_VALUE || q[i]->pts < q[m]->pts))
-                m = i;
-        int64_t t = q[m]->pts;   /* the earliest: this picture's; it gives its own to the one it came from */
-        q[m]->pts = q[s->el_timed]->pts;
-        q[s->el_timed++]->pts = t;
-    }
-}
-
-/* Decoded pictures into the layer's queue, until it is full or the decoder
- * has none ready. */
+/* Decoded pictures into the pairer, until it is full or the decoder has
+ * none ready. The pictures given to it, or < 0. */
 static int drain_decoder(struct dv_source *s, int layer)
 {
-    while (s->queued[layer] < QUEUE) {
+    int pushed = 0;
+    while (pi_pairer_room(s->pair, layer) > 0) {
         AVFrame *f = av_frame_alloc();
         if (!f)
             return AVERROR(ENOMEM);
         int r = avcodec_receive_frame(s->dec[layer], f);
         if (r < 0) {
             av_frame_free(&f);
-            return r == AVERROR(EAGAIN) || r == AVERROR_EOF ? 0 : r;
+            return r == AVERROR(EAGAIN) || r == AVERROR_EOF ? pushed : r;
         }
         if (f->format != AV_PIX_FMT_DRM_PRIME) {
             AVFrame *d = to_drm(s, f);
@@ -349,22 +325,21 @@ static int drain_decoder(struct dv_source *s, int layer)
                 return AVERROR(EINVAL);
             f = d;
         }
-        if (layer) {
-            s->el_seen = 1;
-            if (++s->el_out == s->drop_el) {   /* a decoder losing a picture, for the pairing's test */
-                av_frame_free(&f);
-                continue;
-            }
+        if (layer && ++s->el_out == s->drop_el) {   /* a decoder losing a picture, for the pairing's test */
+            av_frame_free(&f);
+            continue;
         }
-        s->queue[layer][s->queued[layer]++] = f;
-        if (layer)
-            el_display_times(s, 0);
+        if (pi_pairer_push(s->pair, layer, f, layer ? s->dec[1]->has_b_frames : 0)) {
+            av_frame_free(&f);
+            return AVERROR(EINVAL);
+        }
+        pushed++;
     }
-    return 0;
+    return pushed;
 }
 
 /* Sends pkt (NULL: flush) to the layer's decoder. 0 sent; 1 not taken (the
- * layer's queue is full: send it again once pictures are taken); <0 error. */
+ * pairer is full: send it again once pictures are taken); <0 error. */
 static int send_layer(struct dv_source *s, int layer, const AVPacket *pkt)
 {
     for (;;) {
@@ -373,13 +348,14 @@ static int send_layer(struct dv_source *s, int layer, const AVPacket *pkt)
             int d = drain_decoder(s, layer);
             if (d < 0)
                 return d;
-            if (s->queued[layer] >= QUEUE)
+            if (!pi_pairer_room(s->pair, layer))
                 return 1;
             continue;
         }
         if (r < 0 && r != AVERROR_EOF)
             return r;
-        return drain_decoder(s, layer);
+        r = drain_decoder(s, layer);
+        return r < 0 ? r : 0;
     }
 }
 
@@ -405,65 +381,41 @@ static AVPacket *layer_packet(struct dv_source *s, int layer, const AVPacket *in
     return out;
 }
 
-static AVFrame *pop(struct dv_source *s, int layer)
+/* The next picture from the pairer; 0 if none can be made yet. The pairer
+ * pairs the layers by display time and drops a picture without its partner
+ * (a decoder lost one) unless it's a BL that doesn't need its EL. */
+static int take(struct dv_source *s, struct dv_picture *p)
 {
-    AVFrame *f = s->queue[layer][0];
-    if (layer && s->el_timed)
-        s->el_timed--;
-    memmove(s->queue[layer], s->queue[layer] + 1, sizeof(s->queue[0][0]) * (size_t)--s->queued[layer]);
-    return f;
-}
-
-/* The next picture from the queues; 0 if none can be made yet. The layers
- * pair by display time: the BL picture's timestamp, and the EL picture's as
- * el_display_times assigns it. A picture without its partner (a decoder lost
- * one) is dropped (EL) or shown alone (BL). Without timestamps: in output
- * order, as both decoders output in display order. */
-static int take(struct dv_source *s, struct dv_picture *p, int layers)
-{
-    while (s->queued[0]) {
-        if (layers == 2 && s->eof == 2)
-            el_display_times(s, 1);
-        if (layers == 2 && !s->el_timed && s->queued[0] < QUEUE && s->eof < 2)
-            return 0;   /* wait for its EL */
-        if (layers == 2 && s->el_timed) {
-            int64_t a = s->queue[0][0]->pts, b = s->queue[1][0]->pts;
-            int timed = a != AV_NOPTS_VALUE && b != AV_NOPTS_VALUE;
-            if (timed && b < a) {   /* an EL picture whose BL was lost */
-                AVFrame *f = pop(s, 1);
-                av_frame_free(&f);
-                if (!s->warned++)
-                    fprintf(stderr, "source: an enhancement-layer picture without its base layer\n");
-                continue;
-            }
-            p->bl = pop(s, 0);
-            if (!timed || a == b)
-                p->el = pop(s, 1);
-        } else
-            p->bl = pop(s, 0);
-        if (layers == 2 && !p->el && !s->warned++)
-            fprintf(stderr, "source: a base-layer picture without its enhancement layer\n");
-        p->dovi = av_frame_get_side_data(p->bl, AV_FRAME_DATA_DOVI_METADATA);
-        if (!p->dovi && p->el)
-            p->dovi = av_frame_get_side_data(p->el, AV_FRAME_DATA_DOVI_METADATA);
-        return 1;
+    int r = pi_pairer_pop(s->pair, s->eof == 2, &p->bl, &p->el);
+    struct pi_pair_stats st;
+    pi_pairer_stats(s->pair, &st);
+    if (st.el_absent && s->dec[1]) {
+        fprintf(stderr, "source: no enhancement-layer pictures; base layer only\n");
+        avcodec_free_context(&s->dec[1]);
+        av_packet_free(&s->pending[1]);
     }
-    return 0;
+    if (st.el_dropped && !s->told.el_dropped)
+        fprintf(stderr, "source: an enhancement-layer picture without its base layer: dropped\n");
+    if (st.bl_dropped && !s->told.bl_dropped)
+        fprintf(stderr, "source: a base-layer picture without its enhancement layer, which it needs: dropped\n");
+    if (st.bl_alone && !s->told.bl_alone)
+        fprintf(stderr, "source: a base-layer picture without its enhancement layer (MEL): shown alone\n");
+    s->told = st;
+    if (r != 1)
+        return 0;
+    p->dovi = av_frame_get_side_data(p->bl, AV_FRAME_DATA_DOVI_METADATA);
+    if (!p->dovi && p->el)
+        p->dovi = av_frame_get_side_data(p->el, AV_FRAME_DATA_DOVI_METADATA);
+    return 1;
 }
 
 int dv_source_next(struct dv_source *s, struct dv_picture *p)
 {
     memset(p, 0, sizeof(*p));
     for (;;) {
-        int layers = s->dec[1] ? 2 : 1;
-        if (layers == 2 && !s->el_seen && (s->queued[0] >= 8 || s->eof == 2)) {
-            fprintf(stderr, "source: no enhancement-layer pictures; base layer only\n");
-            avcodec_free_context(&s->dec[1]);
-            av_packet_free(&s->pending[1]);
-            layers = 1;
-        }
-        if (take(s, p, layers))
+        if (take(s, p))
             return 1;
+        int layers = s->dec[1] ? 2 : 1;
         /* packets the decoders couldn't take: again, now pictures are gone */
         int blocked = 0;
         for (int l = 0; l < layers; l++)
@@ -476,7 +428,7 @@ int dv_source_next(struct dv_source *s, struct dv_picture *p)
                 blocked |= r == 1;
             }
         if (blocked) {
-            if (take(s, p, layers))
+            if (take(s, p))
                 return 1;
             fprintf(stderr, "source: decoders stalled\n");
             return AVERROR(EAGAIN);
@@ -484,10 +436,10 @@ int dv_source_next(struct dv_source *s, struct dv_picture *p)
         if (s->eof == 2) {   /* flushed: the decoders' last pictures, as the queues empty */
             int got = 0;
             for (int l = 0; l < layers; l++) {
-                int before = s->queued[l], r = drain_decoder(s, l);
+                int r = drain_decoder(s, l);
                 if (r < 0)
                     return r;
-                got |= s->queued[l] != before;
+                got |= r > 0;
             }
             if (got)
                 continue;
@@ -540,9 +492,8 @@ void dv_source_close(struct dv_source *s)
 {
     if (!s)
         return;
+    pi_pairer_destroy(s->pair);
     for (int l = 0; l < 2; l++) {
-        while (s->queued[l])
-            av_frame_free(&s->queue[l][--s->queued[l]]);
         av_packet_free(&s->pending[l]);
         avcodec_free_context(&s->dec[l]);
     }

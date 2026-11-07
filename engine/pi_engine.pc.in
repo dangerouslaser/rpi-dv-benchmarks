@@ -1,0 +1,11 @@
+prefix=@CMAKE_INSTALL_PREFIX@
+libdir=${prefix}/@CMAKE_INSTALL_LIBDIR@
+includedir=${prefix}/@CMAKE_INSTALL_INCLUDEDIR@
+
+Name: pi_engine
+Description: The Raspberry Pi 5 Dolby Vision engine (TV-led HDMI tunnel frames, Vulkan)
+Version: @PROJECT_VERSION@
+Requires: libavutil
+Libs: -L${libdir} -lpi_engine
+Libs.private: @PI_PC_LIBS_PRIVATE@
+Cflags: -I${includedir}

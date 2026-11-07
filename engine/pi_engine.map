@@ -1,0 +1,8 @@
+/* libpi_engine.so's exported symbols: the pi_engine.h API, nothing of the
+ * planner's. A new API version (PI_API_VERSION, the SONAME) gets a new node. */
+PI_1 {
+    global:
+        pi_*;
+    local:
+        *;
+};

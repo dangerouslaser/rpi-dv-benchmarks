@@ -24,6 +24,12 @@
 extern "C" {
 #endif
 
+/* This header's version: bumped by every change that breaks a caller built
+ * against the last (libpi_engine.so.PI_API_VERSION). pi_api_version() is
+ * the library's. */
+#define PI_API_VERSION 1
+int pi_api_version(void);
+
 #define PI_FRAMES_IN_FLIGHT 3
 
 struct pi_engine;
@@ -35,7 +41,7 @@ enum pi_status {
     PI_E_INVALID = -1,            /* a bad argument, or a call out of order */
     PI_E_UNSUPPORTED_FORMAT = -2, /* the input isn't a DRM PRIME SAND128 frame of the stream's size */
     PI_E_UNSUPPORTED_PLAN = -3,   /* the planner refuses the stream, or plans outside these passes */
-    PI_E_BAD_RPU = -4,            /* the planner finds the RPU invalid */
+    PI_E_BAD_RPU = -4,            /* the frame has no RPU, or the planner finds it invalid */
     PI_E_VULKAN = -5,
     PI_E_NOMEM = -6,
 };
@@ -88,6 +94,18 @@ struct pi_options {
 void pi_options_default(struct pi_options *o);
 
 int pi_engine_create(const struct pi_options *o, struct pi_engine **out);
+
+/* What pi_engine_create would find, without creating an engine (a Vulkan
+ * instance, no device): for a player's capability check. o: its device and
+ * measure options (NULL: the defaults). 0 a device the engine can use;
+ * PI_E_VULKAN none. */
+struct pi_probe_info {
+    char device[256];             /* the Vulkan device's name */
+    int cpu;                      /* a CPU implementation (llvmpipe): not real time */
+    int in_place;                 /* renders into the output (else into its own image, then copies) */
+    int release_fence;            /* pi_render returns a sync_file */
+};
+int pi_probe(const struct pi_options *o, struct pi_probe_info *info);
 /* Waits for the GPU, releases every object, writes the pipeline cache. */
 void pi_engine_destroy(struct pi_engine *e);
 /* "device, MMR mode, output path", for logs. */
@@ -116,8 +134,12 @@ void pi_output_release(struct pi_engine *e, struct pi_output *o);
 
 struct pi_frame {
     const AVFrame *bl, *el;       /* AV_PIX_FMT_DRM_PRIME, SAND128 P030; el NULL: none */
-    const void *rpu;              /* AV_FRAME_DATA_DOVI_METADATA's data, and its size */
-    size_t rpu_size;
+    /* The RPU: the side data FFmpeg's HEVC decoder attaches,
+     * AV_FRAME_DATA_DOVI_METADATA and AV_FRAME_DATA_DOVI_RPU_BUFFER (which
+     * the CM v4.0 levels are re-encoded from), of rpu_frame; NULL: of bl, or
+     * else of el. rpu_frame is for an EL frame carrying it that isn't
+     * rendered (el NULL). */
+    const AVFrame *rpu_frame;
     int chroma_top_left;          /* pi_chroma_top_left() */
     int64_t pts_us;
     int acquire_fd;               /* a sync_file the output is busy until (KMS); -1 none. Taken. */
@@ -150,6 +172,45 @@ int pi_is_sand128(uint64_t modifier);
  * each type-63 unit's payload, Annex B. Writes at most room bytes to out;
  * returns the bytes written, or -1. */
 int pi_p7_split(const uint8_t *in, int size, int nal_size, int layer, uint8_t *out, int room);
+
+/* Whether the picture needs its EL: 1 its RPU has a residual for the EL to
+ * carry (FEL), so rendering it without one is wrong; 0 not (MEL, whose
+ * residual is zero, or a single-layer profile), so the EL may be left out
+ * and its decoder closed; PI_E_BAD_RPU no RPU. f: the frame carrying the RPU
+ * (pi_frame.rpu_frame's). */
+int pi_frame_needs_el(const AVFrame *f);
+
+/* Pairs a dual-layer stream's BL and EL pictures, from two decoders, by
+ * display time: the BL picture's timestamp, and the EL picture's as its
+ * position among the EL decoder's output gives it (an EL picture's own pts
+ * is its packet's, not its display time, where the EL's coding order
+ * differs). Without timestamps, in output order. A picture whose partner a
+ * decoder lost: an EL is dropped; a BL is dropped when it needs its EL
+ * (pi_frame_needs_el), else given alone. A stream whose EL decoder gives no
+ * pictures (none by the BL's 8th) is given BL alone from then on
+ * (pi_pair_stats.el_absent: its decoder may be closed). layers 1: BLs
+ * through as they come. One thread drives a pairer. */
+struct pi_pairer;
+int pi_pairer_create(int layers, struct pi_pairer **out);
+void pi_pairer_destroy(struct pi_pairer *p);
+/* Pictures the pairer can take of the layer (0 BL, 1 EL) before a pop. */
+int pi_pairer_room(const struct pi_pairer *p, int layer);
+/* A decoder's next picture, in its output order. 0: taken (owned by the
+ * pairer from then on); 1: full, not taken (pop first); < 0 an error.
+ * el_reorder: the EL decoder's AVCodecContext.has_b_frames (EL only). */
+int pi_pairer_push(struct pi_pairer *p, int layer, AVFrame *f, int el_reorder);
+/* The next pair: 1, *bl and *el (NULL: none) the caller's; 0 none yet.
+ * end: the decoders are flushed, no more pictures will come. */
+int pi_pairer_pop(struct pi_pairer *p, int end, AVFrame **bl, AVFrame **el);
+/* Drops every picture held: on a seek, after flushing the decoders. */
+void pi_pairer_flush(struct pi_pairer *p);
+struct pi_pair_stats {
+    int el_absent;                /* no EL pictures: BLs alone */
+    unsigned bl_alone;            /* BLs given without their EL (MEL) */
+    unsigned bl_dropped;          /* BLs dropped without their EL (FEL) */
+    unsigned el_dropped;          /* ELs without their BL */
+};
+void pi_pairer_stats(const struct pi_pairer *p, struct pi_pair_stats *s);
 
 #ifdef __cplusplus
 }

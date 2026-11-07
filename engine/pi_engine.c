@@ -183,7 +183,7 @@ struct route {
 };
 
 enum {   /* warnings, each once per engine */
-    W_PLAN = 1, W_GUARD = 2, W_INPUT = 4, W_PIPELINE = 8, W_IMPORT = 16, W_PLANNER = 32,
+    W_PLAN = 1, W_GUARD = 2, W_INPUT = 4, W_PIPELINE = 8, W_IMPORT = 16, W_PLANNER = 32, W_RPU = 64,
 };
 
 struct pi_engine {
@@ -834,27 +834,30 @@ static int pick_device(struct pi_engine *e, VkPhysicalDeviceProperties *props)
     return 0;
 }
 
-static int create_device(struct pi_engine *e)
+static int create_instance(struct pi_engine *e)
 {
     VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .pApplicationName = "pi-dv",
                              .apiVersion = VK_API_VERSION_1_2};
     VkInstanceCreateInfo ici = {.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app};
     VKC(e, vkCreateInstance(&ici, NULL, &e->inst));
-    VkPhysicalDeviceProperties props;
-    int rc = pick_device(e, &props);
-    if (rc)
-        return rc;
-    vkGetPhysicalDeviceMemoryProperties(e->phys, &e->mp);
-    e->ts_period = props.limits.timestampPeriod;
-    const char *exts[8] = {"VK_KHR_external_memory_fd", "VK_EXT_external_memory_dma_buf"};
-    uint32_t next = 2;
+    return 0;
+}
+
+/* The picked device's extensions: the required ones, and which of the
+ * optional ones the engine uses (e->modifiers, foreign, sem_fd, fence_fd). */
+static int device_extensions(struct pi_engine *e, const VkPhysicalDeviceProperties *props, const char *exts[8],
+                             uint32_t *count)
+{
+    uint32_t next = 0;
+    exts[next++] = "VK_KHR_external_memory_fd";
+    exts[next++] = "VK_EXT_external_memory_dma_buf";
     for (uint32_t i = 0; i < next; i++)
         if (!has_ext(e->phys, exts[i])) {
-            logf_(e, PI_LOG_ERROR, "%s lacks %s", props.deviceName, exts[i]);
+            logf_(e, PI_LOG_ERROR, "%s lacks %s", props->deviceName, exts[i]);
             return PI_E_VULKAN;
         }
     if (has_ext(e->phys, "VK_EXT_image_drm_format_modifier") && !(e->o.measure & PI_MEASURE_COPY_OUTPUT) &&
-        linear_attachments(e->phys, props.apiVersion)) {
+        linear_attachments(e->phys, props->apiVersion)) {
         exts[next++] = "VK_EXT_image_drm_format_modifier";
         e->modifiers = 1;
     }
@@ -870,6 +873,24 @@ static int create_device(struct pi_engine *e)
         exts[next++] = "VK_KHR_external_fence_fd";
         e->fence_fd = 1;
     }
+    *count = next;
+    return 0;
+}
+
+static int create_device(struct pi_engine *e)
+{
+    int rc = create_instance(e);
+    if (rc)
+        return rc;
+    VkPhysicalDeviceProperties props;
+    if ((rc = pick_device(e, &props)))
+        return rc;
+    vkGetPhysicalDeviceMemoryProperties(e->phys, &e->mp);
+    e->ts_period = props.limits.timestampPeriod;
+    const char *exts[8];
+    uint32_t next;
+    if ((rc = device_extensions(e, &props, exts, &next)))
+        return rc;
     uint32_t nq = 0;
     vkGetPhysicalDeviceQueueFamilyProperties(e->phys, &nq, NULL);
     VkQueueFamilyProperties *qf = calloc(nq ? nq : 1, sizeof(*qf));
@@ -1014,6 +1035,39 @@ static int create(struct pi_engine *e)
     if (!pthread_create(&e->worker, NULL, worker_main, e))
         e->worker_started = 1;
     return 0;
+}
+
+int pi_api_version(void) { return PI_API_VERSION; }
+
+int pi_probe(const struct pi_options *o, struct pi_probe_info *info)
+{
+    if (info)
+        memset(info, 0, sizeof(*info));
+    struct pi_engine *e = calloc(1, sizeof(*e));
+    if (!e)
+        return PI_E_NOMEM;
+    if (o)
+        e->o = *o;
+    else
+        pi_options_default(&e->o);
+    VkPhysicalDeviceProperties props;
+    const char *exts[8];
+    uint32_t next;
+    int rc = create_instance(e);
+    if (!rc)
+        rc = pick_device(e, &props);
+    if (!rc)
+        rc = device_extensions(e, &props, exts, &next);
+    if (!rc && info) {
+        snprintf(info->device, sizeof(info->device), "%s", props.deviceName);
+        info->cpu = props.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU;
+        info->in_place = e->modifiers;
+        info->release_fence = e->fence_fd;
+    }
+    if (e->inst)
+        vkDestroyInstance(e->inst, NULL);
+    free(e);
+    return rc;
 }
 
 void pi_options_default(struct pi_options *o)
@@ -2030,7 +2084,7 @@ int pi_render(struct pi_engine *e, const struct pi_frame *f, struct pi_output *o
         *release_fd = -1;
     int acquire_fd = f ? f->acquire_fd : -1;
     int rc = PI_E_INVALID;
-    if (!e->open || !f || !f->bl || !o || !f->rpu || o->w != e->w || o->h != e->h)
+    if (!e->open || !f || !f->bl || !o || o->w != e->w || o->h != e->h)
         goto out;
     rc = PI_E_UNSUPPORTED_FORMAT;
     if ((uint32_t)f->bl->width != e->w || (uint32_t)f->bl->height != e->h ||
@@ -2038,6 +2092,17 @@ int pi_render(struct pi_engine *e, const struct pi_frame *f, struct pi_output *o
                    f->el->height < 4)) ||
         !frame_ok(e, f->bl) || (f->el && !frame_ok(e, f->el)))
         goto out;
+    /* the RPU: rpu_frame's side data, else bl's, else el's */
+    const AVFrame *meta = f->rpu_frame ? f->rpu_frame : f->bl;
+    const AVFrameSideData *dovi = av_frame_get_side_data(meta, AV_FRAME_DATA_DOVI_METADATA);
+    if (!dovi && !f->rpu_frame && f->el)
+        dovi = av_frame_get_side_data(meta = f->el, AV_FRAME_DATA_DOVI_METADATA);
+    const AVFrameSideData *rpu = dovi ? av_frame_get_side_data(meta, AV_FRAME_DATA_DOVI_RPU_BUFFER) : NULL;
+    rc = PI_E_BAD_RPU;
+    if (!dovi) {
+        WARN_ONCE(e, W_RPU, "a frame without Dolby Vision metadata");
+        goto out;
+    }
     struct ctx *c = &e->c[e->next];
     ctx_retire(e, c, 1);
     imports_trim(e);
@@ -2049,7 +2114,8 @@ int pi_render(struct pi_engine *e, const struct pi_frame *f, struct pi_output *o
                        .fel = 1, .refresh = (uint32_t)e->first, .pts = f->pts_us, .white_nits = 203.0,
                        .cb1_contract = e->o.filters == PI_FILTERS_CB1};
     dvvk_plan *p = e->plan;
-    int st = dvvk_plan_frame_state(&in, NULL, e->state, f->rpu, f->rpu_size, p);
+    int st = dvvk_plan_frame_state_rpu(&in, NULL, e->state, dovi->data, dovi->size, rpu ? rpu->data : NULL,
+                                       rpu ? rpu->size : 0, p);
     if (st) {
         WARN_ONCE(e, W_PLANNER, "the planner refuses the frame: dv_status %d", st);
         rc = st == -1 ? PI_E_BAD_RPU : PI_E_UNSUPPORTED_PLAN;

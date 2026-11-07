@@ -122,6 +122,13 @@ int dvvk_plan_frame_ex(const dvvk_plan_in *in, const dvvk_plan_desktop *desktop,
                        size_t metadata_size, dvvk_plan *out);
 int dvvk_plan_frame_state(const dvvk_plan_in *in, const dvvk_plan_desktop *desktop, dvvk_plan_state *state,
                           const void *metadata, size_t metadata_size, dvvk_plan *out);
+/* With the picture's raw RPU (AV_FRAME_DATA_DOVI_RPU_BUFFER's data and size;
+ * NULL: none), which the CM v4.0 levels are re-encoded from: without it a
+ * picture carrying them is refused (DV_UNSUPPORTED). From the same AVFrame
+ * as the metadata. */
+int dvvk_plan_frame_state_rpu(const dvvk_plan_in *in, const dvvk_plan_desktop *desktop, dvvk_plan_state *state,
+                              const void *metadata, size_t metadata_size, const void *rpu, size_t rpu_size,
+                              dvvk_plan *out);
 /* sizeof and a few offsets, for the Rust mirror. */
 void dvvk_plan_layout(size_t out[6]);
 

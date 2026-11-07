@@ -43,20 +43,29 @@ P2  w/2 × h/2   one fragment per 2×2 output block: 4:2:2 vertical filter,
 
 | Call | When |
 |---|---|
+| `pi_probe(&options, &info)` | for a capability check: the device `pi_engine_create` would use, without creating an engine |
 | `pi_engine_create(&options, &e)` | once: device, MMR mode, filters, pipeline cache file, log callback |
 | `pi_stream_open(e, &info)` | per stream: its size and profile. Resets the planner (packet ids, cached tables). |
 | `pi_output_import(e, fd, w, h, stride, size, &out)` | per scanout buffer the caller owns; `pi_output_size()` gives the layout |
-| `pi_render(e, &frame, out, &release_fd)` | per picture. Returns a sync_file signalled when `out` is complete; `frame.acquire_fd` is one the output is busy until (KMS's). |
+| `pi_render(e, &frame, out, &release_fd)` | per picture: its BL and EL frames. Returns a sync_file signalled when `out` is complete; `frame.acquire_fd` is one the output is busy until (KMS's). |
 | `pi_output_done` / `pi_output_wait` | without sync_files |
 | `pi_stream_close`, `pi_output_release`, `pi_engine_destroy` | release everything, in reverse |
 
+- **The RPU is the frames' side data,** as FFmpeg's HEVC decoder attaches
+  it: `AV_FRAME_DATA_DOVI_METADATA`, and `AV_FRAME_DATA_DOVI_RPU_BUFFER`,
+  the raw RPU, from which the CM v4.0 extension blocks (L3, L8–L11, L254) are
+  re-encoded (FFmpeg's parse doesn't keep their bytes). The BL frame's, else
+  the EL's; `frame.rpu_frame` names another (an EL frame not rendered). A
+  picture with CM v4.0 blocks and no RPU buffer is refused
+  (`PI_E_UNSUPPORTED_PLAN`), unless its metadata repeats the last RPU's,
+  as FFmpeg's does for an access unit without one.
 - **Up to three renders in flight.** `pi_render` waits for the oldest beyond
   that. The engine holds references to the BL and EL frames until the GPU is
   done with them.
 - **Errors a caller can act on:** `PI_E_UNSUPPORTED_FORMAT` (not a SAND128
   frame of the stream's size), `PI_E_UNSUPPORTED_PLAN` (the planner refuses
   the stream, for example single-layer MMR under CB1's filters),
-  `PI_E_BAD_RPU`, `PI_E_VULKAN`, `PI_E_NOMEM`.
+  `PI_E_BAD_RPU` (no RPU, or an invalid one), `PI_E_VULKAN`, `PI_E_NOMEM`.
 - **Decoder buffers** are imported once per stream and released by
   `pi_stream_close`.
 - **Pipelines** are cached on disk when `pipeline_cache` names a file. After
@@ -88,21 +97,36 @@ P2  w/2 × h/2   one fragment per 2×2 output block: 4:2:2 vertical filter,
   later, 12 of 12). At 1080p a bare commit happened to wait on it, at 4K it
   didn't.
 - **Input glue** for a player (`engine/pi_input.c`): `pi_chroma_top_left()`,
-  `pi_is_sand128()` and `pi_p7_split()`, the single-track Profile 7 BL / EL
-  split. `bench/source.c` is the reference for decoding and pairing the
-  layers, by display time (`el_display_times()`: an EL picture's own
-  timestamp is its packet's, not its display time, where the EL's coding
-  order differs).
-- **Build:** `libpi_engine.a` and `libdv_planner.a`, with `pi_engine.h`,
-  install with CMake. glslc is optional: without it the committed SPIR-V
-  (`engine/shaders/spirv/`, built with `-O`, which V3D needs: 7–9% faster)
-  is used; `cmake --build . --target update-spirv` refreshes it. dvbench
-  builds with `-DPI_BUILD_BENCH=ON`.
+  `pi_is_sand128()`, `pi_p7_split()` (the single-track Profile 7 BL / EL
+  split), `pi_frame_needs_el()` and `pi_pairer`:
+  - `pi_frame_needs_el()`: whether a picture's RPU has a residual for the
+    EL (FEL), by the planner's own test. MEL's residual is zero, so a player
+    may close the EL decoder.
+  - `pi_pairer` pairs the two decoders' pictures by display time: the BL
+    picture's timestamp, and the EL picture's as its place among the EL
+    decoder's output gives it (an EL picture's own timestamp is its
+    packet's, not its display time, where the EL's coding order differs).
+    A picture whose partner a decoder lost: an EL is dropped, a BL that
+    needs its EL is dropped, one that doesn't is given alone. An EL decoder
+    that gives no pictures by the 8th BL is given up (BLs alone). Flushed on
+    a seek.
+  `bench/source.c` is the reference for decoding the layers around them.
+- **Build:** `libpi_engine.so.1` (the SONAME follows `PI_API_VERSION`;
+  `pi_api_version()` is the library's), exporting the `pi_*` API only
+  (`engine/pi_engine.map`), with `pi_engine.h` and `pi_engine.pc`
+  (requires `libavutil`); `-DPI_SHARED=OFF` builds `libpi_engine.a` and
+  `libdv_planner.a` instead. It needs Vulkan and libavutil. glslc is
+  optional: without it the committed SPIR-V (`engine/shaders/spirv/`, built
+  with `-O`, which V3D needs: 7–9% faster) is used;
+  `cmake --build . --target update-spirv` refreshes it. dvbench builds with
+  `-DPI_BUILD_BENCH=ON`. `scripts/make-release.sh` makes the source release
+  (`out/pi-dv-engine-<version>.tar.xz`, HEAD, the version in
+  `CMakeLists.txt`) and prints its SHA-256.
 - **Licence:** GPL-2.0-or-later (`LICENSE`), as Kodi; third-party notices
   in `engine/planner/LICENSE`. The bench's FFmpeg is built
   `--enable-version3`, so binaries linking it are GPLv3 as a whole, which
-  "or later" allows. Kodi's FFmpeg must carry `patches/ffmpeg` (the Dolby Vision RPU
-  extensions the planner reads, `DV_FFMPEG_RAW_EXTENSIONS`).
+  "or later" allows. The engine needs no FFmpeg patches: it reads the side
+  data upstream FFmpeg's HEVC decoder attaches.
 
 ## Display output
 
@@ -292,7 +316,8 @@ growth, imports released at stream close, teardown with renders in flight.
 out-of-bounds buffer reads in the shaders, on every route and filter set. `--reopen` closes and reopens
 the stream in the same engine and requires identical output (the planner
 reset; without it no picture matches). `DVBENCH_DROP_EL=N` discards the Nth EL picture
-(the BL / EL pairing's test).
+(the BL / EL pairing's test: a FEL clip loses that BL and every other
+picture matches the run without it).
 
 On the Pi itself, `V3D_DEBUG=shaderdb` prints the compiler's statistics,
 `V3D_DEBUG=fs` the QPU code, and `V3D_DEBUG=nir` the NIR.

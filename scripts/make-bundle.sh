@@ -1,7 +1,7 @@
 #!/bin/bash
 # out/dvbench-rpi5-<rev>.tar.gz: everything the Pi needs beyond Raspberry Pi
-# OS (trixie, 64-bit): dvbench (the engine is linked in; --probe checks the
-# machine), the matched FFmpeg, run-bench.sh. Build first (build-all.sh).
+# OS (trixie, 64-bit): dvbench (--probe checks the machine), libpi_engine,
+# the matched FFmpeg, run-bench.sh. Build first (build-all.sh).
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 P=$ROOT/build/prefix
@@ -10,6 +10,8 @@ NAME=dvbench-rpi5-$REV
 STAGE=$ROOT/out/$NAME
 rm -rf "$STAGE" && mkdir -p "$STAGE/bin" "$STAGE/lib"
 cp "$P/bin/dvbench" "$STAGE/bin/"
+ls "$P/lib/libpi_engine.so."* >/dev/null 2>&1 || { echo "missing $P/lib/libpi_engine.so.*: build the engine first" >&2; exit 1; }
+cp -P "$P/lib/libpi_engine.so"* "$STAGE/lib/"
 # FFmpeg's libraries: the ones dvbench links must be there; the rest of the
 # build (avfilter, swscale, ...) goes along when it was built.
 for lib in avcodec avformat avutil; do

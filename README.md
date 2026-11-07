@@ -32,15 +32,16 @@ terms).
 
 | Path | What |
 |---|---|
-| `engine/` | The engine: `pi_engine.h` (the API), `pi_engine.c`, `pi_input.c` (a player's input glue), its shaders (`shaders/`: two fragment passes; `spirv/`: their committed SPIR-V), the planner (`planner/`: the CPU half, vendored from yblod) |
+| `engine/` | The engine, `libpi_engine`: `pi_engine.h` (the API), `pi_engine.c`, `pi_input.c` (a player's input glue: the Profile 7 split, BL / EL pairing), its shaders (`shaders/`: two fragment passes; `spirv/`: their committed SPIR-V), the planner (`planner/`: the CPU half, vendored from yblod) |
 | `bench/` | `dvbench`: decode (the Pi's V4L2 decoder, or software into the same SAND128 layout) + the engine, timed, with playback, sync_file fences and output hashes; `--probe` checks a machine |
-| `patches/ffmpeg/` | FFmpeg 9.0 as LibreELEC builds it for the Pi 5, plus the Dolby Vision metadata patches (`patches/ffmpeg/README.md`) |
+| `patches/ffmpeg/` | FFmpeg 9.0 as LibreELEC builds it for the Pi 5, plus Dolby Vision stream patches for the bench (`patches/ffmpeg/README.md`) |
 | `patches/linux/` | The Raspberry Pi kernel's `vc4` HDMI driver: the Dolby Vision vendor infoframe (`patches/linux/README.md`) |
 | `tests/` | `check.sh`: the engine must reproduce `golden/hashes.txt` (verified identical to yblod); `make-test-clips.sh`: profile 8.1 / MEL / MMR clips from Profile 7 sources |
 | `bundle/` | What goes onto the Pi: `run-bench.sh` (correctness, speed, MMR modes, real-time playback, shader statistics), `summarize.py` |
 | `image/`, `scripts/make-image.sh` | A flashable Raspberry Pi OS image with the bundle and clips |
 | `vm/`, `scripts/vm*.sh` | A Debian arm64 VM (Lima) on Mesa's software Vulkan, for building and checking without a Pi |
 | `docker/`, `scripts/build-*.sh` | The aarch64 build container and builds |
+| `scripts/make-release.sh` | The engine's source release, for a distribution's package |
 | `docs/` | `ENGINE.md`, `pi5/V3DV.md` (+ `pi5/device/`: the Pi's own Vulkan / system dumps), `SETUP.md` |
 
 ## Quick start (Apple Silicon Mac: Docker and `brew install lima`)
