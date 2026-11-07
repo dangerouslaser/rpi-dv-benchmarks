@@ -41,14 +41,14 @@ static const uint32_t spv_p3[] =
         }                                                                              \
     } while (0)
 
-enum { T_MAP = 0, T_RES = 1024, T_CMAP = 4096, T_LUTF = 6144, T_LUT64 = 12288, T_WORDS = 24576 };
+enum { T_MAP = 0, T_RES = 1024, T_CMAP = 4096, T_LUTF = 6144, T_LUT64 = 12288, T_SINGLE = 24576, T_WORDS = 27648 };
 enum { NB = 11 };   /* descriptor bindings */
 
 struct params {   /* common.glsl Params, std140 */
     uint32_t size[4], bl[4], el[4], el_size[4], sel[4], sel2[4], active[4], black[4], pk[4];
     uint32_t lo[2][4], hi[2][4], const64[2][4];
     int32_t c_lo[6][4], c_hi[6][4], c32[6][4];
-    float cf[6][4], cconst[4], inv[4];
+    float cf[6][4], cconst[4], inv[4], err[4];
     uint32_t packets[160];
 };
 
@@ -103,7 +103,7 @@ struct pi_engine {
     VkDescriptorPool dpool;
     VkRenderPass rp[3];
     struct variant {
-        uint32_t key[7];
+        uint32_t key[9];
         VkPipeline p;
     } v1[16], v2[8];
     int n1, n2;
@@ -114,6 +114,7 @@ struct pi_engine {
     enum pi_mmr_mode mode;
     int contract, warned;
     uint32_t ablate;   /* PI_ABLATE: measurement only */
+    uint32_t mark;     /* PI_MARK: measurement only, mode 3's fallbacks written as 4095 / 0 */
     uint32_t w, h;
 };
 
@@ -391,7 +392,7 @@ static int create(struct pi_engine *e, const char *want)
                                    .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, .queueFamilyIndex = qfam};
     VKC(vkCreateCommandPool(e->dev, &pci, NULL, &e->pool));
     snprintf(e->name, sizeof(e->name), "%s, MMR %s, output %s", props.deviceName,
-             e->mode == PI_MMR_FLOAT ? "float" : e->mode == PI_MMR_EXACT32 ? "exact (32-bit pieces)"
+             e->mode == PI_MMR_FLOAT ? "float" : e->mode == PI_MMR_HYBRID ? "exact (float + bound, 64-bit fallback)" : e->mode == PI_MMR_EXACT32 ? "exact (32-bit pieces)"
                                                                              : "exact (emulated 64-bit)",
              e->modifiers ? "rendered in place" : "copied");
 
@@ -430,6 +431,7 @@ static int create(struct pi_engine *e, const char *want)
                     &e->rp[1]))
         return -1;
     e->ablate = getenv("PI_ABLATE") ? (uint32_t)atoi(getenv("PI_ABLATE")) : 0;
+    e->mark = getenv("PI_MARK") != NULL;
 
     e->w = 3840;
     e->h = 2160;
@@ -690,15 +692,44 @@ static int bind_inputs(struct pi_engine *e, struct slot *s, const AVFrame *bl, c
     return 0;
 }
 
-static void pass(struct pi_engine *e, struct slot *s, int i, VkPipeline p, uint32_t w, uint32_t h)
+struct band {
+    VkPipeline p;
+    uint32_t y0, rows;
+};
+
+/* Pass i as bands of rows, each with its pipeline, in one render pass. */
+static void pass_bands(struct pi_engine *e, struct slot *s, int i, uint32_t w, uint32_t h, const struct band *b, int n)
 {
     VkRenderPassBeginInfo rbi = {.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, .renderPass = e->rp[i],
                                  .framebuffer = s->fb[i], .renderArea = {{0, 0}, {w, h}}};
     vkCmdBeginRenderPass(s->cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+    vkCmdBindDescriptorSets(s->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, e->pl, 0, 1, &s->ds, 0, NULL);
+    VkViewport vp = {0, 0, (float)w, (float)h, 0, 1};
+    for (int k = 0; k < n; k++) {
+        if (!b[k].rows)
+            continue;
+        vkCmdBindPipeline(s->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, b[k].p);
+        VkRect2D sc = {{0, (int32_t)b[k].y0}, {w, b[k].rows}};
+        vkCmdSetViewport(s->cmd, 0, 1, &vp);
+        vkCmdSetScissor(s->cmd, 0, 1, &sc);
+        vkCmdDraw(s->cmd, 3, 1, 0, 0);
+    }
+    vkCmdEndRenderPass(s->cmd);
+    if (s->qp)
+        vkCmdWriteTimestamp(s->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s->qp, (uint32_t)i + 1);
+}
+
+/* Pass i over rows y0 .. y0 + rows - 1 of its w x h target. */
+static void pass(struct pi_engine *e, struct slot *s, int i, VkPipeline p, uint32_t w, uint32_t h, uint32_t y0,
+                 uint32_t rows)
+{
+    VkRenderPassBeginInfo rbi = {.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, .renderPass = e->rp[i],
+                                 .framebuffer = s->fb[i], .renderArea = {{0, (int32_t)y0}, {w, rows}}};
+    vkCmdBeginRenderPass(s->cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
     vkCmdBindPipeline(s->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p);
     vkCmdBindDescriptorSets(s->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, e->pl, 0, 1, &s->ds, 0, NULL);
     VkViewport vp = {0, 0, (float)w, (float)h, 0, 1};
-    VkRect2D sc = {{0, 0}, {w, h}};
+    VkRect2D sc = {{0, (int32_t)y0}, {w, rows}};
     vkCmdSetViewport(s->cmd, 0, 1, &vp);
     vkCmdSetScissor(s->cmd, 0, 1, &sc);
     vkCmdDraw(s->cmd, 3, 1, 0, 0);
@@ -736,37 +767,40 @@ int pi_submit(struct pi_engine *e, const AVFrame *bl, const AVFrame *el, const v
     struct slot *s = &e->s[slot];
     if (!s->has_output || pi_wait(e, slot))
         return -1;
-    if (!el)
-        return 2;   /* this engine is the FEL route */
     uint32_t w = (uint32_t)bl->width, h = (uint32_t)bl->height;
     if (w != e->w || h != e->h)
         return 2;
     double t0 = now_ms();
     dvvk_plan_in in = {.width = w, .height = h, .x = 0, .y = 0, .dw = w, .dh = h,
-                       .chroma_top_left = (uint32_t)chroma_top_left, .has_el = 1, .el_scaler = 2, .fel = 1,
+                       .chroma_top_left = (uint32_t)chroma_top_left, .has_el = el != NULL, .el_scaler = 2, .fel = 1,
                        .refresh = (uint32_t)first, .pts = pts_us, .white_nits = 203.0,
                        .cb1_contract = (uint32_t)e->contract};
     dvvk_plan *p = e->plan;
     int st = dvvk_plan_frame_state(&in, NULL, e->state, rpu, rpu_size, p);
     if (st)
         return st < 0 ? -st : st;
-    if (p->route != DVVK_ROUTE_DUAL || p->equal || p->nearest != 2 || p->pack != DVVK_PACK_SITED ||
+    int single = p->route == DVVK_ROUTE_SINGLE;
+    if ((!single && (p->route != DVVK_ROUTE_DUAL || !el || p->equal || p->nearest != 2)) || p->pack != DVVK_PACK_SITED ||
         p->placement[0] || p->placement[1] || p->placement[2] != w || p->placement[3] != h) {
         if (!e->warned++)
             fprintf(stderr, "pi: plan outside this engine (route %u equal %u el filter %u pack %u)\n", p->route,
                     p->equal, p->nearest, p->pack);
         return 2;
     }
+    if (getenv("PI_DEBUG") && first)
+        fprintf(stderr, "pi: active area x %u..%u, y %u..%u; row window %u..%u; chroma kinds %u %u, dual %u, orders %u %u\n",
+                p->active[0], p->active[2], p->active[1], p->active[3], p->row_first, p->row_last, p->chroma_kind[0],
+                p->chroma_kind[1], p->dual, p->mmr_params[0][0], p->mmr_params[1][0]);
     struct params *q = s->pmap;
     memset(q, 0, sizeof(*q));
-    if (bind_inputs(e, s, bl, el, q))
+    if (bind_inputs(e, s, bl, el ? el : bl, q))
         return -1;
     q->size[0] = w;
     q->size[1] = h;
     q->size[2] = w / 2;
     q->size[3] = h / 2;
-    q->el_size[0] = (uint32_t)el->width / 2;
-    q->el_size[1] = (uint32_t)el->height / 2;
+    q->el_size[0] = el ? (uint32_t)el->width / 2 : w / 4;
+    q->el_size[1] = el ? (uint32_t)el->height / 2 : h / 4;
     q->sel[0] = p->chroma_phase;
     q->sel[1] = p->dual;
     q->sel[2] = p->chroma_kind[0];
@@ -792,6 +826,9 @@ int pi_submit(struct pi_engine *e, const AVFrame *bl, const AVFrame *el, const v
         t[T_CMAP + 1024 + i] = p->chroma_mapping[1][i];
     }
     memcpy(t + T_RES, p->residual, sizeof(p->residual));
+    for (int c = 0; c < 3; c++)
+        for (int i = 0; i < 1024; i++)
+            t[T_SINGLE + c * 1024 + i] = p->single_table[c][i];
     int exact = e->mode != PI_MMR_FLOAT;
     for (unsigned c = 0; c < 2; c++) {
         const uint32_t *pw = p->mmr_params[c];
@@ -825,6 +862,19 @@ int pi_submit(struct pi_engine *e, const AVFrame *bl, const AVFrame *el, const v
                     t[T_LUT64 + (k * 1024 + i) * 4 + c * 2 + 1] = (uint32_t)(v >> 32);
                 }
     }
+    /* The float MMR's error bound (mode 3, p1_chroma.frag mmr_float): at most
+     * 15 additions and 1 multiplication per term, each within 2^-24 of its
+     * result, the coefficients' and tables' own rounding to float as much
+     * again: 32 x 2^-24 would cover it; 256 x 2^-24 leaves room for a GPU
+     * whose rounding is a few units off IEEE's. The feature powers b, c
+     * (floors of float products) are within 1 and 2 of the exact ones. */
+    q->err[0] = 256.0f / 16777216.0f;
+    for (int c = 0; c < 2; c++) {
+        double f = 0;
+        for (int k = 0; k < 4; k++)
+            f += fabs(q->cf[c * 3 + 1][k]) + 2.0 * fabs(q->cf[c * 3 + 2][k]);
+        q->err[1 + c] = (float)(f * 1.01 + 1e-3);
+    }
     s->plan_ms = now_ms() - t0;
 
     VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -835,15 +885,33 @@ int pi_submit(struct pi_engine *e, const AVFrame *bl, const AVFrame *el, const v
         vkCmdResetQueryPool(s->cmd, s->qp, 0, 4);
         vkCmdWriteTimestamp(s->cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, s->qp, 0);
     }
-    uint32_t k1[7] = {exact ? (uint32_t)e->mode : PI_MMR_FLOAT, p->chroma_phase, p->dual, p->chroma_kind[0],
-                      p->chroma_kind[1], p->mmr_params[0][0], p->mmr_params[1][0]};
-    uint32_t k2[3] = {p->chroma_filter != 0, p->top_left != 0, e->ablate};
-    VkPipeline p1 = variant(e, e->v1, &e->n1, 16, spv_p1, sizeof(spv_p1), e->rp[0], 2, k1, 7, 0);
-    VkPipeline p2 = variant(e, e->v2, &e->n2, 8, spv_p3, sizeof(spv_p3), e->rp[1], 2, k2, 3, 1);
-    if (!p1 || !p2)
+    uint32_t k1[9] = {exact ? (uint32_t)e->mode : PI_MMR_FLOAT, p->chroma_phase, p->dual, p->chroma_kind[0],
+                      p->chroma_kind[1], p->mmr_params[0][0], p->mmr_params[1][0], (uint32_t)single, e->mark};
+    if (single)   /* none of the FEL selectors matter */
+        memset(k1, 0, 7 * sizeof(k1[0]));
+    uint32_t k2[5] = {p->chroma_filter != 0, p->top_left != 0, e->ablate, 0, (uint32_t)single},
+             kb[5] = {0, 0, 0, 1, 0};
+    VkPipeline p1 = variant(e, e->v1, &e->n1, 16, spv_p1, sizeof(spv_p1), e->rp[0], 2, k1, 9, 0);
+    VkPipeline p2 = variant(e, e->v2, &e->n2, 8, spv_p3, sizeof(spv_p3), e->rp[1], 2, k2, 5, 1);
+    VkPipeline pb = variant(e, e->v2, &e->n2, 8, spv_p3, sizeof(spv_p3), e->rp[1], 2, kb, 5, 1);
+    if (!p1 || !p2 || !pb)
         return -1;
-    pass(e, s, 0, p1, w / 2, h / 2);
-    pass(e, s, 1, p2, w / 2, h / 2);
+    /* Pass 1 only over the letterbox's row window (yblod's, with the margin the
+     * filters need; 8-aligned): pass 2 reads no chroma or EL outside it, and
+     * writes black there itself. */
+    uint32_t c0 = 0, crows = h / 2;
+    if (p->row_last > p->row_first && !getenv("PI_ALL_ROWS")) {
+        c0 = p->row_first / 2;
+        crows = (p->row_last - p->row_first) / 2;   /* row_last: exclusive */
+    }
+    pass(e, s, 0, p1, w / 2, h / 2, c0, crows);
+    /* Pass 2: the bars (block rows wholly outside the active rows) with the
+     * black pipeline, the rest with the full one: one render pass. */
+    uint32_t a0 = p->active[1] / 2, a1 = (p->active[3] + 1) / 2;
+    if (getenv("PI_ALL_ROWS") || a1 <= a0 || a1 > h / 2)
+        a0 = 0, a1 = h / 2;
+    struct band b[3] = {{pb, 0, a0}, {p2, a0, a1 - a0}, {pb, a1, h / 2 - a1}};
+    pass_bands(e, s, 1, w / 2, h / 2, b, 3);
     if (!e->modifiers)
         for (int half = 0; half < 2; half++) {
             VkBufferImageCopy c = {.bufferOffset = (VkDeviceSize)half * s->stride, .bufferRowLength = s->stride / 4,

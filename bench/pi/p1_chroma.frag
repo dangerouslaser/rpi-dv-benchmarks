@@ -19,8 +19,12 @@ layout(binding = 10) uniform usamplerBuffer tables128;   // the tables as RGBA32
 layout(location = 0) out uvec2 o_chroma;
 layout(location = 1) out uint o_el;
 
-// 0 float, 1 exact in 32-bit pieces, 2 exact in emulated 64-bit (yblod's)
+// 0 float, 1 exact in 32-bit pieces, 2 exact in emulated 64-bit (yblod's),
+// 3 exact: float, and emulated 64-bit only where float's error bound could
+// change the result
 layout(constant_id = 0) const uint MMR_MODE = 1;
+// Measurement only (PI_MARK): mode 3 writes 4095 / 0 where it falls back.
+layout(constant_id = 8) const uint MARK = 0;
 // The stream's selectors (pi_engine.c makes a pipeline per combination):
 // chroma phase method; dual MMR; chroma kind (0 polynomial, else MMR) and
 // MMR order per channel.
@@ -31,6 +35,9 @@ layout(constant_id = 4) const uint KIND1 = 3;
 layout(constant_id = 5) const uint ORDER0 = 3;
 layout(constant_id = 6) const uint ORDER1 = 3;
 const uint ORDER = ORDER0 > ORDER1 ? ORDER0 : ORDER1;
+// The single-layer polynomial route (yblod's single_polynomial): the BL's
+// own chroma through 12-bit tables, no EL.
+layout(constant_id = 7) const uint SINGLE = 0;
 
 // ---- SAND reads ------------------------------------------------------------
 uint div3(uint n) { return uint(float(n) * 0.33333334 + 0.1); }
@@ -137,50 +144,75 @@ uint map16(uvec2 v, uint shift)
 vec2 lutf(uint t, uint i) { return uintBitsToFloat(texelFetch(tables64, T_LUTF / 2 + int(t * 1024u + i)).rg); }
 uvec4 lut64(uint t, uint i) { return texelFetch(tables128, T_LUT64 / 4 + int(t * 1024u + i)); }
 
-// MMR of both channels; s0, s1 their inputs (both: equal, a dual MMR).
-uvec2 mmr(uvec3 s0, uvec3 s1, bool both)
+// The float MMR of both channels (Q16 units, unclamped); s0, s1 their inputs
+// (both: equal, a dual MMR). bound: a bound on its distance from the exact
+// value: every float operation rounds within a relative 2^-24 of its result,
+// so the sum is within (operations) x 2^-24 x the sum of the terms'
+// magnitudes (P.err.x carries that factor, with a wide margin), plus the
+// error of the feature powers, which are floor()s of float products here:
+// b within 1, c within 2 of the exact ones (P.err.yz: the coefficients'
+// share of that, per channel).
+vec2 mmr_float(uvec3 s0, uvec3 s1, bool both, out vec2 bound)
 {
     uint xy0 = s0.x * s0.y, xy1 = s1.x * s1.y;
-    uint f0[4] = uint[4](xy0, s0.x * s0.z, s0.y * s0.z, (xy0 * s0.z) >> 10);
-    uint f1[4] = uint[4](xy1, s1.x * s1.z, s1.y * s1.z, (xy1 * s1.z) >> 10);
-    if (MMR_MODE == 0u) {
-        vec2 v = P.cconst.xy;
-        for (uint t = 0u; t < 3u; ++t)
-            v += both ? lutf(t, s0[t]) : vec2(lutf(t, s0[t]).x, lutf(t, s1[t]).y);
-        for (uint k = 0u; k < 4u; ++k) {
-            vec2 a = vec2(float(f0[k]), float(f1[k]));
-            v += vec2(P.cf[0][k], P.cf[3][k]) * a;
-            if (ORDER > 1u) {
-                vec2 b = floor(a * a * (1.0 / 1048576.0));
-                v += vec2(P.cf[1][k], P.cf[4][k]) * b;
-                if (ORDER > 2u)
-                    v += vec2(P.cf[2][k], P.cf[5][k]) * floor(a * b * (1.0 / 1048576.0));
+    uvec4 f0 = uvec4(xy0, s0.x * s0.z, s0.y * s0.z, (xy0 * s0.z) >> 10);
+    uvec4 f1 = uvec4(xy1, s1.x * s1.z, s1.y * s1.z, (xy1 * s1.z) >> 10);
+    vec2 v = P.cconst.xy, mag = abs(v);
+    for (uint t = 0u; t < 3u; ++t) {
+        vec2 l = both ? lutf(t, s0[t]) : vec2(lutf(t, s0[t]).x, lutf(t, s1[t]).y);
+        v += l;
+        mag += abs(l);
+    }
+    for (uint k = 0u; k < 4u; ++k) {
+        vec2 a = vec2(float(f0[k]), float(f1[k]));
+        vec2 t1 = vec2(P.cf[0][k], P.cf[3][k]) * a;
+        v += t1;
+        mag += abs(t1);
+        if (ORDER > 1u) {
+            vec2 b = floor(a * a * (1.0 / 1048576.0));
+            vec2 t2 = vec2(P.cf[1][k], P.cf[4][k]) * b;
+            v += t2;
+            mag += abs(t2);
+            if (ORDER > 2u) {
+                vec2 t3 = vec2(P.cf[2][k], P.cf[5][k]) * floor(a * b * (1.0 / 1048576.0));
+                v += t3;
+                mag += abs(t3);
             }
         }
-        return uvec2(max(min(v, vec2(65535.0)), vec2(0.0)));
     }
+    bound = mag * P.err.x + P.err.yz;
+    return v;
+}
+
+// The exact MMR of both channels (Q16, clamped): 1 in 32-bit pieces, 2 in
+// emulated 64-bit (yblod's).
+uvec2 mmr_exact(uvec3 s0, uvec3 s1, bool both, uint mode)
+{
+    uint xy0 = s0.x * s0.y, xy1 = s1.x * s1.y;
+    uvec4 f0 = uvec4(xy0, s0.x * s0.z, s0.y * s0.z, (xy0 * s0.z) >> 10);
+    uvec4 f1 = uvec4(xy1, s1.x * s1.z, s1.y * s1.z, (xy1 * s1.z) >> 10);
     uvec2 v0 = P.const64[0].xy, v1 = P.const64[1].xy;
     for (uint t = 0u; t < 3u; ++t) {
         uvec4 q0 = lut64(t, s0[t]), q1 = both ? q0 : lut64(t, s1[t]);
         v0 = add64(v0, q0.xy);
         v1 = add64(v1, q1.zw);
     }
-    if (MMR_MODE == 1u) {
+    if (mode == 1u) {
         // coefficient (hi * 2^16 + lo) x feature (f1 * 2^10 + f0), four
         // accumulators by weight per channel: products < 2^26, sums < 2^30.
         uvec2 a0 = uvec2(0u), a10 = uvec2(0u);
         ivec2 a16 = ivec2(0), a26 = ivec2(0);
         for (uint k = 0u; k < 4u; ++k) {
-            uvec2 f[3];
-            f[0] = uvec2(f0[k], f1[k]);
+            uvec2 fa = uvec2(f0[k], f1[k]), fb = uvec2(0u), fc = uvec2(0u);
             if (ORDER > 1u)
-                f[1] = both ? uvec2(fprod(f[0].x, f[0].x)) : uvec2(fprod(f[0].x, f[0].x), fprod(f[0].y, f[0].y));
+                fb = both ? uvec2(fprod(fa.x, fa.x)) : uvec2(fprod(fa.x, fa.x), fprod(fa.y, fa.y));
             if (ORDER > 2u)
-                f[2] = both ? uvec2(fprod(f[0].x, f[1].x)) : uvec2(fprod(f[0].x, f[1].x), fprod(f[0].y, f[1].y));
+                fc = both ? uvec2(fprod(fa.x, fb.x)) : uvec2(fprod(fa.x, fb.x), fprod(fa.y, fb.y));
             for (uint o = 0u; o < ORDER; ++o) {
+                uvec2 f = o == 0u ? fa : o == 1u ? fb : fc;
                 uvec2 lo = uvec2(P.c_lo[o][k], P.c_lo[3u + o][k]);
                 ivec2 hi = ivec2(P.c_hi[o][k], P.c_hi[3u + o][k]);
-                uvec2 lo_f = f[o] & 1023u, hi_f = f[o] >> 10;
+                uvec2 lo_f = f & 1023u, hi_f = f >> 10;
                 a0 += lo * lo_f;
                 a10 += lo * hi_f;
                 a16 += hi * ivec2(lo_f);
@@ -196,7 +228,6 @@ uvec2 mmr(uvec3 s0, uvec3 s1, bool both)
         v1 = add64(v1, uvec2(uint(a16.y) << 16, uint(a16.y >> 16)));
         v1 = add64(v1, uvec2(uint(a26.y) << 26, uint(a26.y >> 6)));
     } else {
-        // MMR_MODE 2: yblod's emulated 64-bit (umulExtended per product)
         for (uint k = 0u; k < 4u; ++k) {
             uvec2 a = uvec2(f0[k], f1[k]), b = uvec2(0u), c = uvec2(0u);
             if (ORDER > 1u)
@@ -216,9 +247,43 @@ uvec2 mmr(uvec3 s0, uvec3 s1, bool both)
     return uvec2(map16(v0, P.pk.y + 4u), map16(v1, P.pk.z + 4u));
 }
 
+uvec2 q16(vec2 v) { return uvec2(clamp(floor(v), vec2(0.0), vec2(65535.0))); }
+
+// The MMR's 12-bit result of both channels, residuals r added: float (mode
+// 0), exact (1, 2), or (3) float where its error bound can't change the
+// result, else exact (emulated 64-bit) for the fragment.
+uvec2 mmr(uvec3 s0, uvec3 s1, bool both, ivec2 r)
+{
+    if (MMR_MODE == 1u || MMR_MODE == 2u) {
+        uvec2 m = mmr_exact(s0, s1, both, MMR_MODE);
+        return uvec2(recon(m.x, r.x), recon(m.y, r.y));
+    }
+    vec2 bound, v = mmr_float(s0, s1, both, bound);
+    uvec2 lo = q16(v - bound);
+    uvec2 o = uvec2(recon(lo.x, r.x), recon(lo.y, r.y));
+    if (MMR_MODE == 3u) {
+        uvec2 hi = q16(v + bound);
+        if (o != uvec2(recon(hi.x, r.x), recon(hi.y, r.y))) {
+            if (MARK != 0u)
+                return uvec2(4095u, 0u);   // measurement only: marks the fallbacks
+            uvec2 m = mmr_exact(s0, s1, both, 2u);
+            return uvec2(recon(m.x, r.x), recon(m.y, r.y));
+        }
+        return o;
+    }
+    uvec2 m = q16(v);
+    return uvec2(recon(m.x, r.x), recon(m.y, r.y));
+}
+
 void main()
 {
     uint cx = uint(gl_FragCoord.x), k = uint(gl_FragCoord.y);
+    if (SINGLE != 0u) {
+        uvec2 c = min(sand2(bl_c, P.bl.y, P.bl.w, 2u * cx, k), uvec2(1023u));
+        o_chroma = uvec2(texelFetch(tables, T_SINGLE + 1024 + int(c.x)).r, texelFetch(tables, T_SINGLE + 2048 + int(c.y)).r);
+        o_el = 0u;
+        return;
+    }
     o_el = sand2(el_y, P.el.x, P.el.z, cx, k).x;
 
     // the luma guide: [1 2 1] / 4 on each of the block's rows (pixels
@@ -249,22 +314,20 @@ void main()
     uvec4 ev = el_vertical(cx >> 1, k);
     uvec2 e = min((cx & 1u) != 0u ? (ev.xy + ev.zw + 1u) >> 1 : ev.xy, uvec2(1023u));
 
-    uvec2 m;
+    ivec2 r = ivec2(int(texelFetch(tables, T_RES + 1024 + int(e.x)).r), int(texelFetch(tables, T_RES + 2048 + int(e.y)).r));
     uvec3 s = uvec3(guide, bp.x, bp.y);
     if (KIND0 != 0u && KIND1 != 0u) {
         if (DUAL != 0u) {   // both channels clamp the input by channel 0's bounds
             uvec3 c = clamp(s, P.lo[0].xyz, P.hi[0].xyz);
-            m = mmr(c, c, true);
+            o_chroma = mmr(c, c, true, r);
         } else
-            m = mmr(clamp(s, P.lo[0].xyz, P.hi[0].xyz), clamp(s, P.lo[1].xyz, P.hi[1].xyz), false);
+            o_chroma = mmr(clamp(s, P.lo[0].xyz, P.hi[0].xyz), clamp(s, P.lo[1].xyz, P.hi[1].xyz), false, r);
     } else {
         // polynomial channels: the chroma mapping table (an MMR one: its own)
         uvec2 mm = (KIND0 != 0u || KIND1 != 0u)
-                       ? mmr(clamp(s, P.lo[0].xyz, P.hi[0].xyz), clamp(s, P.lo[1].xyz, P.hi[1].xyz), false)
+                       ? mmr(clamp(s, P.lo[0].xyz, P.hi[0].xyz), clamp(s, P.lo[1].xyz, P.hi[1].xyz), false, r)
                        : uvec2(0u);
-        m.x = KIND0 == 0u ? texelFetch(tables, T_CMAP + int(bp.x)).r : mm.x;
-        m.y = KIND1 == 0u ? texelFetch(tables, T_CMAP + 1024 + int(bp.y)).r : mm.y;
+        o_chroma = uvec2(KIND0 == 0u ? recon(texelFetch(tables, T_CMAP + int(bp.x)).r, r.x) : mm.x,
+                         KIND1 == 0u ? recon(texelFetch(tables, T_CMAP + 1024 + int(bp.y)).r, r.y) : mm.y);
     }
-    o_chroma = uvec2(recon(m.x, int(texelFetch(tables, T_RES + 1024 + int(e.x)).r)),
-                     recon(m.y, int(texelFetch(tables, T_RES + 2048 + int(e.y)).r)));
 }

@@ -28,6 +28,9 @@ layout(constant_id = 2) const uint TOP_LEFT = 0;
 // Measurement only (PI_ABLATE): 1 no luma tables, 2 no EL gathers, 4 no chroma
 // rows, 8 no SAND reads, 16 the pass with no work, 32 no tunnel packing, 64 no 4:2:2 filter.
 layout(constant_id = 3) const uint ABLATE = 0;
+layout(constant_id = 4) const uint BARS = 0;
+// The single-layer polynomial route: luma is the BL through a 12-bit table.
+layout(constant_id = 5) const uint SINGLE = 0;
 
 uint packet_byte(uint i) { return (P.packets[i >> 4][(i >> 2) & 3u] >> (8u * (i & 3u))) & 255u; }
 
@@ -53,6 +56,8 @@ uvec4 bl_block(uint x, uint y0)
 
 uint luma(uint base, uint e)
 {
+    if (SINGLE != 0u)
+        return texelFetch(tables, T_SINGLE + int(base)).r;
     if ((ABLATE & 1u) != 0u)
         return base + e;
     // T_MAP holds mapping + 8: recon() is then one add, shift and clamp
@@ -88,6 +93,17 @@ void main()
     if ((ABLATE & 16u) != 0u) {
         o_even = uvec2(px, k);
         o_odd = uvec2(k, px);
+        return;
+    }
+
+    // BARS: the pipeline drawn over the letterbox's bars (rows wholly outside
+    // the active area): black and the metadata packets, nothing fetched; pass
+    // 1 didn't reconstruct these rows. A separate pipeline, so the main one's
+    // code is untouched by it.
+    if (BARS != 0u) {
+        uint by = P.black.x, bcb = P.black.y, bcr = P.black.z;
+        o_even = uvec2(finish(x, y0, by, bcb), finish(x + 1u, y0, by, bcr));
+        o_odd = uvec2(finish(x, y0 + 1u, by, bcb), finish(x + 1u, y0 + 1u, by, bcr));
         return;
     }
 
@@ -133,7 +149,7 @@ void main()
     // k and k-1, row 2k+1 rows k and k+1; odd pixels average the two columns.
     // gather: x (c0, b), y (c1, b), z (c1, a), w (c0, a); rows a, b = a, a+1
     uvec4 gu, gd;
-    if ((ABLATE & 2u) != 0u)
+    if (SINGLE != 0u || (ABLATE & 2u) != 0u)
         gu = gd = uvec4(px, k, px + 1u, k) & 1023u;
     else {
         vec2 at = vec2(float(px + 1u), float(k)) * P.inv.xy;   // rows k-1, k

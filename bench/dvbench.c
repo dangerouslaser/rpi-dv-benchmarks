@@ -574,7 +574,7 @@ static int vk_submit(const struct dv_picture *q, double pts, long i, unsigned sl
 
 /* ---- the Pi FEL engine (pi_engine.c) ------------------------------------- */
 static struct pi_engine *g_pi;
-static enum pi_mmr_mode g_pi_mode = PI_MMR_EXACT64;   /* the faster exact mode on V3D */
+static enum pi_mmr_mode g_pi_mode = PI_MMR_HYBRID;   /* exact, at near float cost */
 
 static int pi_frame(const struct dv_picture *q, double pts, long i, unsigned slot)
 {
@@ -862,7 +862,7 @@ int main(int argc, char **argv)
             i++;
         } else if (!strcmp(a, "--pi-mmr") && v) {
             const char *m = argv[++i];
-            g_pi_mode = !strcmp(m, "float") ? PI_MMR_FLOAT : !strcmp(m, "exact32") ? PI_MMR_EXACT32 : PI_MMR_EXACT64;
+            g_pi_mode = !strcmp(m, "float") ? PI_MMR_FLOAT : !strcmp(m, "exact32") ? PI_MMR_EXACT32 : !strcmp(m, "exact64") ? PI_MMR_EXACT64 : PI_MMR_HYBRID;
         } else if (!strcmp(a, "--compare")) {
             compare = 1;
         } else if (!strcmp(a, "--frames") && v)

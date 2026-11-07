@@ -92,6 +92,48 @@ Per pass (`PI_PROFILE=1`), in ms:
   hardware can't keep up: its error is at most 2 codes on about 0.001% of
   chroma samples.
 
+## Real films (Pi 5, hardware decode, read over SMB from the NAS)
+
+| Film | Route | Exact against yblod | Per picture | Throughput | 60 s at 23.976 fps |
+|---|---|---|---|---|---|
+| 1917 (UHD BD, P7.6 FEL, MMR, 2.39:1) | dual, float MMR | luma identical, chroma within ±2 | 35.3 ms | **29.0 fps** | 1,438 frames, **1 late** (by 0.8 ms) |
+| 1917 | dual, exact64 MMR | identical | 46.1 ms | 22.0 fps | 1,438 frames in 66.5 s (behind) |
+| Dune (2021) (UHD BD, P7.6 MEL, 2.39:1) | single (polynomial) | identical | 16.5 ms | **62.5 fps** | 1,438 frames, **0 late** |
+
+yblod's Vulkan engine takes 515 ms per picture on FEL and 143 ms on Dune.
+
+What it took:
+- **Single-layer polynomial route** (yblod's `single_polynomial`): three
+  12-bit tables applied to the BL's own Y, Cb and Cr, then the same 4:2:2
+  and pack. It is a specialisation of the same two passes.
+- **Letterbox skipping:**
+  - P1 renders only yblod's row window. For 2.39:1 that is rows 264–1896,
+    76% of the frame.
+  - P2 draws the bars with a separate black-and-packets pipeline, in the
+    same render pass with a scissor per band.
+  - Putting an early-out for the bars inside the main P2 shader made it
+    slower instead (18 → 28 ms): it changed that shader's code generation.
+  - 1917 float went from 44.8 to 35.3 ms, exact64 from 59.8 to 46.1 ms.
+- **Not handled yet:** the single-layer MMR route (yblod's `piecewise`, the
+  planner's route 3, e.g. some P8.1 web streams). The engine refuses those
+  frames for now.
+
+## Vulkan against GLES (`vk-micro`, the same 4K per-pixel shader)
+
+| | Vulkan fragment | GLES fragment | Vulkan compute | GLES compute |
+|---|---|---|---|---|
+| fetch only | 9.2 ms | 8.8 ms | 93 ms | 81 ms |
+| float maths ×4 | 22.1 ms | 22.1 ms | 157 ms | 145 ms |
+| float maths ×16 | 63.3 ms | 63.7 ms | 350 ms | 337 ms |
+| integer maths ×16 | 100.6 ms | 100.2 ms | 464 ms | 460 ms |
+
+- **Vulkan and GLES fragment passes run at the same speed.** Both drivers go
+  through the same V3D compiler.
+- **Compute is about 10× slower than fragment in both APIs.**
+- GLES would also need a SAND detile copy (about 5 ms per 4K frame) where
+  Vulkan reads the decoder's buffers directly. **A GLES port is not worth
+  prototyping.**
+
 ## What the time was, and how it went
 
 **The 4:2:2 and pack work: 42 → 17 ms**

@@ -11,7 +11,10 @@
 
 struct pi_engine;
 
-enum pi_mmr_mode { PI_MMR_FLOAT = 0, PI_MMR_EXACT32 = 1, PI_MMR_EXACT64 = 2 };
+/* MMR: float; exact in 32-bit pieces; exact in emulated 64-bit; exact as
+ * float with an error bound, emulated 64-bit only where the bound could
+ * change the result (the default). */
+enum pi_mmr_mode { PI_MMR_FLOAT = 0, PI_MMR_EXACT32 = 1, PI_MMR_EXACT64 = 2, PI_MMR_HYBRID = 3 };
 
 /* device: substring of the Vulkan device name, or NULL (the first GPU). */
 struct pi_engine *pi_create(const char *device, enum pi_mmr_mode mode, int cb1_contract);

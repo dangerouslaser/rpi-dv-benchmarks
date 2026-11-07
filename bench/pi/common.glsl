@@ -26,13 +26,14 @@ layout(std140, binding = 0) uniform Params {
     vec4 cf[6];        // the coefficient / 2^(shift + 4) (mode 0)
     vec4 cconst;       // the constant / 2^(shift + 4), Cb and Cr (mode 0)
     vec4 inv;          // 1 / cw, 1 / ch (pass 1's texture sizes)
+    vec4 err;          // the float MMR's error bound: relative factor; per channel, the feature powers' share
     uvec4 packets[40]; // 640 bytes of metadata packets
 } P;
 
 // The per-frame tables (pi_engine.c T_*), 32-bit words.
 layout(binding = 1) uniform usamplerBuffer tables;
 layout(binding = 2) uniform usamplerBuffer tables64;   // the same buffer as RG32UI
-const int T_MAP = 0, T_RES = 1024, T_CMAP = 4096, T_LUTF = 6144, T_LUT64 = 12288;
+const int T_MAP = 0, T_RES = 1024, T_CMAP = 4096, T_LUTF = 6144, T_LUT64 = 12288, T_SINGLE = 24576;
 
 int edge(int p, uint n) { return clamp(p, 0, int(n) - 1); }
 
