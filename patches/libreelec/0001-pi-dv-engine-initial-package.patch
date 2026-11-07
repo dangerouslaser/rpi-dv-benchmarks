@@ -1,0 +1,38 @@
+From 3f29e27f73d046ba017e4b248fb2ad90071106b9 Mon Sep 17 00:00:00 2001
+From: Bryan Hoban <bryan.hoban@gmail.com>
+Date: Sat, 7 Nov 2026 12:24:35 -0500
+Subject: [PATCH 1/4] pi-dv-engine: initial package
+
+libpi_engine, the Raspberry Pi 5 GPU (Vulkan) Dolby Vision reconstruction that Kodi renders standard Dolby Vision output with.
+
+Signed-off-by: Bryan Hoban <bryan.hoban@gmail.com>
+---
+ packages/multimedia/pi-dv-engine/package.mk | 19 +++++++++++++++++++
+ 1 file changed, 19 insertions(+)
+ create mode 100644 packages/multimedia/pi-dv-engine/package.mk
+
+diff --git a/packages/multimedia/pi-dv-engine/package.mk b/packages/multimedia/pi-dv-engine/package.mk
+new file mode 100644
+index 0000000000..0d152542d4
+--- /dev/null
++++ b/packages/multimedia/pi-dv-engine/package.mk
+@@ -0,0 +1,19 @@
++# SPDX-License-Identifier: GPL-2.0-or-later
++# Copyright (C) 2026-present Team LibreELEC (https://libreelec.tv)
++
++PKG_NAME="pi-dv-engine"
++PKG_VERSION="0.1.0"
++PKG_SHA256="84378669095ab5986fe365ed774a6858ddbd30b196f08ed23bb0fe4f1203e895"
++PKG_LICENSE="GPL-2.0-or-later"
++PKG_SITE="https://github.com/dangerouslaser/rpi-dv-benchmarks"
++PKG_URL="https://github.com/dangerouslaser/rpi-dv-benchmarks/releases/download/v${PKG_VERSION}/${PKG_NAME}-${PKG_VERSION}.tar.xz"
++PKG_DEPENDS_TARGET="toolchain ffmpeg vulkan-headers vulkan-loader"
++PKG_LONGDESC="Dolby Vision reconstruction for the Raspberry Pi 5 GPU (Vulkan), for Kodi."
++PKG_TOOLCHAIN="cmake"
++
++PKG_CMAKE_OPTS_TARGET="-DPI_BUILD_BENCH=OFF \
++                       -DPI_SHARED=ON"
++
++post_makeinstall_target() {
++  rm -rf ${INSTALL}/usr/share/doc
++}

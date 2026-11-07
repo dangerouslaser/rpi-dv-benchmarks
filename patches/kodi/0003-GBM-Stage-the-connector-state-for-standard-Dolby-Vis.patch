@@ -1,0 +1,204 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Bryan Hoban <bryan.hoban@gmail.com>
+Date: Sat, 7 Nov 2026 11:25:38 -0500
+Subject: [PATCH 3/6] [GBM] Stage the connector state for standard Dolby Vision
+
+In standard (TV-led) Dolby Vision the video frames carry the Dolby
+Vision signal tunnelled in 8-bit RGB, and the sink decodes it only when
+the source sends a Dolby Vision vendor-specific infoframe. Add
+CWinSystemGbm::SetDolbyVision(), which stages the HDMI connector's
+"Dolby Vision" property with the state the tunnel needs: full range
+RGB at 8 bpc, no HDR_OUTPUT_METADATA and the default Colorspace.
+Broadcast RGB is restored when it is turned off. The infoframe the
+EDID suggests is Dolby's for a version 2 Dolby Vision data block.
+
+While it is on, the GUI plane is kept off the output's first 8 rows,
+which carry the tunnel's metadata packets: a GUI blended over those
+would break the signal, where over the rest it only shows in the wrong
+colours.
+
+Signed-off-by: Bryan Hoban <bryan.hoban@gmail.com>
+---
+ xbmc/windowing/gbm/WinSystemGbm.cpp  | 71 ++++++++++++++++++++++++++++
+ xbmc/windowing/gbm/WinSystemGbm.h    | 21 ++++++++
+ xbmc/windowing/gbm/drm/DRMAtomic.cpp |  5 +-
+ xbmc/windowing/gbm/drm/DRMAtomic.h   |  3 ++
+ 4 files changed, 98 insertions(+), 2 deletions(-)
+
+diff --git a/xbmc/windowing/gbm/WinSystemGbm.cpp b/xbmc/windowing/gbm/WinSystemGbm.cpp
+index 1f47845..820a45f 100644
+--- a/xbmc/windowing/gbm/WinSystemGbm.cpp
++++ b/xbmc/windowing/gbm/WinSystemGbm.cpp
+@@ -660,3 +660,74 @@ CHDRCapabilities CWinSystemGbm::GetDisplayHDRCapabilities() const
+ 
+   return caps;
+ }
++
++bool CWinSystemGbm::SetDolbyVision(DolbyVisionOutput output)
++{
++  auto drm = std::dynamic_pointer_cast<CDRMAtomic>(m_DRM);
++  if (!drm)
++    return output == DolbyVisionOutput::OFF;
++
++  auto connector = drm->GetConnector();
++  if (!connector || !connector->SupportsProperty("Dolby Vision"))
++    return output == DolbyVisionOutput::OFF;
++
++  if (output == m_dolbyVision)
++    return true;
++
++  std::string_view name = "Off";
++  if (output == DolbyVisionOutput::HDMI_VSIF)
++    name = "Standard (HDMI VSIF)";
++  else if (output == DolbyVisionOutput::DOLBY_VSIF)
++    name = "Standard (Dolby VSIF)";
++
++  const std::optional<uint64_t> value = connector->GetPropertyEnumValue("Dolby Vision", name);
++  if (!value)
++    return false;
++
++  if (output != DolbyVisionOutput::OFF)
++  {
++    // the tunnelled signal is in the RGB bits: no range compression, no deep colour
++    // Kodi doesn't set it otherwise: the first value seen is the one to restore
++    if (!m_dolbyVisionSavedBroadcastRGB)
++      m_dolbyVisionSavedBroadcastRGB = connector->GetPropertyValue("Broadcast RGB");
++    const std::optional<uint64_t> full = connector->GetPropertyEnumValue("Broadcast RGB", "Full");
++    if (full)
++      drm->AddProperty(connector, "Broadcast RGB", full.value());
++    drm->AddProperty(connector, "max bpc", 8);
++
++    if (connector->SupportsProperty("HDR_OUTPUT_METADATA"))
++    {
++      drm->AddProperty(connector, "HDR_OUTPUT_METADATA", 0);
++      m_hdrBlob.Reset();
++    }
++    m_eotf = KODI::UTILS::Eotf::TRADITIONAL_SDR;
++
++    const std::optional<uint64_t> colorspace = connector->GetPropertyEnumValue(
++        "Colorspace", ColorimetryMap.at(KODI::UTILS::Colorimetry::DEFAULT));
++    if (colorspace)
++      drm->AddProperty(connector, "Colorspace", colorspace.value());
++    m_colorimetry = KODI::UTILS::Colorimetry::DEFAULT;
++  }
++  else if (m_dolbyVisionSavedBroadcastRGB)
++  {
++    drm->AddProperty(connector, "Broadcast RGB", m_dolbyVisionSavedBroadcastRGB.value());
++  }
++
++  CLog::LogF(LOGDEBUG, "setting connector Dolby Vision to {}", name);
++  drm->AddProperty(connector, "Dolby Vision", value.value());
++  // the tunnel's metadata packets are in its first rows: a GUI blended over them would
++  // break the signal, where over the rest it only shows in the wrong colours
++  drm->SetGuiPlaneTop(output != DolbyVisionOutput::OFF ? 8 : 0);
++  drm->SetActive(true);
++  m_dolbyVision = output;
++
++  return true;
++}
++
++DolbyVisionOutput CWinSystemGbm::GetDolbyVisionDefaultOutput() const
++{
++  if (m_info && m_info->GetDolbyVisionStandardVersion() == 2)
++    return DolbyVisionOutput::DOLBY_VSIF;
++
++  return DolbyVisionOutput::HDMI_VSIF;
++}
+diff --git a/xbmc/windowing/gbm/WinSystemGbm.h b/xbmc/windowing/gbm/WinSystemGbm.h
+index 2105a76..39931d9 100644
+--- a/xbmc/windowing/gbm/WinSystemGbm.h
++++ b/xbmc/windowing/gbm/WinSystemGbm.h
+@@ -18,6 +18,7 @@
+ 
+ #include "platform/linux/input/LibInputHandler.h"
+ 
++#include <optional>
+ #include <utility>
+ 
+ #include <gbm.h>
+@@ -35,6 +36,14 @@ namespace WINDOWING
+ namespace GBM
+ {
+ 
++//! The standard (TV-led) Dolby Vision signal on the HDMI output
++enum class DolbyVisionOutput
++{
++  OFF,
++  HDMI_VSIF, //!< the HDMI vendor-specific infoframe
++  DOLBY_VSIF, //!< Dolby's vendor-specific infoframe
++};
++
+ class CWinSystemGbm : public CWinSystemBase
+ {
+ public:
+@@ -70,6 +79,16 @@ public:
+   bool IsHDRDisplay() override;
+   CHDRCapabilities GetDisplayHDRCapabilities() const override;
+ 
++  /*!
++   * \brief Stage the connector state for frames in the standard Dolby Vision
++   * tunnel (8-bit full range RGB, no HDR metadata, default colorimetry, the
++   * vendor infoframe), or restore it. Applied with a modeset at the next commit.
++   * \return false if the connector can't signal it
++   */
++  bool SetDolbyVision(DolbyVisionOutput output);
++  //! \brief The infoframe the sink's EDID suggests: Dolby's for a version 2 data block
++  DolbyVisionOutput GetDolbyVisionDefaultOutput() const;
++
+   // holding the returned reference defers video plane teardown until it is released
+   std::shared_ptr<CVideoLayerBridge> GetVideoLayerBridge() const { return m_videoLayerBridge; }
+   void RegisterVideoLayerBridge(std::shared_ptr<CVideoLayerBridge> bridge)
+@@ -103,6 +122,8 @@ private:
+   CDRMPropertyBlob m_hdrBlob;
+   KODI::UTILS::Eotf m_eotf = KODI::UTILS::Eotf::TRADITIONAL_SDR;
+   KODI::UTILS::Colorimetry m_colorimetry = KODI::UTILS::Colorimetry::DEFAULT;
++  DolbyVisionOutput m_dolbyVision = DolbyVisionOutput::OFF;
++  std::optional<uint64_t> m_dolbyVisionSavedBroadcastRGB;
+ 
+   std::unique_ptr<UTILS::CDisplayInfo> m_info;
+ };
+diff --git a/xbmc/windowing/gbm/drm/DRMAtomic.cpp b/xbmc/windowing/gbm/drm/DRMAtomic.cpp
+index 2f27659..8fb8809 100644
+--- a/xbmc/windowing/gbm/drm/DRMAtomic.cpp
++++ b/xbmc/windowing/gbm/drm/DRMAtomic.cpp
+@@ -96,6 +96,7 @@ void CDRMAtomic::DrmAtomicCommit(int fb_id, int flags, bool rendered, bool video
+ 
+   if (rendered)
+   {
++    const uint32_t top = outputPlane == m_gui_plane ? m_guiPlaneTop : 0;
+     AddProperty(outputPlane, "FB_ID", fb_id);
+     AddProperty(outputPlane, "CRTC_ID", m_crtc->GetCrtcId());
+     AddProperty(outputPlane, "SRC_X", 0);
+@@ -103,9 +104,9 @@ void CDRMAtomic::DrmAtomicCommit(int fb_id, int flags, bool rendered, bool video
+     AddProperty(outputPlane, "SRC_W", m_width << 16);
+     AddProperty(outputPlane, "SRC_H", m_height << 16);
+     AddProperty(outputPlane, "CRTC_X", 0);
+-    AddProperty(outputPlane, "CRTC_Y", 0);
++    AddProperty(outputPlane, "CRTC_Y", top);
+     AddProperty(outputPlane, "CRTC_W", m_mode->hdisplay);
+-    AddProperty(outputPlane, "CRTC_H", m_mode->vdisplay);
++    AddProperty(outputPlane, "CRTC_H", m_mode->vdisplay - top);
+ 
+     if (m_inFenceFd != -1)
+     {
+diff --git a/xbmc/windowing/gbm/drm/DRMAtomic.h b/xbmc/windowing/gbm/drm/DRMAtomic.h
+index d31d94d..166e7d9 100644
+--- a/xbmc/windowing/gbm/drm/DRMAtomic.h
++++ b/xbmc/windowing/gbm/drm/DRMAtomic.h
+@@ -40,6 +40,8 @@ public:
+    * \param fd A sync_file, taken (closed after the next commit); -1 for none.
+    */
+   void SetVideoPlaneInFence(int fd);
++  //! \brief Keep the GUI plane off the output's first rows (scaled into the rest)
++  void SetGuiPlaneTop(uint32_t rows) { m_guiPlaneTop = rows; }
+ 
+   // Probe whether any DRM device supports atomic modesetting, with no
+   // connector required. Used to decide atomic-vs-legacy before falling back.
+@@ -50,6 +52,7 @@ private:
+ 
+   bool m_need_modeset{true};
+   int m_videoInFenceFd{-1};
++  uint32_t m_guiPlaneTop{0};
+   bool m_active = true;
+ 
+   class CDRMAtomicRequest

@@ -1,0 +1,561 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Bryan Hoban <bryan.hoban@gmail.com>
+Date: Sat, 7 Nov 2026 12:18:40 -0500
+Subject: [PATCH 6/6] [VideoPlayer] Dolby Vision settings in the video settings
+ dialog
+
+Add a Dolby Vision group to the in-video settings, shown when the
+renderer can send the stream as standard Dolby Vision
+(RENDERFEATURE_DOLBYVISION): the output itself, whether the enhancement
+layer is rendered, its upscaling filter, the chroma MMR's arithmetic,
+the reconstruction's filters and the vendor infoframe. They are part
+of CVideoSettings and the default video settings, and apply during
+playback: CRendererDRMPRIME reopens the engine's stream with changed
+options, restages the connector for another infoframe, or switches
+between the tunnel and the decoder's own frames.
+
+Signed-off-by: Bryan Hoban <bryan.hoban@gmail.com>
+---
+ .../resources/strings.po                      |  98 ++++++++++++++++-
+ xbmc/cores/IPlayer.h                          |   3 +-
+ .../HwDecRender/RendererDRMPRIME.cpp          | 104 ++++++++++++++++--
+ .../HwDecRender/RendererDRMPRIME.h            |   3 +
+ xbmc/cores/VideoSettings.cpp                  |  12 ++
+ xbmc/cores/VideoSettings.h                    |  40 +++++++
+ xbmc/settings/MediaSettings.cpp               |  24 ++++
+ xbmc/video/dialogs/GUIDialogVideoSettings.cpp |  79 +++++++++++++
+ 8 files changed, 350 insertions(+), 13 deletions(-)
+
+diff --git a/addons/resource.language.en_gb/resources/strings.po b/addons/resource.language.en_gb/resources/strings.po
+index 58ddc85..6b0e8e2 100644
+--- a/addons/resource.language.en_gb/resources/strings.po
++++ b/addons/resource.language.en_gb/resources/strings.po
+@@ -23174,7 +23174,103 @@ msgctxt "#36642"
+ msgid "No orphaned add-ons to remove."
+ msgstr ""
+ 
+-#empty strings from id 36643 to 36898
++#. Group of the video settings dialog: the standard Dolby Vision output
++#: xbmc/video/dialogs/GUIDialogVideoSettings.cpp
++msgctxt "#36643"
++msgid "Dolby Vision"
++msgstr ""
++
++#. Send the video as standard (TV-led) Dolby Vision
++#: xbmc/video/dialogs/GUIDialogVideoSettings.cpp
++msgctxt "#36644"
++msgid "Dolby Vision output"
++msgstr ""
++
++#. Dolby Vision: render the enhancement layer where the picture needs it, or the base layer alone
++#: xbmc/video/dialogs/GUIDialogVideoSettings.cpp
++msgctxt "#36645"
++msgid "Enhancement layer"
++msgstr ""
++
++#. Dolby Vision: the enhancement layer's upscaling filter
++#: xbmc/video/dialogs/GUIDialogVideoSettings.cpp
++msgctxt "#36646"
++msgid "Enhancement layer upscale"
++msgstr ""
++
++#. Dolby Vision enhancement layer upscale: the filters of ETSI GS CCM 001 Annex B
++#: xbmc/video/dialogs/GUIDialogVideoSettings.cpp
++msgctxt "#36647"
++msgid "Annex B"
++msgstr ""
++
++#. Dolby Vision: the arithmetic of the chroma reshaping (MMR)
++#: xbmc/video/dialogs/GUIDialogVideoSettings.cpp
++msgctxt "#36648"
++msgid "Chroma MMR"
++msgstr ""
++
++#. Dolby Vision chroma MMR: exact, from a float sum with an error bound
++#: xbmc/video/dialogs/GUIDialogVideoSettings.cpp
++msgctxt "#36649"
++msgid "Exact"
++msgstr ""
++
++#. Dolby Vision chroma MMR: exact, a split integer sum
++#: xbmc/video/dialogs/GUIDialogVideoSettings.cpp
++msgctxt "#36650"
++msgid "Split"
++msgstr ""
++
++#. Dolby Vision chroma MMR: exact, emulated 64-bit integers
++#: xbmc/video/dialogs/GUIDialogVideoSettings.cpp
++msgctxt "#36651"
++msgid "Exact (64-bit)"
++msgstr ""
++
++#. Dolby Vision chroma MMR: 32-bit float, not exact
++#: xbmc/video/dialogs/GUIDialogVideoSettings.cpp
++msgctxt "#36652"
++msgid "Float"
++msgstr ""
++
++#. Dolby Vision: the reconstruction's spatial filters
++#: xbmc/video/dialogs/GUIDialogVideoSettings.cpp
++msgctxt "#36653"
++msgid "Filters"
++msgstr ""
++
++#. Dolby Vision filters: those of the CB1 reference
++#: xbmc/video/dialogs/GUIDialogVideoSettings.cpp
++msgctxt "#36654"
++msgid "CB1"
++msgstr ""
++
++#. Dolby Vision filters: chroma phase filters
++#: xbmc/video/dialogs/GUIDialogVideoSettings.cpp
++msgctxt "#36655"
++msgid "Phase"
++msgstr ""
++
++#. Dolby Vision: the vendor-specific infoframe sent on HDMI
++#: xbmc/video/dialogs/GUIDialogVideoSettings.cpp
++msgctxt "#36656"
++msgid "Infoframe"
++msgstr ""
++
++#. Dolby Vision infoframe: the HDMI vendor-specific infoframe
++#: xbmc/video/dialogs/GUIDialogVideoSettings.cpp
++msgctxt "#36657"
++msgid "HDMI VSIF"
++msgstr ""
++
++#. Dolby Vision infoframe: Dolby's vendor-specific infoframe
++#: xbmc/video/dialogs/GUIDialogVideoSettings.cpp
++msgctxt "#36658"
++msgid "Dolby VSIF"
++msgstr ""
++
++#empty strings from id 36659 to 36898
+ 
+ #. Description of setting with label #729 "Enable SSL"
+ #: system/settings/settings.xml
+diff --git a/xbmc/cores/IPlayer.h b/xbmc/cores/IPlayer.h
+index 5f96bc3..bb6accb 100644
+--- a/xbmc/cores/IPlayer.h
++++ b/xbmc/cores/IPlayer.h
+@@ -82,7 +82,8 @@ enum ERENDERFEATURE
+   RENDERFEATURE_VERTICAL_SHIFT,
+   RENDERFEATURE_PIXEL_RATIO,
+   RENDERFEATURE_POSTPROCESS,
+-  RENDERFEATURE_TONEMAP
++  RENDERFEATURE_TONEMAP,
++  RENDERFEATURE_DOLBYVISION
+ };
+ 
+ class IPlayer
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIME.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIME.cpp
+index 818a48a..0609f0c 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIME.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIME.cpp
+@@ -161,26 +161,75 @@ void CRendererDRMPRIME::SetHDROutput(const VideoPicture& picture)
+   }
+ }
+ 
++#if defined(HAVE_PIDV)
++namespace
++{
++CDVTunnelDRMPRIME::Options GetDolbyVisionOptions(const CVideoSettings& settings)
++{
++  CDVTunnelDRMPRIME::Options options;
++  switch (settings.m_DolbyVisionMMR)
++  {
++    case VS_DOLBYVISION_MMR_SPLIT:
++      options.mmr = PI_MMR_SPLIT;
++      break;
++    case VS_DOLBYVISION_MMR_EXACT64:
++      options.mmr = PI_MMR_EXACT64;
++      break;
++    case VS_DOLBYVISION_MMR_FLOAT:
++      options.mmr = PI_MMR_FLOAT;
++      break;
++    default:
++      options.mmr = PI_MMR_EXACT;
++      break;
++  }
++  options.filters = settings.m_DolbyVisionFilters == VS_DOLBYVISION_FILTERS_PHASE
++                        ? PI_FILTERS_PHASE
++                        : PI_FILTERS_CB1;
++  options.elUpscale = settings.m_DolbyVisionUpscale == VS_DOLBYVISION_UPSCALE_ANNEX_B
++                          ? PI_EL_ANNEX_B
++                          : PI_EL_BILINEAR;
++  options.enhancementLayer = settings.m_DolbyVisionEL != VS_DOLBYVISION_EL_OFF;
++  return options;
++}
++
++DolbyVisionOutput GetDolbyVisionInfoframe(const CVideoSettings& settings)
++{
++  if (settings.m_DolbyVisionInfoframe == VS_DOLBYVISION_INFOFRAME_HDMI)
++    return DolbyVisionOutput::HDMI_VSIF;
++  if (settings.m_DolbyVisionInfoframe == VS_DOLBYVISION_INFOFRAME_DOLBY)
++    return DolbyVisionOutput::DOLBY_VSIF;
++  return static_cast<CWinSystemGbm*>(CServiceBroker::GetWinSystem())
++      ->GetDolbyVisionDefaultOutput();
++}
++} // namespace
++#endif
++
+ bool CRendererDRMPRIME::SetDolbyVisionOutput(const VideoPicture& picture)
+ {
+ #if defined(HAVE_PIDV)
+-  if (!CDVTunnelDRMPRIME::Supports(picture))
+-    return false;
++  if (!m_dolbyVisionCapable)
++  {
++    auto* winSystem = static_cast<CWinSystemGbm*>(CServiceBroker::GetWinSystem());
++    const auto allowedHdrFormats = std::dynamic_pointer_cast<CSettingList>(
++        CServiceBroker::GetSettingsComponent()->GetSettings()->GetSetting(
++            CSettings::SETTING_VIDEOPLAYER_ALLOWEDHDRFORMATS));
++    m_dolbyVisionCapable =
++        CDVTunnelDRMPRIME::Supports(picture) &&
++        CSettingUtils::FindIntInList(allowedHdrFormats,
++                                     CSettings::VIDEOPLAYER_ALLOWED_HDR_TYPE_DOLBY_VISION) &&
++        winSystem->GetDisplayHDRCapabilities().SupportsDolbyVision();
++  }
+ 
+-  auto* winSystem = static_cast<CWinSystemGbm*>(CServiceBroker::GetWinSystem());
+-  const auto allowedHdrFormats = std::dynamic_pointer_cast<CSettingList>(
+-      CServiceBroker::GetSettingsComponent()->GetSettings()->GetSetting(
+-          CSettings::SETTING_VIDEOPLAYER_ALLOWEDHDRFORMATS));
+-  if (!CSettingUtils::FindIntInList(allowedHdrFormats,
+-                                    CSettings::VIDEOPLAYER_ALLOWED_HDR_TYPE_DOLBY_VISION) ||
+-      !winSystem->GetDisplayHDRCapabilities().SupportsDolbyVision())
++  m_dolbyVisionEnabled = m_videoSettings.m_DolbyVision;
++  if (!m_dolbyVisionCapable || !m_dolbyVisionEnabled)
+     return false;
+ 
+-  m_dolbyVision = CDVTunnelDRMPRIME::Create(picture, {});
++  m_dolbyVision = CDVTunnelDRMPRIME::Create(picture, GetDolbyVisionOptions(m_videoSettings));
+   if (!m_dolbyVision)
+     return false;
+ 
+-  if (!winSystem->SetDolbyVision(winSystem->GetDolbyVisionDefaultOutput()))
++  auto* winSystem = static_cast<CWinSystemGbm*>(CServiceBroker::GetWinSystem());
++  if (!winSystem->SetDolbyVision(GetDolbyVisionInfoframe(m_videoSettings)))
+   {
+     m_dolbyVision.reset();
+     return false;
+@@ -189,6 +238,8 @@ bool CRendererDRMPRIME::SetDolbyVisionOutput(const VideoPicture& picture)
+   m_dolbyVisionMismatches = 0;
+   winSystem->SetGuiCompositing(false);
+   winSystem->SetHDR(nullptr);
++  // the bridge configures the plane and connector for the tunnel's frames
++  m_iLastRenderBuffer = -1;
+   return true;
+ #else
+   return false;
+@@ -207,9 +258,38 @@ void CRendererDRMPRIME::ResetDolbyVisionOutput(const VideoPicture& picture)
+ #endif
+ }
+ 
++void CRendererDRMPRIME::UpdateDolbyVisionOutput(const VideoPicture& picture)
++{
++#if defined(HAVE_PIDV)
++  if (!m_dolbyVisionCapable)
++    return;
++
++  if (m_videoSettings.m_DolbyVision != m_dolbyVisionEnabled)
++  {
++    CLog::Log(LOGINFO, "CRendererDRMPRIME: Dolby Vision output {}",
++              m_videoSettings.m_DolbyVision ? "on" : "off");
++    if (m_dolbyVisionEnabled)
++    {
++      m_dolbyVisionEnabled = false;
++      ResetDolbyVisionOutput(picture);
++    }
++    else if (!SetDolbyVisionOutput(picture))
++      SetHDROutput(picture);
++  }
++
++  if (!m_dolbyVision)
++    return;
++
++  m_dolbyVision->SetOptions(GetDolbyVisionOptions(m_videoSettings));
++  static_cast<CWinSystemGbm*>(CServiceBroker::GetWinSystem())
++      ->SetDolbyVision(GetDolbyVisionInfoframe(m_videoSettings));
++#endif
++}
++
+ bool CRendererDRMPRIME::RenderDolbyVision(CVideoBufferDRMPRIME* buffer)
+ {
+ #if defined(HAVE_PIDV)
++  UpdateDolbyVisionOutput(buffer->GetPicture());
+   if (!m_dolbyVision)
+     return false;
+ 
+@@ -403,6 +483,8 @@ bool CRendererDRMPRIME::Supports(ERENDERFEATURE feature) const
+     case RENDERFEATURE_VERTICAL_SHIFT:
+     case RENDERFEATURE_PIXEL_RATIO:
+       return true;
++    case RENDERFEATURE_DOLBYVISION:
++      return m_dolbyVisionCapable;
+     default:
+       return false;
+   }
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIME.h b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIME.h
+index 3954720..83fcdc6 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIME.h
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIME.h
+@@ -56,6 +56,7 @@ private:
+   void SetHDROutput(const VideoPicture& picture);
+   bool SetDolbyVisionOutput(const VideoPicture& picture);
+   void ResetDolbyVisionOutput(const VideoPicture& picture);
++  void UpdateDolbyVisionOutput(const VideoPicture& picture);
+   bool RenderDolbyVision(CVideoBufferDRMPRIME* buffer);
+ 
+   bool m_bConfigured = false;
+@@ -64,6 +65,8 @@ private:
+ 
+   std::shared_ptr<CVideoLayerBridgeDRMPRIME> m_videoLayerBridge;
+ 
++  bool m_dolbyVisionCapable = false;
++  bool m_dolbyVisionEnabled = false;
+ #if defined(HAVE_PIDV)
+   std::unique_ptr<CDVTunnelDRMPRIME> m_dolbyVision;
+   unsigned int m_dolbyVisionMismatches = 0;
+diff --git a/xbmc/cores/VideoSettings.cpp b/xbmc/cores/VideoSettings.cpp
+index 0589484..a9028d3 100644
+--- a/xbmc/cores/VideoSettings.cpp
++++ b/xbmc/cores/VideoSettings.cpp
+@@ -43,6 +43,12 @@ CVideoSettings::CVideoSettings()
+   m_ToneMapParam = 1.0f;
+   m_Orientation = 0;
+   m_CenterMixLevel = 0;
++  m_DolbyVision = true;
++  m_DolbyVisionEL = VS_DOLBYVISION_EL_AUTO;
++  m_DolbyVisionUpscale = VS_DOLBYVISION_UPSCALE_BILINEAR;
++  m_DolbyVisionMMR = VS_DOLBYVISION_MMR_EXACT;
++  m_DolbyVisionFilters = VS_DOLBYVISION_FILTERS_CB1;
++  m_DolbyVisionInfoframe = VS_DOLBYVISION_INFOFRAME_AUTO;
+ }
+ 
+ bool CVideoSettings::operator!=(const CVideoSettings &right) const
+@@ -74,6 +80,12 @@ bool CVideoSettings::operator!=(const CVideoSettings &right) const
+   if (m_ToneMapParam != right.m_ToneMapParam) return true;
+   if (m_Orientation != right.m_Orientation) return true;
+   if (m_CenterMixLevel != right.m_CenterMixLevel) return true;
++  if (m_DolbyVision != right.m_DolbyVision) return true;
++  if (m_DolbyVisionEL != right.m_DolbyVisionEL) return true;
++  if (m_DolbyVisionUpscale != right.m_DolbyVisionUpscale) return true;
++  if (m_DolbyVisionMMR != right.m_DolbyVisionMMR) return true;
++  if (m_DolbyVisionFilters != right.m_DolbyVisionFilters) return true;
++  if (m_DolbyVisionInfoframe != right.m_DolbyVisionInfoframe) return true;
+   return false;
+ }
+ 
+diff --git a/xbmc/cores/VideoSettings.h b/xbmc/cores/VideoSettings.h
+index 82779fb..0d3b7ee 100644
+--- a/xbmc/cores/VideoSettings.h
++++ b/xbmc/cores/VideoSettings.h
+@@ -196,6 +196,40 @@ private:
+                 "add/remove a mapping?");
+ };
+ 
++// standard Dolby Vision output (libpi_engine)
++enum EDOLBYVISIONEL
++{
++  VS_DOLBYVISION_EL_AUTO = 0, //!< where the RPU needs it (FEL)
++  VS_DOLBYVISION_EL_OFF = 1, //!< the base layer alone
++};
++
++enum EDOLBYVISIONUPSCALE
++{
++  VS_DOLBYVISION_UPSCALE_BILINEAR = 0,
++  VS_DOLBYVISION_UPSCALE_ANNEX_B = 1,
++};
++
++enum EDOLBYVISIONMMR
++{
++  VS_DOLBYVISION_MMR_EXACT = 0,
++  VS_DOLBYVISION_MMR_SPLIT = 1,
++  VS_DOLBYVISION_MMR_EXACT64 = 2,
++  VS_DOLBYVISION_MMR_FLOAT = 3,
++};
++
++enum EDOLBYVISIONFILTERS
++{
++  VS_DOLBYVISION_FILTERS_CB1 = 0,
++  VS_DOLBYVISION_FILTERS_PHASE = 1,
++};
++
++enum EDOLBYVISIONINFOFRAME
++{
++  VS_DOLBYVISION_INFOFRAME_AUTO = 0, //!< as the sink's EDID suggests
++  VS_DOLBYVISION_INFOFRAME_HDMI = 1,
++  VS_DOLBYVISION_INFOFRAME_DOLBY = 2,
++};
++
+ enum ViewMode
+ {
+   ViewModeNormal = 0,
+@@ -247,6 +281,12 @@ public:
+   float m_ToneMapParam;
+   int m_Orientation;
+   int m_CenterMixLevel; // relative to metadata or default
++  bool m_DolbyVision;
++  EDOLBYVISIONEL m_DolbyVisionEL;
++  EDOLBYVISIONUPSCALE m_DolbyVisionUpscale;
++  EDOLBYVISIONMMR m_DolbyVisionMMR;
++  EDOLBYVISIONFILTERS m_DolbyVisionFilters;
++  EDOLBYVISIONINFOFRAME m_DolbyVisionInfoframe;
+   std::optional<bool>
+       m_isDefaultVideoSettings; //!< true: default video settings, false: video specific
+ };
+diff --git a/xbmc/settings/MediaSettings.cpp b/xbmc/settings/MediaSettings.cpp
+index 25fe6f5..cbc0f2b 100644
+--- a/xbmc/settings/MediaSettings.cpp
++++ b/xbmc/settings/MediaSettings.cpp
+@@ -109,6 +109,24 @@ bool CMediaSettings::Load(const TiXmlNode *settings)
+ 
+     if (!XMLUtils::GetFloat(pElement, "tonemapparam", m_defaultVideoSettings.m_ToneMapParam, 0.1f, 5.0f))
+       m_defaultVideoSettings.m_ToneMapParam = 1.0f;
++
++    XMLUtils::GetBoolean(pElement, "dolbyvision", m_defaultVideoSettings.m_DolbyVision);
++    int value;
++    if (XMLUtils::GetInt(pElement, "dolbyvisionel", value, VS_DOLBYVISION_EL_AUTO,
++                         VS_DOLBYVISION_EL_OFF))
++      m_defaultVideoSettings.m_DolbyVisionEL = static_cast<EDOLBYVISIONEL>(value);
++    if (XMLUtils::GetInt(pElement, "dolbyvisionupscale", value, VS_DOLBYVISION_UPSCALE_BILINEAR,
++                         VS_DOLBYVISION_UPSCALE_ANNEX_B))
++      m_defaultVideoSettings.m_DolbyVisionUpscale = static_cast<EDOLBYVISIONUPSCALE>(value);
++    if (XMLUtils::GetInt(pElement, "dolbyvisionmmr", value, VS_DOLBYVISION_MMR_EXACT,
++                         VS_DOLBYVISION_MMR_FLOAT))
++      m_defaultVideoSettings.m_DolbyVisionMMR = static_cast<EDOLBYVISIONMMR>(value);
++    if (XMLUtils::GetInt(pElement, "dolbyvisionfilters", value, VS_DOLBYVISION_FILTERS_CB1,
++                         VS_DOLBYVISION_FILTERS_PHASE))
++      m_defaultVideoSettings.m_DolbyVisionFilters = static_cast<EDOLBYVISIONFILTERS>(value);
++    if (XMLUtils::GetInt(pElement, "dolbyvisioninfoframe", value, VS_DOLBYVISION_INFOFRAME_AUTO,
++                         VS_DOLBYVISION_INFOFRAME_DOLBY))
++      m_defaultVideoSettings.m_DolbyVisionInfoframe = static_cast<EDOLBYVISIONINFOFRAME>(value);
+   }
+ 
+   m_defaultGameSettings.Reset();
+@@ -224,6 +242,12 @@ bool CMediaSettings::Save(TiXmlNode *settings) const
+   XMLUtils::SetInt(pNode, "centermixlevel", m_defaultVideoSettings.m_CenterMixLevel);
+   XMLUtils::SetInt(pNode, "tonemapmethod", m_defaultVideoSettings.m_ToneMapMethod);
+   XMLUtils::SetFloat(pNode, "tonemapparam", m_defaultVideoSettings.m_ToneMapParam);
++  XMLUtils::SetBoolean(pNode, "dolbyvision", m_defaultVideoSettings.m_DolbyVision);
++  XMLUtils::SetInt(pNode, "dolbyvisionel", m_defaultVideoSettings.m_DolbyVisionEL);
++  XMLUtils::SetInt(pNode, "dolbyvisionupscale", m_defaultVideoSettings.m_DolbyVisionUpscale);
++  XMLUtils::SetInt(pNode, "dolbyvisionmmr", m_defaultVideoSettings.m_DolbyVisionMMR);
++  XMLUtils::SetInt(pNode, "dolbyvisionfilters", m_defaultVideoSettings.m_DolbyVisionFilters);
++  XMLUtils::SetInt(pNode, "dolbyvisioninfoframe", m_defaultVideoSettings.m_DolbyVisionInfoframe);
+ 
+   // default audio settings for dsp addons
+   TiXmlElement audioSettingsNode("defaultaudiosettings");
+diff --git a/xbmc/video/dialogs/GUIDialogVideoSettings.cpp b/xbmc/video/dialogs/GUIDialogVideoSettings.cpp
+index 4f42759..482f44b 100644
+--- a/xbmc/video/dialogs/GUIDialogVideoSettings.cpp
++++ b/xbmc/video/dialogs/GUIDialogVideoSettings.cpp
+@@ -54,6 +54,13 @@
+ #define SETTING_VIDEO_INTERLACEMETHOD     "video.interlacemethod"
+ #define SETTING_VIDEO_SCALINGMETHOD       "video.scalingmethod"
+ 
++#define SETTING_VIDEO_DOLBYVISION         "video.dolbyvision"
++#define SETTING_VIDEO_DOLBYVISION_EL      "video.dolbyvision.el"
++#define SETTING_VIDEO_DOLBYVISION_UPSCALE "video.dolbyvision.upscale"
++#define SETTING_VIDEO_DOLBYVISION_MMR     "video.dolbyvision.mmr"
++#define SETTING_VIDEO_DOLBYVISION_FILTERS "video.dolbyvision.filters"
++#define SETTING_VIDEO_DOLBYVISION_INFOFRAME "video.dolbyvision.infoframe"
++
+ #define SETTING_VIDEO_STEREOSCOPICMODE    "video.stereoscopicmode"
+ #define SETTING_VIDEO_STEREOSCOPICINVERT  "video.stereoscopicinvert"
+ 
+@@ -194,6 +201,32 @@ void CGUIDialogVideoSettings::OnSettingChanged(const std::shared_ptr<const CSett
+     vs.m_Orientation = std::static_pointer_cast<const CSettingInt>(setting)->GetValue();
+     appPlayer->SetVideoSettings(vs);
+   }
++  else if (settingId == SETTING_VIDEO_DOLBYVISION)
++  {
++    CVideoSettings vs = appPlayer->GetVideoSettings();
++    vs.m_DolbyVision = std::static_pointer_cast<const CSettingBool>(setting)->GetValue();
++    appPlayer->SetVideoSettings(vs);
++  }
++  else if (settingId == SETTING_VIDEO_DOLBYVISION_EL ||
++           settingId == SETTING_VIDEO_DOLBYVISION_UPSCALE ||
++           settingId == SETTING_VIDEO_DOLBYVISION_MMR ||
++           settingId == SETTING_VIDEO_DOLBYVISION_FILTERS ||
++           settingId == SETTING_VIDEO_DOLBYVISION_INFOFRAME)
++  {
++    CVideoSettings vs = appPlayer->GetVideoSettings();
++    const int value = std::static_pointer_cast<const CSettingInt>(setting)->GetValue();
++    if (settingId == SETTING_VIDEO_DOLBYVISION_EL)
++      vs.m_DolbyVisionEL = static_cast<EDOLBYVISIONEL>(value);
++    else if (settingId == SETTING_VIDEO_DOLBYVISION_UPSCALE)
++      vs.m_DolbyVisionUpscale = static_cast<EDOLBYVISIONUPSCALE>(value);
++    else if (settingId == SETTING_VIDEO_DOLBYVISION_MMR)
++      vs.m_DolbyVisionMMR = static_cast<EDOLBYVISIONMMR>(value);
++    else if (settingId == SETTING_VIDEO_DOLBYVISION_FILTERS)
++      vs.m_DolbyVisionFilters = static_cast<EDOLBYVISIONFILTERS>(value);
++    else
++      vs.m_DolbyVisionInfoframe = static_cast<EDOLBYVISIONINFOFRAME>(value);
++    appPlayer->SetVideoSettings(vs);
++  }
+   else if (settingId == SETTING_VIDEO_STEREOSCOPICMODE)
+   {
+     CVideoSettings vs = appPlayer->GetVideoSettings();
+@@ -311,6 +344,12 @@ void CGUIDialogVideoSettings::InitializeSettings()
+     CLog::Log(LOGERROR, "CGUIDialogVideoSettings: unable to setup settings");
+     return;
+   }
++  const std::shared_ptr<CSettingGroup> groupDolbyVision = AddGroup(category, 36643);
++  if (groupDolbyVision == NULL)
++  {
++    CLog::Log(LOGERROR, "CGUIDialogVideoSettings: unable to setup settings");
++    return;
++  }
+   const std::shared_ptr<CSettingGroup> groupStereoscopic = AddGroup(category);
+   if (groupStereoscopic == NULL)
+   {
+@@ -455,6 +494,46 @@ void CGUIDialogVideoSettings::InitializeSettings()
+               visible);
+   }
+ 
++  // standard Dolby Vision output
++  if (appPlayer->Supports(RENDERFEATURE_DOLBYVISION))
++  {
++    AddToggle(groupDolbyVision, SETTING_VIDEO_DOLBYVISION, 36644, SettingLevel::Basic,
++              videoSettings.m_DolbyVision);
++
++    entries.clear();
++    entries.emplace_back(16316, VS_DOLBYVISION_EL_AUTO);
++    entries.emplace_back(16039, VS_DOLBYVISION_EL_OFF);
++    AddSpinner(groupDolbyVision, SETTING_VIDEO_DOLBYVISION_EL, 36645, SettingLevel::Basic,
++               videoSettings.m_DolbyVisionEL, entries);
++
++    entries.clear();
++    entries.emplace_back(16302, VS_DOLBYVISION_UPSCALE_BILINEAR);
++    entries.emplace_back(36647, VS_DOLBYVISION_UPSCALE_ANNEX_B);
++    AddSpinner(groupDolbyVision, SETTING_VIDEO_DOLBYVISION_UPSCALE, 36646, SettingLevel::Basic,
++               videoSettings.m_DolbyVisionUpscale, entries);
++
++    entries.clear();
++    entries.emplace_back(36649, VS_DOLBYVISION_MMR_EXACT);
++    entries.emplace_back(36650, VS_DOLBYVISION_MMR_SPLIT);
++    entries.emplace_back(36651, VS_DOLBYVISION_MMR_EXACT64);
++    entries.emplace_back(36652, VS_DOLBYVISION_MMR_FLOAT);
++    AddSpinner(groupDolbyVision, SETTING_VIDEO_DOLBYVISION_MMR, 36648, SettingLevel::Basic,
++               videoSettings.m_DolbyVisionMMR, entries);
++
++    entries.clear();
++    entries.emplace_back(36654, VS_DOLBYVISION_FILTERS_CB1);
++    entries.emplace_back(36655, VS_DOLBYVISION_FILTERS_PHASE);
++    AddSpinner(groupDolbyVision, SETTING_VIDEO_DOLBYVISION_FILTERS, 36653, SettingLevel::Basic,
++               videoSettings.m_DolbyVisionFilters, entries);
++
++    entries.clear();
++    entries.emplace_back(16316, VS_DOLBYVISION_INFOFRAME_AUTO);
++    entries.emplace_back(36657, VS_DOLBYVISION_INFOFRAME_HDMI);
++    entries.emplace_back(36658, VS_DOLBYVISION_INFOFRAME_DOLBY);
++    AddSpinner(groupDolbyVision, SETTING_VIDEO_DOLBYVISION_INFOFRAME, 36656, SettingLevel::Basic,
++               videoSettings.m_DolbyVisionInfoframe, entries);
++  }
++
+   // stereoscopic settings
+   entries.clear();
+   entries.emplace_back(16316, static_cast<int>(RenderStereoMode::OFF));

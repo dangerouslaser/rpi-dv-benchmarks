@@ -83,7 +83,10 @@ if [ $GPUAV = 1 ]; then
   # out-of-bounds reads in the shaders, every route and filter set
   for c in "DV FEL Power Rangers Credits Test.mkv|" "DV FEL Power Rangers Credits Test.mkv|--filters phase" \
            "sol/p84-2160-100.hevc|" "sol/p84-2160-100.hevc|--filters phase" "sol/p5-1080-100.hevc|" \
-           "p81mmr-cmv.mkv|--filters phase"; do
+           "p81mmr-cmv.mkv|--filters phase" "DV FEL Power Rangers Credits Test.mkv|--el-upscale annexb" \
+           "DV FEL Power Rangers Credits Test.mkv|--el-upscale annexb --filters phase" \
+           "DV FEL Power Rangers Credits Test.mkv|--el-upscale bicubic" \
+           "DV FEL Power Rangers Credits Test.mkv|--el-upscale lanczos"; do
     clip=${c%%|*} opts=${c#*|}
     [ -e "clips/$clip" ] || { echo "skip  gpuav $clip: not in clips/"; continue; }
     log=$WORK/gpuav.log

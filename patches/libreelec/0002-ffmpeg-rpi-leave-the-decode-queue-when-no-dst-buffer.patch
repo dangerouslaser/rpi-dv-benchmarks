@@ -1,0 +1,41 @@
+From d5357b58d2943c2dbc85e787b926b5c99d15fb2d Mon Sep 17 00:00:00 2001
+From: Bryan Hoban <bryan.hoban@gmail.com>
+Date: Sat, 7 Nov 2026 12:24:35 -0500
+Subject: [PATCH 2/4] ffmpeg: rpi: leave the decode queue when no dst buffer is
+ free
+
+A failed destination buffer allocation in the V4L2 request HEVC decoder left the frame queued, and closing the decoder then hung.
+
+Signed-off-by: Bryan Hoban <bryan.hoban@gmail.com>
+---
+ ...eave-the-decode-queue-on-dst-failure.patch | 21 +++++++++++++++++++
+ 1 file changed, 21 insertions(+)
+ create mode 100644 packages/multimedia/ffmpeg/patches/rpi/0002-v4l2_req-hevc-leave-the-decode-queue-on-dst-failure.patch
+
+diff --git a/packages/multimedia/ffmpeg/patches/rpi/0002-v4l2_req-hevc-leave-the-decode-queue-on-dst-failure.patch b/packages/multimedia/ffmpeg/patches/rpi/0002-v4l2_req-hevc-leave-the-decode-queue-on-dst-failure.patch
+new file mode 100644
+index 0000000000..478788b839
+--- /dev/null
++++ b/packages/multimedia/ffmpeg/patches/rpi/0002-v4l2_req-hevc-leave-the-decode-queue-on-dst-failure.patch
+@@ -0,0 +1,21 @@
++From: Bryan Hoban <bryan.hoban@gmail.com>
++Subject: [PATCH] v4l2_req: hevc: leave the decode queue when no dst buffer is free
++
++v4l2_request_hevc_start_frame() adds the frame to the decode queue before
++it allocates its destination buffer. When that allocation fails, the
++frame stays queued and is never removed, so a later decode waits on it
++forever, and closing the decoder (avcodec_free_context) hangs. Remove it
++from the queue on that error path.
++
++Signed-off-by: Bryan Hoban <bryan.hoban@gmail.com>
++---
++--- a/libavcodec/v4l2_req_hevc_vx.c	2026-11-07 11:54:20
+++++ b/libavcodec/v4l2_req_hevc_vx.c	2026-11-07 11:54:29
++@@ -767,6 +767,7 @@
++     {
++         if ((rd->qe_dst = mediabufs_dst_qent_alloc(ctx->mbufs, ctx->dbufs)) == NULL) {
++             av_log(avctx, AV_LOG_ERROR, "%s: Failed to get dst buffer\n", __func__);
+++            decode_q_remove(&ctx->decode_q, &rd->decode_ent);
++             return AVERROR(ENOMEM);
++         }
++     }

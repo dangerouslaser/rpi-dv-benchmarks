@@ -1,0 +1,38 @@
+From 377ab7934c9787ed5b21c97ff91b7a617312d5c9 Mon Sep 17 00:00:00 2001
+From: Bryan Hoban <bryan.hoban@gmail.com>
+Date: Sat, 7 Nov 2026 12:24:35 -0500
+Subject: [PATCH 3/4] kodi: optional Dolby Vision output (DOLBY_VISION_SUPPORT)
+
+With DOLBY_VISION_SUPPORT=yes Kodi is built with pi-dv-engine (ENABLE_PIDV) for standard Dolby Vision output.
+
+Signed-off-by: Bryan Hoban <bryan.hoban@gmail.com>
+---
+ packages/mediacenter/kodi/package.mk | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/packages/mediacenter/kodi/package.mk b/packages/mediacenter/kodi/package.mk
+index 41db2c0809..58dce0f380 100644
+--- a/packages/mediacenter/kodi/package.mk
++++ b/packages/mediacenter/kodi/package.mk
+@@ -227,6 +227,13 @@ configure_package() {
+     KODI_VAAPI="-DENABLE_VAAPI=OFF"
+   fi
+ 
++  if [ "${DOLBY_VISION_SUPPORT}" = yes ]; then
++    PKG_DEPENDS_TARGET+=" pi-dv-engine"
++    KODI_PIDV="-DENABLE_PIDV=ON"
++  else
++    KODI_PIDV="-DENABLE_PIDV=OFF"
++  fi
++
+   if [ "${TARGET_ARCH}" = "x86_64" ]; then
+     KODI_ARCH="-DWITH_CPU=${TARGET_ARCH}"
+   else
+@@ -284,6 +291,7 @@ configure_package() {
+                          ${KODI_ARCH} \
+                          ${KODI_NEON} \
+                          ${KODI_VAAPI} \
++                         ${KODI_PIDV} \
+                          ${KODI_CEC} \
+                          ${KODI_PLATFORM} \
+                          ${KODI_SAMBA} \

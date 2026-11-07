@@ -17,12 +17,12 @@
  * flight; pi_render waits for the oldest beyond that.
  * SPDX-License-Identifier: GPL-2.0-or-later */
 #pragma once
-#include <libavutil/frame.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+#include <libavutil/frame.h>   /* FFmpeg's headers have no C++ linkage of their own */
 
 /* This header's version: bumped by every change that breaks a caller built
  * against the last (libpi_engine.so.PI_API_VERSION). pi_api_version() is
@@ -66,6 +66,20 @@ enum pi_mmr_mode { PI_MMR_FLOAT = 0, PI_MMR_EXACT64 = 2, PI_MMR_SPLIT = 3, PI_MM
  *          single-layer MMR (Profile 8.1 MMR) under CB1 */
 enum pi_filters { PI_FILTERS_CB1 = 0, PI_FILTERS_PHASE = 1 };
 
+/* The FEL's EL upscale (2x), at the same sample positions:
+ *   BILINEAR  the default: vertical 3:1, horizontal 1:1 (yblod's)
+ *   ANNEX_B   ETSI GS CCM 001 Annex B's example: luma a 4-tap vertical and
+ *             an 8-tap horizontal filter, chroma 64/192 vertical and the
+ *             8-tap horizontal
+ *   BICUBIC   Catmull-Rom in both directions, luma and chroma: vertical
+ *             -9 111 29 -3 / 128 (Annex B's luma vertical), horizontal
+ *             -1 9 9 -1 / 16
+ *   LANCZOS   Lanczos-3 in both directions, luma and chroma: vertical
+ *             8 -70 277 914 -136 31 / 1024, horizontal
+ *             25 -139 626 626 -139 25 / 1024
+ * Every option but bilinear reads more of the EL in both passes. */
+enum pi_el_upscale { PI_EL_BILINEAR = 0, PI_EL_ANNEX_B = 1, PI_EL_BICUBIC = 2, PI_EL_LANCZOS = 3 };
+
 enum pi_log_level { PI_LOG_ERROR = 0, PI_LOG_WARNING = 1, PI_LOG_INFO = 2, PI_LOG_DEBUG = 3 };
 
 /* Measurement only (pi_options.measure). */
@@ -76,12 +90,14 @@ enum {
     PI_MEASURE_MARK = 8,          /* mark the MMR's fallback samples (p1_chroma.frag MARK) */
     PI_MEASURE_COPY_OUTPUT = 16,  /* render into own images and copy (no DRM format modifiers) */
     PI_MEASURE_FORCE_WIDE = 32,   /* compute 64-bit LUT MMRs as MMR128 (the 128-bit path's test) */
+    PI_MEASURE_EL_OUT = 64,       /* pass 1 writes the upscaled EL chroma as its chroma (the EL upscale's test) */
 };
 
 struct pi_options {
     const char *device;           /* substring of the Vulkan device's name; NULL: the first GPU */
     enum pi_mmr_mode mmr;
     enum pi_filters filters;
+    enum pi_el_upscale el_upscale;
     const char *pipeline_cache;   /* a file: read at create, written at destroy; NULL: none */
     /* Messages: NULL log: stderr. Levels above log_level are dropped. */
     void (*log)(void *opaque, enum pi_log_level level, const char *message);
@@ -108,6 +124,10 @@ struct pi_probe_info {
 int pi_probe(const struct pi_options *o, struct pi_probe_info *info);
 /* Waits for the GPU, releases every object, writes the pipeline cache. */
 void pi_engine_destroy(struct pi_engine *e);
+/* Changes o's mmr, filters and el_upscale (the rest of o is ignored), from
+ * the next pi_stream_open: a player applies a change by reopening the
+ * stream. PI_E_INVALID for a value out of range. */
+int pi_engine_configure(struct pi_engine *e, const struct pi_options *o);
 /* "device, MMR mode, output path", for logs. */
 const char *pi_engine_describe(const struct pi_engine *e);
 

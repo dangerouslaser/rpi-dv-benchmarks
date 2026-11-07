@@ -44,7 +44,8 @@ P2  w/2 × h/2   one fragment per 2×2 output block: 4:2:2 vertical filter,
 | Call | When |
 |---|---|
 | `pi_probe(&options, &info)` | for a capability check: the device `pi_engine_create` would use, without creating an engine |
-| `pi_engine_create(&options, &e)` | once: device, MMR mode, filters, pipeline cache file, log callback |
+| `pi_engine_create(&options, &e)` | once: device, MMR mode, filters, EL upscale, pipeline cache file, log callback |
+| `pi_engine_configure(e, &options)` | a change of MMR mode, filters or EL upscale (a player's settings), from the next `pi_stream_open` |
 | `pi_stream_open(e, &info)` | per stream: its size and profile. Resets the planner (packet ids, cached tables). |
 | `pi_output_import(e, fd, w, h, stride, size, &out)` | per scanout buffer the caller owns; `pi_output_size()` gives the layout |
 | `pi_render(e, &frame, out, &release_fd)` | per picture: its BL and EL frames. Returns a sync_file signalled when `out` is complete; `frame.acquire_fd` is one the output is busy until (KMS's). |
@@ -171,8 +172,24 @@ built the first time a stream needs it.
   blend, and the full-height 4:2:2 layout for single-layer MMR. The planner
   refuses single-layer MMR under CB1's contract.
 
-**The FEL EL upscale is bilinear.** Annex B is the Master Reference filter;
-it is not implemented in the passes.
+**The FEL EL upscale** (`pi_options.el_upscale`, `--el-upscale`), at the same
+sample positions in every option:
+- **`bilinear`, the default:** vertical 3:1, horizontal 1:1, as yblod's
+  engine.
+- **`annexb`:** ETSI GS CCM 001 Annex B's example filter, the Master
+  Reference's: the EL luma through a vertical 4-tap (−3 29 111 −9 / 128 and
+  its mirror) and the 8-tap horizontal (22 94 −524 2456 2456 −524 94 22 /
+  4096) on the odd columns; the EL chroma through the 64/192 vertical
+  filter (both upscales') and the same 8-tap. Pass 2 reads 12 gathers per
+  fragment for it, pass 1 four EL column pairs on odd columns.
+- **`bicubic`:** Catmull-Rom at the same sample positions, luma and chroma:
+  vertical −9 111 29 −3 / 128 and its mirror (Annex B's luma vertical),
+  horizontal −1 9 9 −1 / 16 on the odd columns. Pass 2 reads 6 gathers per
+  fragment; pass 1 four EL rows per column.
+- **`lanczos`:** Lanczos-3 at the same positions, luma and chroma, its
+  weights normalised to 1024: vertical 8 −70 277 914 −136 31 and its mirror,
+  horizontal 25 −139 626 626 −139 25 on the odd columns. Pass 2 reads 12
+  gathers per fragment; pass 1 six EL rows per column.
 
 ## Exactness
 
@@ -186,6 +203,15 @@ upscale: every sample of the tunnel frame, metadata included.
   are computed in emulated 128-bit in every exact mode. No test stream has
   them; `--measure force_wide` runs a 64-bit stream through that path, and
   its golden case must equal the stream's own.
+- **The Annex B EL upscale** is identical to yblod's engine with its CB1
+  option (YBLOD 0.3.2 `--cb1`, which upscales the EL by Annex B), frame
+  for frame. Its upscaled EL alone (luma and chroma, exposed by `--measure
+  el_out` with `PI_ABLATE=33`) is identical, sample for sample, to the
+  planner's CPU reference (`pixel_spatial.c` `dv_annex_b_scale2x`) under
+  both filter sets. The golden cases with `--el-upscale annexb` keep that.
+- **The bicubic and Lanczos EL upscales** have no outside reference: each
+  one's upscaled EL is identical to a separate C implementation of the
+  filter under both filter sets, and their golden cases keep that.
 - **1080p** matches yblod's render of the same pictures (centred in a 4K
   canvas: its engine can't render native 1080p), except the metadata
   packets' LSBs, which our frame carries in its own first rows.
@@ -300,6 +326,7 @@ reads no environment. `--measure` takes the same names, comma-separated.
 | `PI_MARK=1` | `mark` | write Q16 65535 / 0 (12-bit 4095 / 0) where `exact` fell back; 0 / 65535 where the split's guard did |
 | `PI_COPY_OUTPUT=1` | `copy_output` | render to an image and copy it to the dmabuf, as on devices without linear DRM-modifier attachments (lavapipe) |
 | `PI_FORCE_WIDE=1` | `force_wide` | compute 64-bit LUT MMRs in the 128-bit path |
+| `PI_EL_OUT=1` | `el_out` | the dual route's pass 1 writes the upscaled EL chroma as its chroma (with `PI_ABLATE=33`: the EL upscale's test) |
 | `PI_DEVICE=NAME` | | Vulkan device (as `dvbench --device`) |
 | `DVBENCH_ALLOC=udmabuf\|cma\|system` | | the bench's dmabuf allocator (default: the first that works, in the order udmabuf, system, cma: CMA is the Pi decoder's) |
 | `DVBENCH_DV_VSIF=hdmi\|dolby` | | `--kms-play`'s `Dolby Vision` value: the HDMI VSIF (default) or Dolby's |
@@ -329,9 +356,8 @@ On the Pi itself, `V3D_DEBUG=shaderdb` prints the compiler's statistics,
 
 ## Limitations
 
-- **Not implemented:** the Annex B EL upscale (the EL is upscaled
-  bilinearly) and resized output (the planner's `PACK_RESIZED`: the tunnel
-  frame is the stream's size).
+- **Not implemented:** resized output (the planner's `PACK_RESIZED`: the
+  tunnel frame is the stream's size).
 - **`--filters phase` on single-layer MMR** isn't real time at 24p: it
   reshapes both output rows' chroma, twice pass 1's MMR. Profile 8.4 takes
   43–53 ms per picture, an 8.1 MMR cut of 1917 66 ms. With the default

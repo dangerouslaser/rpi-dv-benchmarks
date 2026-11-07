@@ -1,0 +1,152 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Bryan Hoban <bryan.hoban@gmail.com>
+Date: Sat, 7 Nov 2026 11:25:10 -0500
+Subject: [PATCH 2/6] [GBM] Fence the video plane
+
+A video buffer drawn by the GPU, rather than a decoder's output, may
+still be in flight when it is committed, and implicit fencing doesn't
+hold for every producer: the commit then scans out an unfinished frame.
+Let the DRM PRIME bridge pass the producer's sync_file as the video
+plane's IN_FENCE_FD. CDRMAtomic owns the fd until the commit, and
+replaces it when a failed test commit falls back to the last request,
+whose fence is closed by then.
+
+Signed-off-by: Bryan Hoban <bryan.hoban@gmail.com>
+---
+ .../HwDecRender/VideoLayerBridgeDRMPRIME.cpp  | 16 ++++++++++-----
+ .../HwDecRender/VideoLayerBridgeDRMPRIME.h    |  7 ++++++-
+ xbmc/windowing/gbm/drm/DRMAtomic.cpp          | 20 +++++++++++++++++++
+ xbmc/windowing/gbm/drm/DRMAtomic.h            |  6 ++++++
+ 4 files changed, 43 insertions(+), 6 deletions(-)
+
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/VideoLayerBridgeDRMPRIME.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/VideoLayerBridgeDRMPRIME.cpp
+index 24412f8..af3c328 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/VideoLayerBridgeDRMPRIME.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/VideoLayerBridgeDRMPRIME.cpp
+@@ -16,6 +16,8 @@
+ 
+ #include <utility>
+ 
++#include <unistd.h>
++
+ using namespace KODI::WINDOWING::GBM;
+ using namespace DRMPRIME;
+ 
+@@ -225,14 +227,17 @@ void CVideoLayerBridgeDRMPRIME::Configure(CVideoBufferDRMPRIME* buffer)
+             bpc, result);
+ }
+ 
+-void CVideoLayerBridgeDRMPRIME::SetVideoPlane(CVideoBufferDRMPRIME* buffer, const CRect& destRect)
++void CVideoLayerBridgeDRMPRIME::SetVideoPlane(CVideoBufferDRMPRIME* buffer,
++                                              const CRect& destRect,
++                                              int inFence)
+ {
+   auto plane = m_DRM->GetVideoPlane();
+-  if (!plane)
+-    return;
+-
+-  if (!PrepareBuffer(buffer))
++  if (!plane || !PrepareBuffer(buffer))
++  {
++    if (inFence != -1)
++      close(inFence);
+     return;
++  }
+ 
+   m_DRM->AddProperty(plane, "FB_ID", m_fb_id);
+   m_DRM->AddProperty(plane, "CRTC_ID", m_DRM->GetCrtc()->GetCrtcId());
+@@ -244,6 +249,7 @@ void CVideoLayerBridgeDRMPRIME::SetVideoPlane(CVideoBufferDRMPRIME* buffer, cons
+   m_DRM->AddProperty(plane, "CRTC_Y", static_cast<int32_t>(destRect.y1) & ~1);
+   m_DRM->AddProperty(plane, "CRTC_W", (static_cast<uint32_t>(destRect.Width()) + 1) & ~1);
+   m_DRM->AddProperty(plane, "CRTC_H", (static_cast<uint32_t>(destRect.Height()) + 1) & ~1);
++  m_DRM->SetVideoPlaneInFence(inFence);
+ }
+ 
+ void CVideoLayerBridgeDRMPRIME::UpdateVideoPlane()
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/VideoLayerBridgeDRMPRIME.h b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/VideoLayerBridgeDRMPRIME.h
+index 276cf27..f98f22b 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/VideoLayerBridgeDRMPRIME.h
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/VideoLayerBridgeDRMPRIME.h
+@@ -37,7 +37,12 @@ public:
+   void Disable() override;
+ 
+   virtual void Configure(CVideoBufferDRMPRIME* buffer);
+-  virtual void SetVideoPlane(CVideoBufferDRMPRIME* buffer, const CRect& destRect);
++  /*!
++   * \param inFence A sync_file the buffer is complete at, taken; -1 if it is complete
++   */
++  virtual void SetVideoPlane(CVideoBufferDRMPRIME* buffer,
++                             const CRect& destRect,
++                             int inFence = -1);
+   virtual void UpdateVideoPlane();
+ 
+ protected:
+diff --git a/xbmc/windowing/gbm/drm/DRMAtomic.cpp b/xbmc/windowing/gbm/drm/DRMAtomic.cpp
+index 7a6f87c..2f27659 100644
+--- a/xbmc/windowing/gbm/drm/DRMAtomic.cpp
++++ b/xbmc/windowing/gbm/drm/DRMAtomic.cpp
+@@ -148,6 +148,10 @@ void CDRMAtomic::DrmAtomicCommit(int fb_id, int flags, bool rendered, bool video
+     // update the old atomic request with the new fb id to avoid tearing
+     if (rendered)
+       AddProperty(outputPlane, "FB_ID", fb_id);
++
++    // the old request's video plane fence is closed by now
++    if (m_video_plane && m_video_plane != outputPlane)
++      AddProperty(m_video_plane, "IN_FENCE_FD", static_cast<uint64_t>(m_videoInFenceFd));
+   }
+ 
+   ret = drmModeAtomicCommit(m_fd, m_req->Get(), flags, nullptr);
+@@ -175,6 +179,12 @@ void CDRMAtomic::DrmAtomicCommit(int fb_id, int flags, bool rendered, bool video
+     m_inFenceFd = -1;
+   }
+ 
++  if (m_videoInFenceFd != -1)
++  {
++    close(m_videoInFenceFd);
++    m_videoInFenceFd = -1;
++  }
++
+   m_atomicRequestQueue.emplace_back(std::make_unique<CDRMAtomicRequest>());
+   m_req = m_atomicRequestQueue.back().get();
+ }
+@@ -315,6 +325,16 @@ bool CDRMAtomic::AddProperty(CDRMObject* object, const char* name, uint64_t valu
+   return m_req->AddProperty(object, name, value);
+ }
+ 
++void CDRMAtomic::SetVideoPlaneInFence(int fd)
++{
++  if (m_videoInFenceFd != -1)
++    close(m_videoInFenceFd);
++  m_videoInFenceFd = fd;
++
++  if (m_video_plane)
++    AddProperty(m_video_plane, "IN_FENCE_FD", static_cast<uint64_t>(fd));
++}
++
+ CDRMAtomic::CDRMAtomicRequest::CDRMAtomicRequest() : m_atomicRequest(drmModeAtomicAlloc())
+ {
+ }
+diff --git a/xbmc/windowing/gbm/drm/DRMAtomic.h b/xbmc/windowing/gbm/drm/DRMAtomic.h
+index c20531b..d31d94d 100644
+--- a/xbmc/windowing/gbm/drm/DRMAtomic.h
++++ b/xbmc/windowing/gbm/drm/DRMAtomic.h
+@@ -35,6 +35,11 @@ public:
+   void DestroyDrm() override;
+   bool SupportsFencing() override { return true; }
+   bool AddProperty(CDRMObject* object, const char* name, uint64_t value);
++  /*!
++   * \brief Fence the video plane's next framebuffer: the commit waits for it.
++   * \param fd A sync_file, taken (closed after the next commit); -1 for none.
++   */
++  void SetVideoPlaneInFence(int fd);
+ 
+   // Probe whether any DRM device supports atomic modesetting, with no
+   // connector required. Used to decide atomic-vs-legacy before falling back.
+@@ -44,6 +49,7 @@ private:
+   void DrmAtomicCommit(int fb_id, int flags, bool rendered, bool videoLayer);
+ 
+   bool m_need_modeset{true};
++  int m_videoInFenceFd{-1};
+   bool m_active = true;
+ 
+   class CDRMAtomicRequest

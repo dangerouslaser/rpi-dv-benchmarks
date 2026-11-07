@@ -11,6 +11,10 @@
  *     --warmup N         pictures left out of the per-picture timing (default 8)
  *     --start S          seek to S seconds first
  *     --fel 0|1          use the EL (default 1)
+ *     --el-upscale bilinear|annexb|bicubic|lanczos
+ *                        the FEL's EL upscale (default bilinear; annexb: CCM
+ *                        Annex B's filters; bicubic: Catmull-Rom; lanczos:
+ *                        Lanczos-3; pi_engine.h)
  *     --filters F        spatial filters: cb1 (default; CB1 Master Reference's
  *                        4:2:0 reshaping and Annex B 4:2:2 filters) or phase
  *                        (also `yblod`: YBLOD's chroma phase filters, 2-tap
@@ -51,12 +55,13 @@
  *     --json FILE        machine-readable summary
  *     --measure LIST     measurement switches, comma-separated: all_rows,
  *                        draw_bars, piece_general, mark, copy_output,
- *                        force_wide (pi_options.measure; as the PI_* below)
+ *                        force_wide, el_out (pi_options.measure; as the PI_*
+ *                        below)
  *     --probe            only check the dmabuf allocation, the device and an
  *                        output import (3840x2160); exit 0 if they work
  *   Environment: PI_DEBUG=1 the plan; PI_PROFILE=1 per-pass GPU times;
  *   PI_DEVICE (as --device). Measurement only (pi_options.measure): PI_ALL_ROWS,
- *   PI_DRAW_BARS, PI_PIECE_GENERAL, PI_MARK, PI_COPY_OUTPUT, PI_FORCE_WIDE,
+ *   PI_DRAW_BARS, PI_PIECE_GENERAL, PI_MARK, PI_COPY_OUTPUT, PI_FORCE_WIDE, PI_EL_OUT,
  *   PI_ABLATE=N.
  *
  * Per picture the engine plans, imports (if new), renders and finishes
@@ -428,6 +433,7 @@ static int play(const char *file, struct dv_source_options so, double seconds, s
 static void usage(void)
 {
     fprintf(stderr, "usage: dvbench [--source sw|v4l2] [--el-sw] [--frames N] [--warmup N] [--start S] [--fel 0|1]\n"
+                    "               [--el-upscale bilinear|annexb|bicubic|lanczos]\n"
                     "               [--filters cb1|phase] [--mmr exact|split|exact64|float] [--device NAME]\n"
                     "               [--pipeline-cache FILE] [--throughput S] [--play S] [--hash] [--dump DIR]\n"
                     "               [--json FILE] [--measure LIST] FILE\n"
@@ -471,7 +477,8 @@ static const struct {
              {"piece_general", "PI_PIECE_GENERAL", PI_MEASURE_PIECE_GENERAL},
              {"mark", "PI_MARK", PI_MEASURE_MARK},
              {"copy_output", "PI_COPY_OUTPUT", PI_MEASURE_COPY_OUTPUT},
-             {"force_wide", "PI_FORCE_WIDE", PI_MEASURE_FORCE_WIDE}};
+             {"force_wide", "PI_FORCE_WIDE", PI_MEASURE_FORCE_WIDE},
+             {"el_out", "PI_EL_OUT", PI_MEASURE_EL_OUT}};
 enum { NKNOBS = sizeof(knobs) / sizeof(knobs[0]) };
 
 static int measure_list(const char *opt, const char *v, unsigned *out)
@@ -1126,6 +1133,20 @@ static int selftest(struct pi_options base, struct dv_picture *pics, int count, 
              "odd stream size: PI_E_INVALID", 0);
     st_check(pi_stream_open(e, &si) == 0, "stream open", 0);
 
+    /* pi_engine_configure: checked, and applied from the next stream open */
+    struct pi_options co = po;
+    co.el_upscale = (enum pi_el_upscale)7;
+    st_check(pi_engine_configure(e, &co) == PI_E_INVALID, "configure with an unknown EL upscale: PI_E_INVALID", 0);
+    co.el_upscale = po.el_upscale == PI_EL_ANNEX_B ? PI_EL_BILINEAR : PI_EL_ANNEX_B;
+    int before_open = !pi_engine_configure(e, &co) && (strstr(pi_engine_describe(e), "Annex B") != NULL) ==
+                                                         (po.el_upscale == PI_EL_ANNEX_B);
+    int after_open = !pi_stream_open(e, &si) && (strstr(pi_engine_describe(e), "Annex B") != NULL) ==
+                                                    (co.el_upscale == PI_EL_ANNEX_B);
+    int restored = !pi_engine_configure(e, &po) && !pi_stream_open(e, &si) &&
+                   (strstr(pi_engine_describe(e), "Annex B") != NULL) == (po.el_upscale == PI_EL_ANNEX_B);
+    st_check(before_open && after_open && restored, "configure: the EL upscale changes at the next stream open", 0);
+    lc.closed = 0;   /* those reopens' closes, before the import check below counts them */
+
     /* output validation */
     struct pi_output *bad = NULL;
     st_check(pi_output_import(e, o[1].buf.fd, W, H, W * 4 - 4, o[1].buf.size, &bad) == PI_E_INVALID,
@@ -1304,6 +1325,19 @@ int main(int argc, char **argv)
             ok = to_seconds(a, v, &so.start), i++;
         else if (!strcmp(a, "--fel") && takes)
             ok = to_int(a, v, 0, 1, &g_fel), i++;
+        else if (!strcmp(a, "--el-upscale") && takes) {
+            if (!strcmp(v, "bilinear"))
+                po.el_upscale = PI_EL_BILINEAR;
+            else if (!strcmp(v, "annexb"))
+                po.el_upscale = PI_EL_ANNEX_B;
+            else if (!strcmp(v, "bicubic"))
+                po.el_upscale = PI_EL_BICUBIC;
+            else if (!strcmp(v, "lanczos"))
+                po.el_upscale = PI_EL_LANCZOS;
+            else
+                ok = bad_value(a, v);
+            i++;
+        }
         else if (!strcmp(a, "--filters") && takes) {
             if (!strcmp(v, "cb1"))
                 po.filters = PI_FILTERS_CB1;

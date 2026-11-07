@@ -1,0 +1,113 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Bryan Hoban <bryan.hoban@gmail.com>
+Date: Sat, 7 Nov 2026 11:24:49 -0500
+Subject: [PATCH 1/6] [GBM] Report Dolby Vision from the EDID and the connector
+
+Read the sink's Dolby Vision vendor-specific video data block through
+libdisplay-info (di_cta_data_block_get_dolby_video, 0.3.0 and later)
+and report Dolby Vision as an HDR capability when the sink takes
+standard (TV-led) Dolby Vision and the HDMI connector has the
+"Dolby Vision" property to signal it.
+
+Signed-off-by: Bryan Hoban <bryan.hoban@gmail.com>
+---
+ xbmc/utils/DisplayInfo.cpp          | 28 ++++++++++++++++++++++++++++
+ xbmc/utils/DisplayInfo.h            |  8 ++++++++
+ xbmc/windowing/gbm/WinSystemGbm.cpp |  6 ++++++
+ 3 files changed, 42 insertions(+)
+
+diff --git a/xbmc/utils/DisplayInfo.cpp b/xbmc/utils/DisplayInfo.cpp
+index 2627a49..cb60ffe 100644
+--- a/xbmc/utils/DisplayInfo.cpp
++++ b/xbmc/utils/DisplayInfo.cpp
+@@ -115,6 +115,12 @@ void CDisplayInfo::Parse()
+ 
+               break;
+             }
++            case DI_CTA_DATA_BLOCK_DOLBY_VIDEO:
++            {
++              m_dolby_video = di_cta_data_block_get_dolby_video(block);
++
++              break;
++            }
+             default:
+               break;
+           }
+@@ -165,6 +171,28 @@ void CDisplayInfo::LogInfo() const
+     CLog::Log(LOGINFO, "[display-info]   st2113_rgb:  {}", m_colorimetry->st2113_rgb);
+     CLog::Log(LOGINFO, "[display-info]   ictcp:       {}", m_colorimetry->ictcp);
+   }
++
++  if (m_dolby_video)
++    CLog::Log(LOGINFO, "[display-info] dolby vision: version {}, standard mode: {}",
++              static_cast<int>(m_dolby_video->version), GetDolbyVisionStandardVersion() >= 0);
++}
++
++int CDisplayInfo::GetDolbyVisionStandardVersion() const
++{
++  if (!m_dolby_video)
++    return -1;
++
++  switch (m_dolby_video->version)
++  {
++    case DI_CTA_DOLBY_VIDEO_VERSION0:
++      return 0;
++    case DI_CTA_DOLBY_VIDEO_VERSION1:
++      return 1;
++    case DI_CTA_DOLBY_VIDEO_VERSION2:
++      return m_dolby_video->v2->mode_standard ? 2 : -1;
++    default:
++      return -1;
++  }
+ }
+ 
+ bool CDisplayInfo::SupportsHDRStaticMetadataType1() const
+diff --git a/xbmc/utils/DisplayInfo.h b/xbmc/utils/DisplayInfo.h
+index 5cf7ef5..7610621 100644
+--- a/xbmc/utils/DisplayInfo.h
++++ b/xbmc/utils/DisplayInfo.h
+@@ -16,6 +16,7 @@
+ struct di_info;
+ struct di_cta_colorimetry_block;
+ struct di_cta_hdr_static_metadata_block;
++struct di_cta_dolby_video_block;
+ 
+ namespace KODI
+ {
+@@ -67,6 +68,12 @@ public:
+ 
+   bool SupportsColorimetry(Colorimetry colorimetry) const;
+ 
++  /*!
++   * \brief The version (0 to 2) of the sink's Dolby Vision data block, if the
++   * sink takes standard (TV-led) Dolby Vision; -1 if not.
++   */
++  int GetDolbyVisionStandardVersion() const;
++
+ private:
+   explicit CDisplayInfo(const std::vector<uint8_t>& edid);
+ 
+@@ -86,6 +93,7 @@ private:
+ 
+   const di_cta_colorimetry_block* m_colorimetry = nullptr;
+   const di_cta_hdr_static_metadata_block* m_hdr_static_metadata = nullptr;
++  const di_cta_dolby_video_block* m_dolby_video = nullptr;
+ };
+ 
+ } // namespace UTILS
+diff --git a/xbmc/windowing/gbm/WinSystemGbm.cpp b/xbmc/windowing/gbm/WinSystemGbm.cpp
+index 644fd4b..1f47845 100644
+--- a/xbmc/windowing/gbm/WinSystemGbm.cpp
++++ b/xbmc/windowing/gbm/WinSystemGbm.cpp
+@@ -652,5 +652,11 @@ CHDRCapabilities CWinSystemGbm::GetDisplayHDRCapabilities() const
+   if (m_info->SupportsEOTF(UTILS::Eotf::HLG))
+     caps.SetHLG();
+ 
++  // the frames are sent as standard (TV-led) Dolby Vision, which the connector has to signal
++  auto* connector = m_DRM ? m_DRM->GetConnector() : nullptr;
++  if (m_info->GetDolbyVisionStandardVersion() >= 0 && connector &&
++      connector->SupportsProperty("Dolby Vision"))
++    caps.SetDolbyVision();
++
+   return caps;
+ }

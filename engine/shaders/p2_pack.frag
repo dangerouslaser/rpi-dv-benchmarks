@@ -11,7 +11,8 @@
 //
 // Per pixel, exactly yblod's pack.comp (PACK 0, SOURCE 2, bilinear):
 //   - luma from the BL (SAND) and the EL luma (pass 1's copy, upsampled
-//     bilinear: vertical 3:1 then horizontal 1:1);
+//     bilinear: vertical 3:1 then horizontal 1:1; or CCM Annex B's: a
+//     vertical 4-tap, then the horizontal 8-tap);
 //   - its 4:2:2 chroma: the tunnel's vertical filter over pass 1's chroma rows
 //     k-3 .. k+4, as sited_chroma() (CB1's Annex B phases, or the 2-tap
 //     blend), Cb on even pixels, Cr on odd;
@@ -37,6 +38,10 @@ layout(constant_id = 5) const uint SINGLE = 0;
 // Route 3's full-height layout (yblod's PACK 422): pass 1 packed both rows'
 // chroma, 4 x 12 bits, into its two targets; no vertical filter.
 layout(constant_id = 6) const uint FULL422 = 0;
+// The EL upscale (pi_engine.h enum pi_el_upscale): 0 bilinear, 1 Annex B,
+// 2 bicubic (Catmull-Rom: Annex B's vertical, the horizontal -1 9 9 -1 / 16),
+// 3 Lanczos-3 (6-tap vertical and horizontal, / 1024).
+layout(constant_id = 7) const uint ELUP = 0;
 
 uint packet_byte(uint i) { return (P.packets[i >> 4][(i >> 2) & 3u] >> (8u * (i & 3u))) & 255u; }
 
@@ -133,6 +138,74 @@ uvec4 el_block(uvec4 gu, uvec4 gd)
     return min(uvec4(ve.x, (ve.x + ve.y + 1u) >> 1, vd.x, (vd.x + vd.y + 1u) >> 1), uvec4(1023u));
 }
 
+// Annex B's vertical 4-tap (dv_annex_b_scale2x) at EL columns c0, c0 + 1:
+// (even row, odd row) of each, from EL rows k-2 .. k+2: even -3 29 111 -9
+// over k-2 .. k+1, odd -9 111 29 -3 over k-1 .. k+2, / 128, floored at 0.
+// Three gathers (the sampler clamps to the edge, as the reference does).
+ivec4 el_vpair(int c0, int k)
+{
+    vec2 at = vec2(float(c0 + 1), float(k - 1)) * P.inv.xy;   // columns c0, c0 + 1; rows k-2, k-1
+    ivec4 a = ivec4(textureGather(el_luma, at, 0)), b = ivec4(textureGather(el_luma, at + vec2(0.0, 2.0 * P.inv.y), 0)),
+          c = ivec4(textureGather(el_luma, at + vec2(0.0, 4.0 * P.inv.y), 0));
+    // per column (left .wxwxw, right .zyzyz): rows k-2, k-1, k, k+1, k+2
+    ivec2 r0 = a.wz, r1 = a.xy, r2 = b.wz, r3 = b.xy, r4 = c.wz;
+    ivec2 ve = max((-3 * r0 + 29 * r1 + 111 * r2 - 9 * r3 + 64) >> 7, ivec2(0));
+    ivec2 vo = max((-9 * r1 + 111 * r2 + 29 * r3 - 3 * r4 + 64) >> 7, ivec2(0));
+    return ivec4(ve.x, vo.x, ve.y, vo.y);
+}
+
+// Annex B's EL luma for the 2 x 2 block at EL column px, row k (the order
+// el_block gives): the even column the vertical filter's, the odd the
+// horizontal 8-tap (22 94 -524 2456 2456 -524 94 22 / 4096) over columns
+// px-3 .. px+4.
+uvec4 el_annexb(int px, int k)
+{
+    ivec4 q0 = el_vpair(px - 3, k), q1 = el_vpair(px - 1, k), q2 = el_vpair(px + 1, k), q3 = el_vpair(px + 3, k);
+    ivec2 h = 22 * (q0.xy + q3.zw) + 94 * (q0.zw + q3.xy) - 524 * (q1.xy + q2.zw) + 2456 * (q1.zw + q2.xy);
+    ivec2 odd = clamp((h + 2048) >> 12, ivec2(0), ivec2(1023));
+    ivec2 even = min(q1.zw, ivec2(1023));   // column px: q1's right
+    return uvec4(uint(even.x), uint(odd.x), uint(even.y), uint(odd.y));
+}
+
+// Bicubic's EL luma for the 2 x 2 block at EL column px, row k: the
+// vertical 4-tap, then -1 9 9 -1 / 16 over columns px-1 .. px+2 on the odd
+// column.
+uvec4 el_bicubic(int px, int k)
+{
+    ivec4 q1 = el_vpair(px - 1, k), q2 = el_vpair(px + 1, k);
+    ivec2 h = -q1.xy + 9 * (q1.zw + q2.xy) - q2.zw;
+    ivec2 odd = clamp((h + 8) >> 4, ivec2(0), ivec2(1023));
+    ivec2 even = min(q1.zw, ivec2(1023));
+    return uvec4(uint(even.x), uint(odd.x), uint(even.y), uint(odd.y));
+}
+
+// Lanczos-3's vertical at EL columns c0, c0 + 1: (even row, odd row) of
+// each, from EL rows k-3 .. k+3: even 8 -70 277 914 -136 31 over k-3 .. k+2,
+// odd mirrored over k-2 .. k+3, / 1024, floored at 0. Four gathers.
+ivec4 el_vpair6(int c0, int k)
+{
+    vec2 at = vec2(float(c0 + 1), float(k - 2)) * P.inv.xy;   // columns c0, c0 + 1; rows k-3, k-2
+    vec2 dy = vec2(0.0, 2.0 * P.inv.y);
+    ivec4 a = ivec4(textureGather(el_luma, at, 0)), b = ivec4(textureGather(el_luma, at + dy, 0)),
+          c = ivec4(textureGather(el_luma, at + 2.0 * dy, 0)), d = ivec4(textureGather(el_luma, at + 3.0 * dy, 0));
+    ivec2 r0 = a.wz, r1 = a.xy, r2 = b.wz, r3 = b.xy, r4 = c.wz, r5 = c.xy, r6 = d.wz;   // rows k-3 .. k+3
+    ivec2 ve = max((8 * r0 - 70 * r1 + 277 * r2 + 914 * r3 - 136 * r4 + 31 * r5 + 512) >> 10, ivec2(0));
+    ivec2 vo = max((31 * r1 - 136 * r2 + 914 * r3 + 277 * r4 - 70 * r5 + 8 * r6 + 512) >> 10, ivec2(0));
+    return ivec4(ve.x, vo.x, ve.y, vo.y);
+}
+
+// Lanczos-3's EL luma for the 2 x 2 block at EL column px, row k: the
+// vertical 6-tap, then 25 -139 626 626 -139 25 / 1024 over columns
+// px-2 .. px+3 on the odd column.
+uvec4 el_lanczos(int px, int k)
+{
+    ivec4 qa = el_vpair6(px - 2, k), qb = el_vpair6(px, k), qc = el_vpair6(px + 2, k);
+    ivec2 h = 25 * (qa.xy + qc.zw) - 139 * (qa.zw + qc.xy) + 626 * (qb.xy + qb.zw);
+    ivec2 odd = clamp((h + 512) >> 10, ivec2(0), ivec2(1023));
+    ivec2 even = min(qb.xy, ivec2(1023));   // column px: qb's left
+    return uvec4(uint(even.x), uint(odd.x), uint(even.y), uint(odd.y));
+}
+
 // A 2 x 2 block at (x, y): its luma from BL samples b and EL e, chroma c
 // (Cb, Cr, Cb, Cr), the letterbox's black outside the active area, packed.
 void block(uint x, uint y, uvec4 b, uvec4 e, uvec4 c, out uvec2 top, out uvec2 bottom)
@@ -193,6 +266,12 @@ void main()
     uvec4 el;
     if (SINGLE != 0u || (ABLATE & 2u) != 0u)
         el = uvec4(px, k, px + 1u, k) & 1023u;
+    else if (ELUP == 1u)
+        el = el_annexb(int(px), kk);
+    else if (ELUP == 2u)
+        el = el_bicubic(int(px), kk);
+    else if (ELUP == 3u)
+        el = el_lanczos(int(px), kk);
     else {
         vec2 at = vec2(float(px + 1u), float(k)) * P.inv.xy;   // rows k-1, k
         el = el_block(textureGather(el_luma, at, 0), textureGather(el_luma, at + vec2(0.0, P.inv.y), 0));

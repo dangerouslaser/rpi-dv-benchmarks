@@ -86,10 +86,10 @@ static const struct {
 };
 enum { NB = sizeof(bindings) / sizeof(bindings[0]) };
 
-/* Specialisation keys: P1's constant ids 0..12, P2's 1..6. */
+/* Specialisation keys: P1's constant ids 0..14, P2's 1..7. */
 enum { K1_MODE, K1_METHOD, K1_DUAL, K1_KIND0, K1_KIND1, K1_ORDER0, K1_ORDER1, K1_SINGLE, K1_PIECE, K1_ORDER2,
-       K1_FAST, K1_MARK, K1_GUARD, K1_N };
-enum { K2_ANNEXB, K2_TOP_LEFT, K2_ABLATE, K2_BARS, K2_SINGLE, K2_FULL422, K2_N };
+       K1_FAST, K1_MARK, K1_GUARD, K1_ELUP, K1_ELOUT, K1_N };
+enum { K2_ANNEXB, K2_TOP_LEFT, K2_ABLATE, K2_BARS, K2_SINGLE, K2_FULL422, K2_ELUP, K2_N };
 enum { MAX_SPEC = 16, KEY_MAX = K1_N };
 _Static_assert((int)K1_N <= (int)MAX_SPEC && (int)K2_N + 1 <= (int)MAX_SPEC, "a specialisation map fits its entries");
 
@@ -188,6 +188,13 @@ enum {   /* warnings, each once per engine */
 
 struct pi_engine {
     struct pi_options o;
+    struct {   /* pi_engine_configure's, applied at the next pi_stream_open */
+        int set;
+        enum pi_mmr_mode mmr;
+        enum pi_filters filters;
+        enum pi_el_upscale el_upscale;
+    } pending;
+    char device[256];   /* the Vulkan device's name */
     char *cache_path;
     char name[320];
     VkInstance inst;
@@ -291,6 +298,19 @@ const char *pi_strerror(int s)
     case PI_E_NOMEM: return "out of memory";
     default: return "unknown status";
     }
+}
+
+static const char *mode_name(enum pi_mmr_mode m);
+
+/* pi_engine_describe's string, from the current options. */
+static void describe(struct pi_engine *e)
+{
+    snprintf(e->name, sizeof(e->name), "%s, MMR %s, output %s%s", e->device, mode_name(e->o.mmr),
+             e->modifiers ? "rendered in place" : "copied",
+             e->o.el_upscale == PI_EL_ANNEX_B   ? ", EL Annex B"
+             : e->o.el_upscale == PI_EL_BICUBIC ? ", EL bicubic"
+             : e->o.el_upscale == PI_EL_LANCZOS ? ", EL Lanczos"
+                                                : "");
 }
 
 static const char *mode_name(enum pi_mmr_mode m)
@@ -927,8 +947,8 @@ static int create_device(struct pi_engine *e)
     }
     if (!e->get_fd_props)
         return PI_E_VULKAN;
-    snprintf(e->name, sizeof(e->name), "%s, MMR %s, output %s", props.deviceName, mode_name(e->o.mmr),
-             e->modifiers ? "rendered in place" : "copied");
+    snprintf(e->device, sizeof(e->device), "%s", props.deviceName);
+    describe(e);
     return 0;
 }
 
@@ -1078,11 +1098,29 @@ void pi_options_default(struct pi_options *o)
     o->log_level = PI_LOG_WARNING;
 }
 
+static int options_ok(const struct pi_options *o)
+{
+    return o && (o->mmr == PI_MMR_FLOAT || o->mmr == PI_MMR_EXACT64 || o->mmr == PI_MMR_SPLIT || o->mmr == PI_MMR_EXACT) &&
+           (o->filters == PI_FILTERS_CB1 || o->filters == PI_FILTERS_PHASE) &&
+           (o->el_upscale == PI_EL_BILINEAR || o->el_upscale == PI_EL_ANNEX_B || o->el_upscale == PI_EL_BICUBIC ||
+            o->el_upscale == PI_EL_LANCZOS);
+}
+
+int pi_engine_configure(struct pi_engine *e, const struct pi_options *o)
+{
+    if (!e || !options_ok(o))
+        return PI_E_INVALID;
+    e->pending.set = 1;
+    e->pending.mmr = o->mmr;
+    e->pending.filters = o->filters;
+    e->pending.el_upscale = o->el_upscale;
+    return 0;
+}
+
 int pi_engine_create(const struct pi_options *o, struct pi_engine **out)
 {
     *out = NULL;
-    if (!o || (o->mmr != PI_MMR_FLOAT && o->mmr != PI_MMR_EXACT64 && o->mmr != PI_MMR_SPLIT && o->mmr != PI_MMR_EXACT) ||
-        (o->filters != PI_FILTERS_CB1 && o->filters != PI_FILTERS_PHASE))
+    if (!options_ok(o))
         return PI_E_INVALID;
     struct pi_engine *e = calloc(1, sizeof(*e));
     if (!e)
@@ -1214,6 +1252,13 @@ int pi_stream_open(struct pi_engine *e, const struct pi_stream_info *info)
         info->height > 4320)
         return PI_E_INVALID;
     pi_stream_close(e);
+    if (e->pending.set) {   /* pi_engine_configure's */
+        e->pending.set = 0;
+        e->o.mmr = e->pending.mmr;
+        e->o.filters = e->pending.filters;
+        e->o.el_upscale = e->pending.el_upscale;
+        describe(e);
+    }
     dvvk_plan_state_reset(e->state);
     e->have_tables = 0;
     for (int k = 0; k < PI_FRAMES_IN_FLIGHT; k++)
@@ -1630,7 +1675,8 @@ static int route_of(const struct pi_engine *e, const dvvk_plan *p, int has_el, s
     if (p->route == DVVK_ROUTE_PIECEWISE && p->depth == 10 && p->layout <= 1 &&
         p->pack == (p->layout ? DVVK_PACK_422 : DVVK_PACK_SITED))
         rt->piece = 1 + (int)p->layout;
-    if ((!rt->single && !rt->piece && (p->route != DVVK_ROUTE_DUAL || !has_el || p->equal || p->nearest != 2)) ||
+    if ((!rt->single && !rt->piece &&
+         (p->route != DVVK_ROUTE_DUAL || !has_el || p->equal || (p->nearest != 2 && p->nearest != 0))) ||
         (!rt->piece && p->pack != DVVK_PACK_SITED) || p->placement[0] || p->placement[1] ||
         p->placement[2] != e->w || p->placement[3] != e->h)
         return 0;
@@ -1849,6 +1895,14 @@ static void keys(const struct pi_engine *e, const dvvk_plan *p, uint32_t k1[K1_N
         k1[K1_ORDER1] = rt->order[1];
     }
     k1[K1_MARK] = (e->o.measure & PI_MEASURE_MARK) != 0;
+    /* the EL filter (p1/p2 ELUP): the plan's Annex B (nearest 0), or bicubic
+     * or Lanczos, which the planner sees as bilinear (the same tables) */
+    k1[K1_ELUP] = rt->single || rt->piece                ? 0u
+                  : p->nearest == 0                       ? 1u
+                  : e->o.el_upscale == PI_EL_BICUBIC      ? 2u
+                  : e->o.el_upscale == PI_EL_LANCZOS      ? 3u
+                                                          : 0u;
+    k1[K1_ELOUT] = (e->o.measure & PI_MEASURE_EL_OUT) != 0;
     if (k1[K1_MODE] == PI_MMR_SPLIT || k1[K1_MODE] == PI_MMR_EXACT)
         k1[K1_GUARD] = rt->guard;
     memset(k2, 0, K2_N * 4);
@@ -1857,6 +1911,7 @@ static void keys(const struct pi_engine *e, const dvvk_plan *p, uint32_t k1[K1_N
     k2[K2_ABLATE] = e->o.ablate;
     k2[K2_SINGLE] = (uint32_t)(rt->single || rt->piece);
     k2[K2_FULL422] = rt->piece == 2;
+    k2[K2_ELUP] = k1[K1_ELUP];
 }
 
 struct band {
@@ -2110,7 +2165,8 @@ int pi_render(struct pi_engine *e, const struct pi_frame *f, struct pi_output *o
     /* plan */
     double t0 = now_ms();
     dvvk_plan_in in = {.width = e->w, .height = e->h, .x = 0, .y = 0, .dw = e->w, .dh = e->h,
-                       .chroma_top_left = (uint32_t)f->chroma_top_left, .has_el = f->el != NULL, .el_scaler = 2,
+                       .chroma_top_left = (uint32_t)f->chroma_top_left, .has_el = f->el != NULL,
+                       .el_scaler = e->o.el_upscale == PI_EL_ANNEX_B ? 1u : 2u,
                        .fel = 1, .refresh = (uint32_t)e->first, .pts = f->pts_us, .white_nits = 203.0,
                        .cb1_contract = e->o.filters == PI_FILTERS_CB1};
     dvvk_plan *p = e->plan;

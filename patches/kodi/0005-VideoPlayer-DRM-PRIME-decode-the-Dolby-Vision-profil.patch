@@ -1,0 +1,727 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Bryan Hoban <bryan.hoban@gmail.com>
+Date: Sat, 7 Nov 2026 11:33:33 -0500
+Subject: [PATCH 5/6] [VideoPlayer] DRM PRIME: decode the Dolby Vision profile
+ 7 enhancement layer
+
+A single-track Dolby Vision profile 7 stream carries its enhancement
+layer as type 63 NAL units inside the base layer's access units. Full
+enhancement layer (FEL) pictures are wrong without it.
+
+When the Dolby Vision tunnel can be used, CDVDVideoCodecDRMPRIME splits
+each packet into its layers, decodes the enhancement layer with a second
+hardware decoder and pairs the layers' pictures by display time, with
+libpi_engine's input glue. A buffer then carries both frames, and the
+tunnel renders the enhancement layer where the picture's RPU needs it.
+
+Signed-off-by: Bryan Hoban <bryan.hoban@gmail.com>
+---
+ .../Buffers/VideoBufferDRMPRIME.cpp           |  16 +
+ .../VideoPlayer/Buffers/VideoBufferDRMPRIME.h |   5 +
+ .../DVDCodecs/Video/CMakeLists.txt            |   5 +
+ .../DVDCodecs/Video/DVDVideoCodecDRMPRIME.cpp |  55 ++-
+ .../DVDCodecs/Video/DVDVideoCodecDRMPRIME.h   |   6 +
+ .../DVDCodecs/Video/DVELDecoderDRMPRIME.cpp   | 328 ++++++++++++++++++
+ .../DVDCodecs/Video/DVELDecoderDRMPRIME.h     |  69 ++++
+ .../HwDecRender/DVTunnelDRMPRIME.cpp          |  21 +-
+ .../HwDecRender/DVTunnelDRMPRIME.h            |   1 +
+ 9 files changed, 502 insertions(+), 4 deletions(-)
+ create mode 100644 xbmc/cores/VideoPlayer/DVDCodecs/Video/DVELDecoderDRMPRIME.cpp
+ create mode 100644 xbmc/cores/VideoPlayer/DVDCodecs/Video/DVELDecoderDRMPRIME.h
+
+diff --git a/xbmc/cores/VideoPlayer/Buffers/VideoBufferDRMPRIME.cpp b/xbmc/cores/VideoPlayer/Buffers/VideoBufferDRMPRIME.cpp
+index 695c28d..16b5309 100644
+--- a/xbmc/cores/VideoPlayer/Buffers/VideoBufferDRMPRIME.cpp
++++ b/xbmc/cores/VideoPlayer/Buffers/VideoBufferDRMPRIME.cpp
+@@ -73,6 +73,7 @@ CVideoBufferDRMPRIMEFFmpeg::~CVideoBufferDRMPRIMEFFmpeg()
+ {
+   Unref();
+   av_frame_free(&m_pFrame);
++  av_frame_free(&m_pELFrame);
+ }
+ 
+ void CVideoBufferDRMPRIMEFFmpeg::SetRef(AVFrame* frame)
+@@ -83,6 +84,21 @@ void CVideoBufferDRMPRIMEFFmpeg::SetRef(AVFrame* frame)
+ void CVideoBufferDRMPRIMEFFmpeg::Unref()
+ {
+   av_frame_unref(m_pFrame);
++  if (m_pELFrame)
++    av_frame_unref(m_pELFrame);
++}
++
++void CVideoBufferDRMPRIMEFFmpeg::SetEnhancementLayerRef(AVFrame* frame)
++{
++  if (!m_pELFrame)
++    m_pELFrame = av_frame_alloc();
++  if (m_pELFrame)
++    av_frame_move_ref(m_pELFrame, frame);
++}
++
++const AVFrame* CVideoBufferDRMPRIMEFFmpeg::GetEnhancementLayer() const
++{
++  return m_pELFrame && m_pELFrame->buf[0] ? m_pELFrame : nullptr;
+ }
+ 
+ AVDRMFrameDescriptor* CVideoBufferDRMPRIMEFFmpeg::GetDescriptor() const
+diff --git a/xbmc/cores/VideoPlayer/Buffers/VideoBufferDRMPRIME.h b/xbmc/cores/VideoPlayer/Buffers/VideoBufferDRMPRIME.h
+index 8b6d500..9a0e564 100644
+--- a/xbmc/cores/VideoPlayer/Buffers/VideoBufferDRMPRIME.h
++++ b/xbmc/cores/VideoPlayer/Buffers/VideoBufferDRMPRIME.h
+@@ -56,6 +56,10 @@ public:
+   void Unref();
+   //! \brief The decoder's frame, with its side data
+   const AVFrame* GetFrame() const { return m_pFrame; }
++  //! \brief Holds a frame of the picture's enhancement layer (Dolby Vision), moving its reference
++  void SetEnhancementLayerRef(AVFrame* frame);
++  //! \brief The picture's enhancement layer, or nullptr
++  const AVFrame* GetEnhancementLayer() const;
+ 
+   AVDRMFrameDescriptor* GetDescriptor() const override;
+   bool IsValid() const override;
+@@ -67,6 +71,7 @@ protected:
+ 
+   AVFrame* m_pFrame = nullptr;
+   AVFrame* m_pMapFrame = nullptr;
++  AVFrame* m_pELFrame = nullptr;
+ };
+ 
+ class CVideoBufferPoolDRMPRIMEFFmpeg : public IVideoBufferPool
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/CMakeLists.txt b/xbmc/cores/VideoPlayer/DVDCodecs/Video/CMakeLists.txt
+index 0d71703..02ad877 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/CMakeLists.txt
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/CMakeLists.txt
+@@ -43,6 +43,11 @@ if(("gbm" IN_LIST CORE_PLATFORM_NAME_LC OR "wayland" IN_LIST CORE_PLATFORM_NAME_
+    TARGET ${APP_NAME_LC}::OpenGLES)
+   list(APPEND SOURCES DVDVideoCodecDRMPRIME.cpp)
+   list(APPEND HEADERS DVDVideoCodecDRMPRIME.h)
++
++  if(TARGET ${APP_NAME_LC}::PiDV)
++    list(APPEND SOURCES DVELDecoderDRMPRIME.cpp)
++    list(APPEND HEADERS DVELDecoderDRMPRIME.h)
++  endif()
+ endif()
+ 
+ core_add_library(dvdvideocodecs)
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.cpp
+index 3532f43..ce44aa1 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.cpp
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.cpp
+@@ -26,6 +26,10 @@
+ #include "windowing/gbm/WinSystemGbm.h"
+ #endif
+ 
++#if defined(HAVE_PIDV)
++#include "DVELDecoderDRMPRIME.h"
++#endif
++
+ extern "C"
+ {
+ #include <libavcodec/avcodec.h>
+@@ -104,6 +108,9 @@ CDVDVideoCodecDRMPRIME::~CDVDVideoCodecDRMPRIME()
+   av_frame_free(&m_pFrame);
+   av_frame_free(&m_pFilterFrame);
+   FilterClose();
++#if defined(HAVE_PIDV)
++  m_dolbyVisionEL.reset();
++#endif
+   avcodec_free_context(&m_pCodecContext);
+ }
+ 
+@@ -408,6 +415,10 @@ bool CDVDVideoCodecDRMPRIME::Open(CDVDStreamInfo& hints, CDVDCodecOptions& optio
+     return Open(hints, options);
+   }
+ 
++#if defined(HAVE_PIDV)
++  m_dolbyVisionEL = CDVELDecoderDRMPRIME::Create(hints, m_pCodecContext);
++#endif
++
+   UpdateProcessInfo(m_pCodecContext, m_pCodecContext->pix_fmt);
+   m_processInfo.SetVideoInterlaced(false);
+   m_processInfo.SetVideoDAR(hints.aspect);
+@@ -462,7 +473,13 @@ bool CDVDVideoCodecDRMPRIME::AddData(const DemuxPacket& packet)
+   avpkt->side_data = static_cast<AVPacketSideData*>(packet.pSideData);
+   avpkt->side_data_elems = packet.iSideDataElems;
+ 
+-  int ret = avcodec_send_packet(m_pCodecContext, avpkt);
++  int ret;
++#if defined(HAVE_PIDV)
++  if (m_dolbyVisionEL)
++    ret = m_dolbyVisionEL->SendPacket(avpkt);
++  else
++#endif
++    ret = avcodec_send_packet(m_pCodecContext, avpkt);
+ 
+   //! @todo: properly handle avpkt side_data. this works around our improper use of the side_data
+   // as we pass pointers to ffmpeg allocated memory for the side_data. we should really be allocating
+@@ -524,6 +541,10 @@ void CDVDVideoCodecDRMPRIME::Reset()
+ 
+   CLog::Log(LOGDEBUG, "CDVDVideoCodecDRMPRIME::{} - flush buffers", __FUNCTION__);
+   avcodec_flush_buffers(m_pCodecContext);
++#if defined(HAVE_PIDV)
++  if (m_dolbyVisionEL)
++    m_dolbyVisionEL->Flush();
++#endif
+ }
+ 
+ void CDVDVideoCodecDRMPRIME::Drain()
+@@ -539,7 +560,13 @@ void CDVDVideoCodecDRMPRIME::Drain()
+   avpkt->data = nullptr;
+   avpkt->size = 0;
+ 
+-  int ret = avcodec_send_packet(m_pCodecContext, avpkt);
++  int ret;
++#if defined(HAVE_PIDV)
++  if (m_dolbyVisionEL)
++    ret = m_dolbyVisionEL->SendPacket(avpkt);
++  else
++#endif
++    ret = avcodec_send_packet(m_pCodecContext, avpkt);
+   if (ret && ret != AVERROR_EOF)
+   {
+     char err[AV_ERROR_MAX_STRING_SIZE] = {};
+@@ -549,6 +576,20 @@ void CDVDVideoCodecDRMPRIME::Drain()
+   }
+ 
+   av_packet_free(&avpkt);
++
++#if defined(HAVE_PIDV)
++  if (m_dolbyVisionEL)
++    m_dolbyVisionEL->Drain();
++#endif
++}
++
++int CDVDVideoCodecDRMPRIME::ReceiveFrame()
++{
++#if defined(HAVE_PIDV)
++  if (m_dolbyVisionEL)
++    return m_dolbyVisionEL->ReceiveFrame(m_pFrame);
++#endif
++  return avcodec_receive_frame(m_pCodecContext, m_pFrame);
+ }
+ 
+ bool CDVDVideoCodecDRMPRIME::SetPictureParams(VideoPicture* pVideoPicture)
+@@ -685,6 +726,10 @@ bool CDVDVideoCodecDRMPRIME::SetPictureParams(VideoPicture* pVideoPicture)
+     CVideoBufferDRMPRIMEFFmpeg* buffer = m_hwVideoBufferPool->Get();
+     buffer->SetPictureParams(*pVideoPicture);
+     buffer->SetRef(m_pFrame);
++#if defined(HAVE_PIDV)
++    if (m_dolbyVisionEL)
++      m_dolbyVisionEL->Attach(buffer);
++#endif
+     pVideoPicture->videoBuffer = buffer;
+   }
+   else if (IsSupportedSwFormat(static_cast<AVPixelFormat>(m_pFrame->format)))
+@@ -1131,7 +1176,7 @@ CDVDVideoCodec::VCReturn CDVDVideoCodecDRMPRIME::GetPicture(VideoPicture* pVideo
+     }
+   }
+ 
+-  int ret = avcodec_receive_frame(m_pCodecContext, m_pFrame);
++  int ret = ReceiveFrame();
+   if (ret == AVERROR(EAGAIN))
+     return VC_BUFFER;
+   else if (ret == AVERROR_EOF)
+@@ -1140,6 +1185,10 @@ CDVDVideoCodec::VCReturn CDVDVideoCodecDRMPRIME::GetPicture(VideoPicture* pVideo
+     {
+       CLog::Log(LOGDEBUG, "CDVDVideoCodecDRMPRIME::{} - flush buffers", __FUNCTION__);
+       avcodec_flush_buffers(m_pCodecContext);
++#if defined(HAVE_PIDV)
++      if (m_dolbyVisionEL)
++        m_dolbyVisionEL->Flush();
++#endif
+       SetCodecControl(m_codecControlFlags & ~DVD_CODEC_CTRL_DRAIN);
+     }
+     return VC_EOF;
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.h b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.h
+index fb42671..e9bf7d0 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.h
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.h
+@@ -20,6 +20,7 @@ extern "C"
+ #include <libavfilter/avfilter.h>
+ }
+ 
++class CDVELDecoderDRMPRIME;
+ class CVideoBufferPoolDMA;
+ class CVideoBufferPoolDRMPRIMEFFmpeg;
+ 
+@@ -42,6 +43,7 @@ public:
+ 
+ protected:
+   void Drain();
++  int ReceiveFrame();
+   bool SetPictureParams(VideoPicture* pVideoPicture);
+   void UpdateProcessInfo(struct AVCodecContext* avctx, const enum AVPixelFormat fmt);
+   CDVDVideoCodec::VCReturn ProcessFilterIn();
+@@ -75,6 +77,10 @@ protected:
+ 
+   CDropControl m_dropCtrl;
+ 
++#if defined(HAVE_PIDV)
++  std::unique_ptr<CDVELDecoderDRMPRIME> m_dolbyVisionEL;
++#endif
++
+   AVBufferRef *m_hw_device_ref = nullptr;
+   AVBufferRef *m_hw_frames_ref = nullptr;
+ };
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVELDecoderDRMPRIME.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVELDecoderDRMPRIME.cpp
+new file mode 100644
+index 0000000..9dc7a4b
+--- /dev/null
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVELDecoderDRMPRIME.cpp
+@@ -0,0 +1,328 @@
++/*
++ *  Copyright (C) 2026 Team Kodi
++ *  This file is part of Kodi - https://kodi.tv
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#include "DVELDecoderDRMPRIME.h"
++
++#include "ServiceBroker.h"
++#include "cores/VideoPlayer/Buffers/VideoBufferDRMPRIME.h"
++#include "cores/VideoPlayer/DVDStreamInfo.h"
++#include "settings/SettingUtils.h"
++#include "settings/Settings.h"
++#include "settings/SettingsComponent.h"
++#include "settings/lib/Setting.h"
++#include "utils/log.h"
++#include "windowing/WinSystem.h"
++
++extern "C"
++{
++#include <pi_engine.h>
++}
++
++extern "C"
++{
++#include <libavutil/opt.h>
++}
++
++namespace
++{
++// Base layer pictures (4K: 16 MB of CMA each) held waiting for their enhancement layer.
++// After a seek its decoder may give nothing for a while: base layer pictures whose
++// enhancement layer never comes are then let go as the pairer decides.
++constexpr int HELD_WITHOUT_EL = 6;
++constexpr int HELD = 12;
++
++enum AVPixelFormat GetFormat(struct AVCodecContext* /*avctx*/, const enum AVPixelFormat* fmt)
++{
++  for (int n = 0; fmt[n] != AV_PIX_FMT_NONE; n++)
++  {
++    if (fmt[n] == AV_PIX_FMT_DRM_PRIME)
++      return fmt[n];
++  }
++
++  CLog::Log(LOGERROR, "CDVELDecoderDRMPRIME: no DRM PRIME decoder for the enhancement layer");
++  return AV_PIX_FMT_NONE;
++}
++} // namespace
++
++std::unique_ptr<CDVELDecoderDRMPRIME> CDVELDecoderDRMPRIME::Create(const CDVDStreamInfo& hints,
++                                                                   AVCodecContext* base)
++{
++  if (hints.hdrType != StreamHdrType::HDR_TYPE_DOLBYVISION || hints.dovi.dv_profile != 7 ||
++      !hints.dovi.el_present_flag || !base->hw_device_ctx)
++    return nullptr;
++
++  // single-track: the enhancement layer's NAL units are in the base layer's, as type 63
++  const uint8_t* extradata = static_cast<const uint8_t*>(hints.extradata.GetData());
++  if (hints.extradata.GetSize() < 23 || extradata[0] != 1)
++    return nullptr;
++
++  const auto allowedHdrFormats = std::dynamic_pointer_cast<CSettingList>(
++      CServiceBroker::GetSettingsComponent()->GetSettings()->GetSetting(
++          CSettings::SETTING_VIDEOPLAYER_ALLOWEDHDRFORMATS));
++  if (!CSettingUtils::FindIntInList(allowedHdrFormats,
++                                    CSettings::VIDEOPLAYER_ALLOWED_HDR_TYPE_DOLBY_VISION) ||
++      !CServiceBroker::GetWinSystem()->GetDisplayHDRCapabilities().SupportsDolbyVision())
++    return nullptr;
++
++  std::unique_ptr<CDVELDecoderDRMPRIME> el(new CDVELDecoderDRMPRIME());
++  el->m_nalSize = (extradata[21] & 3) + 1;
++  el->m_decoder[0] = base;
++
++  const AVCodec* codec = avcodec_find_decoder(AV_CODEC_ID_HEVC);
++  AVCodecContext* decoder = codec ? avcodec_alloc_context3(codec) : nullptr;
++  el->m_decoder[1] = decoder;
++  if (!decoder)
++    return nullptr;
++
++  decoder->hw_device_ctx = av_buffer_ref(base->hw_device_ctx);
++  decoder->get_format = GetFormat;
++  decoder->time_base = base->time_base;
++  decoder->pkt_timebase = base->pkt_timebase;
++  av_opt_set(decoder->priv_data, "dmabuf_alloc", "cma", 0);
++
++  if (!decoder->hw_device_ctx || avcodec_open2(decoder, codec, nullptr) < 0 ||
++      pi_pairer_create(2, &el->m_pairer) != PI_OK)
++  {
++    CLog::Log(LOGERROR, "CDVELDecoderDRMPRIME: unable to open the enhancement layer's decoder");
++    return nullptr;
++  }
++
++  el->m_queueSize = pi_pairer_room(el->m_pairer, 0);
++  el->m_enhancementLayer = av_frame_alloc();
++  if (!el->m_enhancementLayer)
++    return nullptr;
++
++  CLog::Log(LOGINFO, "CDVELDecoderDRMPRIME: decoding the profile 7 enhancement layer");
++  return el;
++}
++
++CDVELDecoderDRMPRIME::~CDVELDecoderDRMPRIME()
++{
++  pi_pairer_destroy(m_pairer);
++  for (AVPacket*& packet : m_pending)
++    av_packet_free(&packet);
++  av_frame_free(&m_enhancementLayer);
++  avcodec_free_context(&m_decoder[1]);
++}
++
++AVPacket* CDVELDecoderDRMPRIME::LayerPacket(int layer, const AVPacket* packet) const
++{
++  const int room = packet->size + 256;
++  AVPacket* out = av_packet_alloc();
++  if (!out || av_new_packet(out, room) < 0)
++  {
++    av_packet_free(&out);
++    return nullptr;
++  }
++
++  const int size = pi_p7_split(packet->data, packet->size, m_nalSize, layer, out->data, room);
++  if (size <= 0 || av_packet_copy_props(out, packet) < 0)
++  {
++    av_packet_free(&out);
++    return nullptr;
++  }
++  out->size = size;
++  return out;
++}
++
++int CDVELDecoderDRMPRIME::Held(int layer) const
++{
++  return m_queueSize - pi_pairer_room(m_pairer, layer);
++}
++
++int CDVELDecoderDRMPRIME::Receive(int layer)
++{
++  AVCodecContext* decoder = m_decoder[layer];
++  int received = 0;
++
++  while (decoder && pi_pairer_room(m_pairer, layer) > 0 && (layer || Held(0) < HELD))
++  {
++    AVFrame* frame = av_frame_alloc();
++    if (!frame)
++      return AVERROR(ENOMEM);
++
++    int ret = avcodec_receive_frame(decoder, frame);
++    if (ret < 0)
++    {
++      av_frame_free(&frame);
++      if (ret == AVERROR_EOF)
++        m_eof[layer] = true;
++      return ret == AVERROR(EAGAIN) || ret == AVERROR_EOF ? received : ret;
++    }
++
++    if (pi_pairer_push(m_pairer, layer, frame, layer ? decoder->has_b_frames : 0) != 0)
++    {
++      av_frame_free(&frame);
++      return AVERROR(EINVAL);
++    }
++    received++;
++  }
++
++  return received;
++}
++
++int CDVELDecoderDRMPRIME::Send(int layer, const AVPacket* packet)
++{
++  if (!m_decoder[layer])
++    return 0;
++
++  for (;;)
++  {
++    int ret = avcodec_send_packet(m_decoder[layer], packet);
++    if (ret == AVERROR(EAGAIN))
++    {
++      ret = Receive(layer);
++      if (ret < 0)
++        return ret;
++      if (ret == 0)
++        return AVERROR(EAGAIN);
++      continue;
++    }
++
++    if (ret < 0 && ret != AVERROR_EOF)
++      return ret;
++
++    ret = Receive(layer);
++    return ret < 0 ? ret : 0;
++  }
++}
++
++int CDVELDecoderDRMPRIME::SendPacket(const AVPacket* packet)
++{
++  // a layer's packet its decoder couldn't take goes first
++  for (int layer = 0; layer < 2; layer++)
++  {
++    if (!m_pending[layer])
++      continue;
++
++    int ret = Send(layer, m_pending[layer]);
++    if (ret == AVERROR(EAGAIN))
++      return ret;
++    av_packet_free(&m_pending[layer]);
++    if (ret < 0)
++      return ret;
++  }
++
++  for (int layer = 0; layer < 2; layer++)
++  {
++    if (!m_decoder[layer])
++      continue;
++
++    AVPacket* layerPacket = LayerPacket(layer, packet);
++    if (!layerPacket)
++      continue;
++
++    int ret = Send(layer, layerPacket);
++    if (ret == AVERROR(EAGAIN))
++    {
++      m_pending[layer] = layerPacket;
++      continue;
++    }
++
++    av_packet_free(&layerPacket);
++    if (ret < 0)
++      return ret;
++  }
++
++  return 0;
++}
++
++void CDVELDecoderDRMPRIME::LogPairing()
++{
++  pi_pair_stats stats;
++  pi_pairer_stats(m_pairer, &stats);
++
++  if (stats.el_absent && m_decoder[1])
++  {
++    CLog::Log(LOGINFO, "CDVELDecoderDRMPRIME: no enhancement layer pictures: base layer only");
++    avcodec_free_context(&m_decoder[1]);
++    av_packet_free(&m_pending[1]);
++  }
++
++  if (stats.bl_dropped != m_logged[0] || stats.el_dropped != m_logged[1] ||
++      stats.bl_alone != m_logged[2])
++  {
++    CLog::Log(LOGDEBUG,
++              "CDVELDecoderDRMPRIME: unpaired pictures: {} base layer dropped, {} enhancement "
++              "layer dropped, {} base layer alone",
++              stats.bl_dropped, stats.el_dropped, stats.bl_alone);
++    m_logged[0] = stats.bl_dropped;
++    m_logged[1] = stats.el_dropped;
++    m_logged[2] = stats.bl_alone;
++  }
++}
++
++int CDVELDecoderDRMPRIME::ReceiveFrame(AVFrame* frame)
++{
++  av_frame_unref(m_enhancementLayer);
++
++  for (;;)
++  {
++    const bool end = m_eof[0] && (m_eof[1] || !m_decoder[1]);
++    const bool full =
++        m_decoder[1] && (Held(0) >= HELD || (Held(0) >= HELD_WITHOUT_EL && Held(1) == 0));
++    AVFrame* bl = nullptr;
++    AVFrame* el = nullptr;
++    int ret = pi_pairer_pop(m_pairer, end || full, &bl, &el);
++    LogPairing();
++    if (ret < 0)
++      return AVERROR(EINVAL);
++
++    if (ret == 1)
++    {
++      av_frame_move_ref(frame, bl);
++      av_frame_free(&bl);
++      if (el)
++        av_frame_move_ref(m_enhancementLayer, el);
++      av_frame_free(&el);
++      return 0;
++    }
++
++    if (end)
++      return AVERROR_EOF;
++
++    int received = 0;
++    for (int layer = 0; layer < 2; layer++)
++    {
++      ret = Receive(layer);
++      if (ret < 0)
++        return ret;
++      received += ret;
++    }
++
++    if (!received && !(m_eof[0] && (m_eof[1] || !m_decoder[1])))
++      return AVERROR(EAGAIN);
++  }
++}
++
++void CDVELDecoderDRMPRIME::Attach(CVideoBufferDRMPRIMEFFmpeg* buffer)
++{
++  if (m_enhancementLayer->buf[0])
++    buffer->SetEnhancementLayerRef(m_enhancementLayer);
++}
++
++void CDVELDecoderDRMPRIME::Drain()
++{
++  if (m_pending[1])
++    return;
++
++  int ret = Send(1, nullptr);
++  if (ret < 0 && ret != AVERROR(EAGAIN))
++    CLog::Log(LOGERROR, "CDVELDecoderDRMPRIME: enhancement layer drain failed ({})", ret);
++}
++
++void CDVELDecoderDRMPRIME::Flush()
++{
++  for (AVPacket*& packet : m_pending)
++    av_packet_free(&packet);
++  if (m_decoder[1])
++    avcodec_flush_buffers(m_decoder[1]);
++  pi_pairer_flush(m_pairer);
++  av_frame_unref(m_enhancementLayer);
++  m_eof[0] = m_eof[1] = false;
++}
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVELDecoderDRMPRIME.h b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVELDecoderDRMPRIME.h
+new file mode 100644
+index 0000000..0e96acb
+--- /dev/null
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVELDecoderDRMPRIME.h
+@@ -0,0 +1,69 @@
++/*
++ *  Copyright (C) 2026 Team Kodi
++ *  This file is part of Kodi - https://kodi.tv
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#pragma once
++
++#include <memory>
++
++extern "C"
++{
++#include <libavcodec/avcodec.h>
++}
++
++class CDVDStreamInfo;
++class CVideoBufferDRMPRIMEFFmpeg;
++struct pi_pairer;
++
++/*!
++ * \brief The enhancement layer of a single-track Dolby Vision profile 7 stream
++ * for CDVDVideoCodecDRMPRIME: splits each packet into its two layers, decodes
++ * the enhancement layer with a second decoder and pairs the layers' pictures
++ * (libpi_engine's input glue).
++ */
++class CDVELDecoderDRMPRIME
++{
++public:
++  ~CDVELDecoderDRMPRIME();
++
++  /*!
++   * \brief For a profile 7 stream with an enhancement layer, in length-prefixed
++   * NAL units, when the display gets standard Dolby Vision.
++   * \param base The base layer's open decoder (a DRM PRIME hardware decoder)
++   */
++  static std::unique_ptr<CDVELDecoderDRMPRIME> Create(const CDVDStreamInfo& hints,
++                                                      AVCodecContext* base);
++
++  //! \return as avcodec_send_packet(): AVERROR(EAGAIN) if a decoder is full
++  int SendPacket(const AVPacket* packet);
++  //! \return as avcodec_receive_frame(), with the base layer's picture
++  int ReceiveFrame(AVFrame* frame);
++  //! \brief Gives the last received picture's enhancement layer to the buffer
++  void Attach(CVideoBufferDRMPRIMEFFmpeg* buffer);
++  //! \brief Drains the enhancement layer's decoder (the base layer's is the caller's)
++  void Drain();
++  //! \brief After the base layer's decoder is flushed: drops everything held
++  void Flush();
++
++private:
++  CDVELDecoderDRMPRIME() = default;
++
++  int Send(int layer, const AVPacket* packet);
++  int Receive(int layer);
++  int Held(int layer) const;
++  AVPacket* LayerPacket(int layer, const AVPacket* packet) const;
++  void LogPairing();
++
++  AVCodecContext* m_decoder[2] = {}; //!< the base layer's isn't owned
++  AVPacket* m_pending[2] = {};
++  bool m_eof[2] = {};
++  pi_pairer* m_pairer = nullptr;
++  AVFrame* m_enhancementLayer = nullptr;
++  int m_nalSize = 4;
++  int m_queueSize = 0;
++  unsigned int m_logged[3] = {};
++};
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.cpp
+index 93c585a..8076608 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.cpp
+@@ -277,7 +277,10 @@ bool CDVTunnelDRMPRIME::SetOptions(const Options& options)
+ 
+   m_options = options;
+   m_failures = 0;
+-  CLog::Log(LOGINFO, "CDVTunnelDRMPRIME: {}, enhancement layer {}", pi_engine_describe(m_engine),
++  CLog::Log(LOGINFO,
++            "CDVTunnelDRMPRIME: {}, {} filters, {} enhancement layer upscale, enhancement layer {}",
++            pi_engine_describe(m_engine), m_options.filters == PI_FILTERS_PHASE ? "phase" : "CB1",
++            m_options.elUpscale == PI_EL_ANNEX_B ? "Annex B" : "bilinear",
+             m_options.enhancementLayer ? "where needed" : "off");
+   return true;
+ }
+@@ -306,11 +309,27 @@ CVideoBufferDRMPRIME* CDVTunnelDRMPRIME::Render(CVideoBufferDRMPRIME* buffer, in
+ 
+   pi_frame frame{};
+   frame.bl = decoded->GetFrame();
++  const AVFrame* el = decoded->GetEnhancementLayer();
++  if (el && !av_frame_get_side_data(frame.bl, AV_FRAME_DATA_DOVI_METADATA))
++    frame.rpu_frame = el;
++  // MEL's residual is zero: the base layer alone renders the same
++  if (el && m_options.enhancementLayer &&
++      pi_frame_needs_el(frame.rpu_frame ? frame.rpu_frame : frame.bl) == 1)
++    frame.el = el;
+   frame.chroma_top_left = pi_chroma_top_left(frame.bl, m_info.profile);
+   frame.pts_us = static_cast<int64_t>(buffer->GetPicture().pts);
+   frame.acquire_fd = -1;
+ 
+   int ret = pi_render(m_engine, &frame, output->m_output, &fence);
++  if (ret == PI_E_UNSUPPORTED_PLAN && el && !frame.el)
++  {
++    // the engine renders a picture whose RPU has a residual only with its enhancement layer
++    if (!m_warnedEnhancementLayer)
++      CLog::Log(LOGWARNING, "CDVTunnelDRMPRIME: full enhancement layer: rendered with it");
++    m_warnedEnhancementLayer = true;
++    frame.el = el;
++    ret = pi_render(m_engine, &frame, output->m_output, &fence);
++  }
+   if (ret != PI_OK)
+   {
+     if (m_failures++ == 0)
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.h b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.h
+index d718934..524ae9d 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.h
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.h
+@@ -75,4 +75,5 @@ private:
+   std::string m_pipelineCache;
+   std::shared_ptr<CDVTunnelOutputPool> m_pool;
+   unsigned int m_failures = 0;
++  bool m_warnedEnhancementLayer = false;
+ };
