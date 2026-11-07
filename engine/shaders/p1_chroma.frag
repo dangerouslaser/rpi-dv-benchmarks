@@ -6,7 +6,7 @@
 //     the chroma mapping (polynomial table or MMR) plus the NLQ residual, as
 //     yblod's luma_phase_guide + phase_vertical_uv + mmr_dual_horizontal /
 //     fel_mmr_single / table_add compute them;
-//   - the EL luma code at (cx, k) (the EL luma is cw x ch), for pass 3.
+//   - the EL luma code at (cx, k) (the EL luma is cw x ch), for pass 2.
 // V3D runs this out of texture fetches: neighbouring SAND samples share
 // their 32-bit word, and a dual MMR fetches Cb's and Cr's tables at once.
 #include "common.glsl"
@@ -20,12 +20,14 @@ layout(binding = 10) uniform usamplerBuffer tables128;   // the tables as RGBA32
 layout(location = 0) out uvec2 o_chroma;
 layout(location = 1) out uint o_el;
 
-// 0 float, 1 exact in 32-bit pieces, 2 exact in emulated 64-bit (yblod's),
-// 3 exact: the low word in integers, the high word from float (mmr_split)
-layout(constant_id = 0) const uint MMR_MODE = 1;
+// The chroma MMR (pi_engine.h enum pi_mmr_mode): 0 float; 2 exact in emulated
+// 64-bit (yblod's); 3 exact, the low word in integers and the high word from
+// a float sum (mmr_split); 4 exact, float with a per-sample error bound and
+// the split where the bound could change the 12-bit result.
+layout(constant_id = 0) const uint MMR_MODE = 4;
 // The stream's selectors (pi_engine.c makes a pipeline per combination):
-// chroma phase method; dual MMR; chroma kind (0 polynomial, else MMR) and
-// MMR order per channel.
+// chroma phase method; dual MMR; chroma kind (0 polynomial, 1 MMR128, 2
+// MMR96, 3 MMR64 with LUTs) and MMR order per channel.
 layout(constant_id = 1) const uint METHOD = 2;
 layout(constant_id = 2) const uint DUAL = 1;
 layout(constant_id = 3) const uint KIND0 = 3;
@@ -33,6 +35,9 @@ layout(constant_id = 4) const uint KIND1 = 3;
 layout(constant_id = 5) const uint ORDER0 = 3;
 layout(constant_id = 6) const uint ORDER1 = 3;
 const uint ORDER = ORDER0 > ORDER1 ? ORDER0 : ORDER1;
+// MMR curves beyond the 64-bit LUT (MMR96, MMR128): exact in emulated
+// 128-bit (mmr_wide) in every exact mode.
+const bool WIDE = KIND0 == 1u || KIND0 == 2u || KIND1 == 1u || KIND1 == 2u;
 // The single-layer polynomial route (yblod's single_polynomial): the BL's
 // own chroma through 12-bit tables, no EL.
 layout(constant_id = 7) const uint SINGLE = 0;
@@ -42,48 +47,57 @@ layout(constant_id = 7) const uint SINGLE = 0;
 // order-2 chroma build (layout 2).
 layout(constant_id = 8) const uint PIECE = 0;
 layout(constant_id = 9) const uint ORDER2 = 0;
-// Route 3 with one piece per chroma channel: pi_engine.c piece_fast() has
-// written it as an MMR, computed by mmr() in the stream's exact mode.
+// Route 3 with one piece per chroma channel: pi_engine.c piece_params() has
+// written it as an MMR, computed by mmr() in the stream's mode.
 layout(constant_id = 10) const uint PIECE_FAST = 0;
-// Measurement only (PI_MARK): mode 4 writes 4095 / 0 where it falls back,
-// the split's guard 0 / 4095.
+// Measurement only (pi_options.measure PI_MEASURE_MARK): where mode 4 falls
+// back it writes Q16 65535 / 0 (12-bit 4095 / 0), where the split's guard
+// does, 0 / 65535.
 layout(constant_id = 11) const uint MARK = 0;
 // The split's per-sample guard (modes 3, 4): pi_engine.c's bound for the
-// frame's largest magnitudes fails, so mmr_split checks each sample's own
+// frame's largest magnitudes fails, so the split checks each sample's own
 // and takes emulated 64-bit where that fails too.
 layout(constant_id = 12) const uint SPLIT_GUARD = 0;
 
 
 // ---- SAND reads ------------------------------------------------------------
-uint div3(uint n) { return uint(float(n) * 0.33333334 + 0.1); }
+// Every read stays in its row: a word is read only when it holds a sample
+// that exists (the last column's neighbours are taken from the left).
 uint word(usamplerBuffer buf, uint base, uint colh, uint w, uint row)
 {
-    uint b = w * 4u;
-    return texelFetch(buf, int(base + ((b & 127u) >> 2) + row * 32u + (b >> 7) * 32u * colh)).r;
+    return texelFetch(buf, sand_index(base, colh, w, row)).r;
 }
 // sample j (0..5) of the word pair a, b
 uint pick(uint a, uint b, uint j) { return ((j < 3u ? a : b) >> (10u * (j < 3u ? j : j - 3u))) & 1023u; }
-// samples n, n+1 (one word unless n is a word's last)
+// sample n
+uint sand1(usamplerBuffer buf, uint base, uint colh, uint n, uint row)
+{
+    uint w = div3(n);
+    return (word(buf, base, colh, w, row) >> (10u * (n - 3u * w))) & 1023u;
+}
+// samples n, n+1 (one word unless n is a word's last); n + 1 must exist
 uvec2 sand2(usamplerBuffer buf, uint base, uint colh, uint n, uint row)
 {
     uint w = div3(n), sub = n - 3u * w, a = word(buf, base, colh, w, row);
     uint b = sub == 2u ? word(buf, base, colh, w + 1u, row) : a;
     return uvec2(pick(a, b, sub), pick(a, b, sub + 1u));
 }
-// samples n .. n+3 (two words)
+// samples n .. n+3 (two words: n + 3 is in the second); n + 3 must exist
 uvec4 sand4(usamplerBuffer buf, uint base, uint colh, uint n, uint row)
 {
     uint w = div3(n), sub = n - 3u * w;
     uint a = word(buf, base, colh, w, row), b = word(buf, base, colh, w + 1u, row);
     return uvec4(pick(a, b, sub), pick(a, b, sub + 1u), pick(a, b, sub + 2u), pick(a, b, sub + 3u));
 }
+uvec2 bl_chroma(uint cx, uint row) { return sand2(bl_c, P.bl.y, P.bl.w, 2u * cx, row); }
 
-// (Cb, Cr) of chroma column x and of x + 1 (clamped to the plane)
+// (Cb, Cr) of chroma column x and of x + 1 (clamped to the plane: the last
+// column's pair is read with its left neighbour, in the plane)
 uvec4 uvq(bool enh, uint x, uint row)
 {
-    uint cw = enh ? P.el_size.x : P.size.z;
-    uvec4 q = enh ? sand4(el_c, P.el.y, P.el.w, 2u * x, row) : sand4(bl_c, P.bl.y, P.bl.w, 2u * x, row);
-    return x + 1u < cw ? q : q.xyxy;
+    uint cw = enh ? P.el_size.x : P.size.z, n = 2u * min(x, cw - 2u);
+    uvec4 q = enh ? sand4(el_c, P.el.y, P.el.w, n, row) : sand4(bl_c, P.bl.y, P.bl.w, n, row);
+    return x + 1u < cw ? q : q.zwzw;
 }
 
 // phase_uv_sample of columns x and x + 1: 2 none (the decoded chroma), 0 the
@@ -121,35 +135,23 @@ uvec4 el_vertical(uint ex, uint k)
 // k = 3..6 (xy, xz, yz, xyz >> 10) to order 1..3, each power the previous
 // times the feature >> 20; then >> (shift + 4), clamped to 0..65535 (Q16).
 // Both channels at once; a channel's coefficients beyond its order are 0.
+// Written without loops (V3D's compiler leaves loops rolled in a shader this
+// size): one term function per cross feature, its indices literal.
 
-// (a * b) >> 20 for a, b < 2^20, from 10-bit halves: no high multiply.
-uint fprod(uint a, uint b)
-{
-    uint a1 = a >> 10, a0 = a & 1023u, b1 = b >> 10, b0 = b & 1023u;
-    uint low = ((a1 * b0 + a0 * b1) << 10) + a0 * b0;
-    return a1 * b1 + (low >> 20);
-}
-// The same, its low word by a 32-bit multiply and its high word from the
-// float product (within 2^16 of a * b < 2^40: the rounding is exact).
+// (a * b) >> 20 for a, b < 2^20: the low word by a 32-bit multiply, the high
+// word from the float product (within 2^16 of a * b < 2^40: exact).
 uint fprod_split(uint a, uint b)
 {
     uint lo = a * b;
     uint hi = uint(round((float(a) * float(b) - float(lo)) * (1.0 / 4294967296.0)));
     return (hi << 12) | (lo >> 20);
 }
-
+// The same by a 64-bit multiply (yblod's).
 uint fprod64(uint a, uint b)
 {
     uint uh, ul;
     umulExtended(a, b, uh, ul);
     return (ul >> 20) | (uh << 12);
-}
-
-uvec2 add64(uvec2 a, uvec2 b)
-{
-    uint c;
-    uint lo = uaddCarry(a.x, b.x, c);
-    return uvec2(lo, a.y + b.y + c);
 }
 
 // min(v >> shift, 65535), 0 for v < 0. One return: V3D's compiler turns
@@ -172,8 +174,8 @@ vec2 float_lut(uint t, uint i0, uint i1, bool both)
     return both ? a : vec2(a.x, lutf(t, i1).y);
 }
 
-// One cross feature's powers of the float MMR: exact powers (EXACT, mode 4)
-// or float floors (mode 0); adds the terms to v and their magnitudes to mag.
+// One cross feature's powers of the float MMR: exact powers (mode 4) or
+// float floors (mode 0); adds the terms to v and their magnitudes to mag.
 void float_term(uvec2 fa, bool both, bool exact, vec2 c1, vec2 c2, vec2 c3, inout vec2 v, inout vec2 mag)
 {
     vec2 a = vec2(fa), t1 = c1 * a;
@@ -201,8 +203,7 @@ void float_term(uvec2 fa, bool both, bool exact, vec2 c1, vec2 c2, vec2 c3, inou
 
 // The float MMR of both channels (Q16, unclamped), s0, s1 its inputs (both:
 // equal, a dual MMR); exact: the feature powers exact (mode 4), and mag the
-// sum of the terms' magnitudes. No loops, one return (V3D's compiler leaves
-// loops rolled in a shader this size).
+// sum of the terms' magnitudes.
 vec2 mmr_float_mag(uvec3 s0, uvec3 s1, bool both, bool exact, out vec2 mag)
 {
     uint xy0 = s0.x * s0.y, xy1 = s1.x * s1.y;
@@ -218,10 +219,36 @@ vec2 mmr_float_mag(uvec3 s0, uvec3 s1, bool both, bool exact, out vec2 mag)
     return v;
 }
 
-vec2 mmr_float(uvec3 s0, uvec3 s1, bool both)
+// Mode 2, yblod's emulated 64-bit (Q16, clamped). Loops, against the rule
+// above: unrolled, it spilled heavily (92 spills against 6) in the split's
+// guarded variant, its only other caller.
+uvec2 mmr_exact64(uvec3 s0, uvec3 s1, bool both)
 {
-    vec2 mag;
-    return mmr_float_mag(s0, s1, both, false, mag);
+    uint xy0 = s0.x * s0.y, xy1 = s1.x * s1.y;
+    uvec4 f0 = uvec4(xy0, s0.x * s0.z, s0.y * s0.z, (xy0 * s0.z) >> 10);
+    uvec4 f1 = uvec4(xy1, s1.x * s1.z, s1.y * s1.z, (xy1 * s1.z) >> 10);
+    uvec2 v0 = P.const64[0].xy, v1 = P.const64[1].xy;
+    for (uint t = 0u; t < 3u; ++t) {
+        uvec4 q0 = lut64(t, s0[t]), q1 = both ? q0 : lut64(t, s1[t]);
+        v0 = add64(v0, q0.xy);
+        v1 = add64(v1, q1.zw);
+    }
+    for (uint k = 0u; k < 4u; ++k) {
+        uvec2 a = uvec2(f0[k], f1[k]), b = uvec2(0u), c = uvec2(0u);
+        if (ORDER > 1u)
+            b = both ? uvec2(fprod64(a.x, a.x)) : uvec2(fprod64(a.x, a.x), fprod64(a.y, a.y));
+        if (ORDER > 2u)
+            c = both ? uvec2(fprod64(a.x, b.x)) : uvec2(fprod64(a.x, b.x), fprod64(a.y, b.y));
+        for (uint o = 0u; o < ORDER; ++o) {
+            uvec2 f = o == 0u ? a : o == 1u ? b : c;
+            int hi, lo;
+            imulExtended(P.c32[o][k], int(f.x), hi, lo);
+            v0 = add64(v0, uvec2(lo, hi));
+            imulExtended(P.c32[3u + o][k], int(f.y), hi, lo);
+            v1 = add64(v1, uvec2(lo, hi));
+        }
+    }
+    return uvec2(map16(v0, P.pk.y + 4u), map16(v1, P.pk.z + 4u));
 }
 
 // Mode 3, exact at near float cost: the exact 64-bit sum S's low 32 bits by
@@ -229,12 +256,9 @@ vec2 mmr_float(uvec3 s0, uvec3 s1, bool both)
 // from float: y, S / 2^32 summed in float, is within 0.5 of the exact value
 // (pi_engine.c checks that bound each frame for the largest magnitudes;
 // where it fails, SPLIT_GUARD checks each sample's own: split_guarded), so
-// H = round(y - L / 2^32) is exact. Features exact (fprod, 10-bit halves).
-// Written without loops: V3D's compiler left the looped version's 11 loops
-// rolled (at 2 threads).
-const float SPLIT_W = 1.0 / 4294967296.0;
+// H = round(y - L / 2^32) is exact.
 
-// One table fetch (Cb's and Cr's entries) of mmr_split: low words, float
+// One table fetch (Cb's and Cr's entries) of the split: low words, float
 // sum, the terms' magnitudes (mag: unused, so removed, without the guard).
 void split_lut(uvec4 q0, uvec4 q1, inout uvec2 lo, inout vec2 y, inout vec2 mag)
 {
@@ -245,9 +269,8 @@ void split_lut(uvec4 q0, uvec4 q1, inout uvec2 lo, inout vec2 y, inout vec2 mag)
     mag += abs(t);
 }
 
-// One cross feature's powers to ORDER of mmr_split, coefficients c (the
-// low words, order 1..3) and cf (/ 2^32), channel 0 then 1: low words and
-// float sum. All indices literal at the call (no dynamic indexing).
+// One cross feature's powers to ORDER of the split, coefficients c (the low
+// words, order 1..3) and f (/ 2^32), channel 0 then 1.
 void split_term(uvec2 fa, bool both, ivec2 c1, ivec2 c2, ivec2 c3, vec2 f1, vec2 f2, vec2 f3, inout uvec2 lo,
                 inout vec2 y, inout vec2 mag)
 {
@@ -294,90 +317,86 @@ uvec2 mmr_split_mag(uvec3 s0, uvec3 s1, bool both, out vec2 mag)
     return uvec2(map16(uvec2(lo.x, hi.x), P.pk.y + 4u), map16(uvec2(lo.y, hi.y), P.pk.z + 4u));
 }
 
-// The exact MMR of both channels (Q16, clamped): 1 in 32-bit pieces, 2 in
-// emulated 64-bit (yblod's).
-uvec2 mmr_exact(uvec3 s0, uvec3 s1, bool both, uint mode)
-{
-    uint xy0 = s0.x * s0.y, xy1 = s1.x * s1.y;
-    uvec4 f0 = uvec4(xy0, s0.x * s0.z, s0.y * s0.z, (xy0 * s0.z) >> 10);
-    uvec4 f1 = uvec4(xy1, s1.x * s1.z, s1.y * s1.z, (xy1 * s1.z) >> 10);
-    uvec2 v0 = P.const64[0].xy, v1 = P.const64[1].xy;
-    for (uint t = 0u; t < 3u; ++t) {
-        uvec4 q0 = lut64(t, s0[t]), q1 = both ? q0 : lut64(t, s1[t]);
-        v0 = add64(v0, q0.xy);
-        v1 = add64(v1, q1.zw);
-    }
-    if (mode == 1u) {
-        // coefficient (hi * 2^16 + lo) x feature (f1 * 2^10 + f0), four
-        // accumulators by weight per channel: products < 2^26, sums < 2^30.
-        uvec2 a0 = uvec2(0u), a10 = uvec2(0u);
-        ivec2 a16 = ivec2(0), a26 = ivec2(0);
-        for (uint k = 0u; k < 4u; ++k) {
-            uvec2 fa = uvec2(f0[k], f1[k]), fb = uvec2(0u), fc = uvec2(0u);
-            if (ORDER > 1u)
-                fb = both ? uvec2(fprod(fa.x, fa.x)) : uvec2(fprod(fa.x, fa.x), fprod(fa.y, fa.y));
-            if (ORDER > 2u)
-                fc = both ? uvec2(fprod(fa.x, fb.x)) : uvec2(fprod(fa.x, fb.x), fprod(fa.y, fb.y));
-            for (uint o = 0u; o < ORDER; ++o) {
-                uvec2 f = o == 0u ? fa : o == 1u ? fb : fc;
-                uvec2 lo = uvec2(P.c_lo[o][k], P.c_lo[3u + o][k]);
-                ivec2 hi = ivec2(P.c_hi[o][k], P.c_hi[3u + o][k]);
-                uvec2 lo_f = f & 1023u, hi_f = f >> 10;
-                a0 += lo * lo_f;
-                a10 += lo * hi_f;
-                a16 += hi * ivec2(lo_f);
-                a26 += hi * ivec2(hi_f);
-            }
-        }
-        v0 = add64(v0, uvec2(a0.x, 0u));
-        v0 = add64(v0, uvec2(a10.x << 10, a10.x >> 22));
-        v0 = add64(v0, uvec2(uint(a16.x) << 16, uint(a16.x >> 16)));
-        v0 = add64(v0, uvec2(uint(a26.x) << 26, uint(a26.x >> 6)));
-        v1 = add64(v1, uvec2(a0.y, 0u));
-        v1 = add64(v1, uvec2(a10.y << 10, a10.y >> 22));
-        v1 = add64(v1, uvec2(uint(a16.y) << 16, uint(a16.y >> 16)));
-        v1 = add64(v1, uvec2(uint(a26.y) << 26, uint(a26.y >> 6)));
-    } else {
-        for (uint k = 0u; k < 4u; ++k) {
-            uvec2 a = uvec2(f0[k], f1[k]), b = uvec2(0u), c = uvec2(0u);
-            if (ORDER > 1u)
-                b = both ? uvec2(fprod64(a.x, a.x)) : uvec2(fprod64(a.x, a.x), fprod64(a.y, a.y));
-            if (ORDER > 2u)
-                c = both ? uvec2(fprod64(a.x, b.x)) : uvec2(fprod64(a.x, b.x), fprod64(a.y, b.y));
-            for (uint o = 0u; o < ORDER; ++o) {
-                uvec2 f = o == 0u ? a : o == 1u ? b : c;
-                int hi, lo;
-                imulExtended(P.c32[o][k], int(f.x), hi, lo);
-                v0 = add64(v0, uvec2(lo, hi));
-                imulExtended(P.c32[3u + o][k], int(f.y), hi, lo);
-                v1 = add64(v1, uvec2(lo, hi));
-            }
-        }
-    }
-    return uvec2(map16(v0, P.pk.y + 4u), map16(v1, P.pk.z + 4u));
-}
-
-// The split MMR, exact: with SPLIT_GUARD, each sample whose float sum may
-// be 0.5 off (32 x 2^-24 x its terms' magnitudes; see pi_engine.c split_ok)
-// in emulated 64-bit instead. One return (see map16).
+// The split, exact: with SPLIT_GUARD, each sample whose float sum may be 0.5
+// off (32 x 2^-24 x its terms' magnitudes; pi_engine.c split_ok) in
+// emulated 64-bit instead. One return (see map16).
 uvec2 split_guarded(uvec3 s0, uvec3 s1, bool both)
 {
     vec2 mag;
     uvec2 m = mmr_split_mag(s0, s1, both, mag);
     if (SPLIT_GUARD != 0u && any(greaterThanEqual(mag * P.err.y, vec2(0.5))))
-        m = MARK != 0u ? uvec2(0u, 65535u) : mmr_exact(s0, s1, both, 2u);
+        m = MARK != 0u ? uvec2(0u, 65535u) : mmr_exact64(s0, s1, both);
     return m;
 }
 
-// One row's [1 2 1] / 4 of the BL luma at pixels 2cx-1 .. 2cx+1 (the first clamped).
-uint guide_row(uint cx, uint y)
+// ---- MMR96 / MMR128: exact in emulated 128-bit ------------------------------
+// The planner's 128-bit MMR parameters (T_WIDE, pi_engine.c wide_tables):
+// per channel the constant, then coefficient (order o, feature k) at
+// 1 + 7o + k, each four words, two's complement. Features: the univariate
+// s << 10 and its powers, the cross features as above.
+
+uvec4 wide_word(uint c, uint i) { return texelFetch(tables128, T_WIDE / 4 + int(c * 22u + i)); }
+
+// a + b, mod 2^128
+uvec4 add128(uvec4 a, uvec4 b)
 {
-    uint n = cx != 0u ? 2u * cx - 1u : 0u, w = div3(n), sub = n - 3u * w;
-    uint wa = word(bl_y, P.bl.x, P.bl.z, w, y);
-    uint wb = sub != 0u ? word(bl_y, P.bl.x, P.bl.z, w + 1u, y) : wa;
-    uvec3 t = cx != 0u ? uvec3(pick(wa, wb, sub), pick(wa, wb, sub + 1u), pick(wa, wb, sub + 2u))
-                       : uvec3(pick(wa, wb, 0u), pick(wa, wb, 0u), pick(wa, wb, 1u));
-    return (t.x + 2u * t.y + t.z + 2u) >> 2;
+    uint c0, c1, c2, c3;
+    uint x = uaddCarry(a.x, b.x, c0);
+    uint y = uaddCarry(a.y, b.y, c1);
+    uint y2 = uaddCarry(y, c0, c3);
+    uint z = uaddCarry(a.z, b.z, c2);
+    uint z2 = uaddCarry(z, c1 + c3, c0);
+    return uvec4(x, y2, z2, a.w + b.w + c2 + c0);
+}
+
+// a * f, mod 2^128, f unsigned
+uvec4 mul128(uvec4 a, uint f)
+{
+    uint h0, l0, h1, l1, h2, l2;
+    umulExtended(a.x, f, h0, l0);
+    umulExtended(a.y, f, h1, l1);
+    umulExtended(a.z, f, h2, l2);
+    return add128(uvec4(l0, l1, l2, a.w * f), uvec4(0u, h0, h1, h2));
+}
+
+// min(v >> shift, 65535), 0 for v < 0, 4 <= shift < 64.
+uint map16_128(uvec4 v, uint shift)
+{
+    uint r = (v.z | v.w) != 0u || int(v.y) < 0 ? 65535u : map16(v.xy, shift);   /* >= 2^63: clamps */
+    return int(v.w) < 0 ? 0u : r;
+}
+
+// One feature's powers of channel c: the feature f (order 1), its square and
+// cube (fprod64) against coefficients 1 + k, 8 + k, 15 + k.
+uvec4 wide_term(uint c, uint order, uint k, uint f)
+{
+    uvec4 v = mul128(wide_word(c, 1u + k), f);
+    if (order > 1u) {
+        uint f2 = fprod64(f, f);
+        v = add128(v, mul128(wide_word(c, 8u + k), f2));
+        if (order > 2u)
+            v = add128(v, mul128(wide_word(c, 15u + k), fprod64(f, f2)));
+    }
+    return v;
+}
+
+uint wide_channel(uint c, uint order, uvec3 s)
+{
+    uint xy = s.x * s.y;
+    uvec4 v = wide_word(c, 0u);
+    v = add128(v, wide_term(c, order, 0u, s.x << 10));
+    v = add128(v, wide_term(c, order, 1u, s.y << 10));
+    v = add128(v, wide_term(c, order, 2u, s.z << 10));
+    v = add128(v, wide_term(c, order, 3u, xy));
+    v = add128(v, wide_term(c, order, 4u, s.x * s.z));
+    v = add128(v, wide_term(c, order, 5u, s.y * s.z));
+    v = add128(v, wide_term(c, order, 6u, (xy * s.z) >> 10));
+    return map16_128(v, (c == 0u ? P.pk.y : P.pk.z) + 4u);
+}
+
+uvec2 mmr_wide(uvec3 s0, uvec3 s1)
+{
+    return uvec2(wide_channel(0u, ORDER0, s0), wide_channel(1u, ORDER1, s1));
 }
 
 uvec2 q16(vec2 v) { return uvec2(clamp(floor(v), vec2(0.0), vec2(65535.0))); }
@@ -395,14 +414,18 @@ vec2 mmr_float_bounded(uvec3 s0, uvec3 s1, bool both, out vec2 bound)
     return v;
 }
 
+// The chroma mapping of both channels plus the residual r: 12-bit codes.
 uvec2 mmr(uvec3 s0, uvec3 s1, bool both, ivec2 r)
 {
     // one path per specialised pipeline, one return (see map16)
     uvec2 m;
-    if (MMR_MODE == 3u)
+    if (MMR_MODE == 0u) {
+        vec2 mag;
+        m = q16(mmr_float_mag(s0, s1, both, false, mag));
+    } else if (WIDE)
+        m = mmr_wide(s0, s1);
+    else if (MMR_MODE == 3u)
         m = split_guarded(s0, s1, both);
-    else if (MMR_MODE == 0u)
-        m = q16(mmr_float(s0, s1, both));
     else if (MMR_MODE == 4u) {
         // float where the bound can't change the 12-bit result, else exact
         vec2 bound, v = mmr_float_bounded(s0, s1, both, bound);
@@ -410,95 +433,99 @@ uvec2 mmr(uvec3 s0, uvec3 s1, bool both, ivec2 r)
         bool sure = uvec2(recon(lo.x, r.x), recon(lo.y, r.y)) == uvec2(recon(hi.x, r.x), recon(hi.y, r.y));
         m = sure ? lo : MARK != 0u ? uvec2(65535u, 0u) : split_guarded(s0, s1, both);
     } else
-        m = mmr_exact(s0, s1, both, MMR_MODE);
+        m = mmr_exact64(s0, s1, both);
     return uvec2(recon(m.x, r.x), recon(m.y, r.y));
 }
 
-uvec3 reshape_chroma(uint guide, uvec2 chroma)
+// ---- the luma guide and route 3 ----------------------------------------------
+// One row's [1 2 1] / 4 of the BL luma at pixels 2cx-1 .. 2cx+1 (the first clamped).
+uint guide_row(uint cx, uint y)
 {
+    uint n = cx != 0u ? 2u * cx - 1u : 0u, w = div3(n), sub = n - 3u * w;
+    uint wa = word(bl_y, P.bl.x, P.bl.z, w, y);
+    uint wb = sub != 0u ? word(bl_y, P.bl.x, P.bl.z, w + 1u, y) : wa;   /* pixel 2cx + 1 exists */
+    uvec3 t = cx != 0u ? uvec3(pick(wa, wb, sub), pick(wa, wb, sub + 1u), pick(wa, wb, sub + 2u))
+                       : uvec3(pick(wa, wb, 0u), pick(wa, wb, 0u), pick(wa, wb, 1u));
+    return (t.x + 2u * t.y + t.z + 2u) >> 2;
+}
+
+// Route 3's chroma (12-bit Cb, Cr) of input (guide, Cb, Cr).
+uvec2 reshape_chroma(uint guide, uvec2 chroma)
+{
+    uvec2 res;
     if (PIECE_FAST != 0u) {
         uvec3 s = clamp(uvec3(guide, chroma), P.lo[0].xyz, P.hi[0].xyz);
-        return uvec3(0u, mmr(s, s, true, ivec2(0)));
+        res = mmr(s, s, true, ivec2(0));
+    } else
+        res = (ORDER2 != 0u ? reshape_order2_chroma(uvec3(guide, chroma)) : reshape_tuple(uvec3(guide, chroma))).yz;
+    return res;
+}
+
+// Route 3's full-height 4:2:2 layout: the chroma of output row 2k + r (its
+// policy's blend of two 4:2:0 rows) and that row's own guide.
+uvec2 row422(uint cx, uint k, uint r)
+{
+    uint ch = P.size.w, row = 2u * k + r, cy = row >> 1, top, bottom, weight;
+    if (P.pw.x == 1u) {
+        top = cy;
+        bottom = min(cy + 1u, ch - 1u);
+        weight = r != 0u ? 2u : 4u;
+    } else if (r != 0u) {
+        top = cy;
+        bottom = min(cy + 1u, ch - 1u);
+        weight = 3u;
+    } else {
+        top = cy != 0u ? cy - 1u : 0u;
+        bottom = cy;
+        weight = 1u;
     }
-    return ORDER2 != 0u ? reshape_order2_chroma(uvec3(guide, chroma)) : reshape_tuple(uvec3(guide, chroma));
+    uvec2 chroma = (weight * bl_chroma(cx, top) + (4u - weight) * bl_chroma(cx, bottom) + 2u) >> 2;
+    return reshape_chroma(guide_row(cx, row), chroma);
 }
 
 void main()
 {
     uint cx = uint(gl_FragCoord.x), k = uint(gl_FragCoord.y);
     if (SINGLE != 0u) {
-        uvec2 c = min(sand2(bl_c, P.bl.y, P.bl.w, 2u * cx, k), uvec2(1023u));
+        uvec2 c = min(bl_chroma(cx, k), uvec2(1023u));
         o_chroma = uvec2(texelFetch(tables, T_SINGLE + 1024 + int(c.x)).r, texelFetch(tables, T_SINGLE + 2048 + int(c.y)).r);
         o_el = 0u;
     } else if (PIECE == 2u) {
-        // per output row: the chroma between two 4:2:0 rows (the policy's
-        // weights), the guide of that row alone
-        uint ch = P.size.w, o[4];
-        for (uint r = 0u; r < 2u; ++r) {
-            uint row = 2u * k + r, cy = row >> 1, top, bottom, weight;
-            if (P.pw.x == 1u) {
-                top = cy;
-                bottom = min(cy + 1u, ch - 1u);
-                weight = (row & 1u) != 0u ? 2u : 4u;
-            } else if ((row & 1u) != 0u) {
-                top = cy;
-                bottom = min(cy + 1u, ch - 1u);
-                weight = 3u;
-            } else {
-                top = cy != 0u ? cy - 1u : 0u;
-                bottom = cy;
-                weight = 1u;
-            }
-            uvec2 first = sand2(bl_c, P.bl.y, P.bl.w, 2u * cx, top), second = sand2(bl_c, P.bl.y, P.bl.w, 2u * cx, bottom);
-            uvec2 chroma = (weight * first + (4u - weight) * second + 2u) >> 2;
-            uint x = 2u * cx, n = x != 0u ? x - 1u : 0u, w = div3(n), sub = n - 3u * w;
-            uint wa = word(bl_y, P.bl.x, P.bl.z, w, row), wb = word(bl_y, P.bl.x, P.bl.z, w + 1u, row);
-            uvec3 t = x != 0u ? uvec3(pick(wa, wb, sub), pick(wa, wb, sub + 1u), pick(wa, wb, sub + 2u))
-                              : uvec3(pick(wa, wb, 0u), pick(wa, wb, 0u), pick(wa, wb, 1u));
-            uint guide = (t.x + 2u * t.y + t.z + 2u) >> 2;
-            uvec3 res = reshape_chroma(guide, chroma);
-            o[2u * r] = res.y;
-            o[2u * r + 1u] = res.z;
-        }
         // 48 bits: Cb, Cr of row 2k, then of row 2k+1, 12 bits each
-        o_chroma = uvec2(o[0] | ((o[1] & 15u) << 12), (o[1] >> 4) | ((o[2] & 255u) << 8));
-        o_el = (o[2] >> 8) | (o[3] << 4);
+        uvec2 a = row422(cx, k, 0u), b = row422(cx, k, 1u);
+        o_chroma = uvec2(a.x | ((a.y & 15u) << 12), (a.y >> 4) | ((b.x & 255u) << 8));
+        o_el = (b.x >> 8) | (b.y << 4);
     } else {
-    o_el = PIECE != 0u ? 0u : sand2(el_y, P.el.x, P.el.z, cx, k).x;
+        o_el = PIECE != 0u ? 0u : sand1(el_y, P.el.x, P.el.z, cx, k);
 
-    // the luma guide: [1 2 1] / 4 on each of the block's rows (pixels
-    // 2cx-1 .. 2cx+1, the first clamped), rows averaged
-    uint guide = (guide_row(cx, 2u * k) + guide_row(cx, 2u * k + 1u) + 1u) >> 1;
-    if (PIECE == 1u) {   // the 4:2:0 layout: the decoded chroma and the guide
-        uvec3 res = reshape_chroma(guide, min(sand2(bl_c, P.bl.y, P.bl.w, 2u * cx, k), uvec2(1023u)));
-        o_chroma = res.yz;
-    } else {
-    uvec2 bp;
-    if (METHOD == 2u)
-        bp = min(sand2(bl_c, P.bl.y, P.bl.w, 2u * cx, k), uvec2(1023u));
-    else
-        bp = phase(false, cx, int(k), P.size.w).xy;
+        // the luma guide: [1 2 1] / 4 on each of the block's rows (pixels
+        // 2cx-1 .. 2cx+1, the first clamped), rows averaged
+        uint guide = (guide_row(cx, 2u * k) + guide_row(cx, 2u * k + 1u) + 1u) >> 1;
+        if (PIECE == 1u)   // the 4:2:0 layout: the decoded chroma and the guide
+            o_chroma = reshape_chroma(guide, min(bl_chroma(cx, k), uvec2(1023u)));
+        else {
+            uvec2 bp = METHOD == 2u ? min(bl_chroma(cx, k), uvec2(1023u)) : phase(false, cx, int(k), P.size.w).xy;
 
-    // the EL chroma at (cx, k): co-sited horizontally, bilinear between
-    uvec4 ev = el_vertical(cx >> 1, k);
-    uvec2 e = min((cx & 1u) != 0u ? (ev.xy + ev.zw + 1u) >> 1 : ev.xy, uvec2(1023u));
+            // the EL chroma at (cx, k): co-sited horizontally, bilinear between
+            uvec4 ev = el_vertical(cx >> 1, k);
+            uvec2 e = min((cx & 1u) != 0u ? (ev.xy + ev.zw + 1u) >> 1 : ev.xy, uvec2(1023u));
 
-    ivec2 r = ivec2(int(texelFetch(tables, T_RES + 1024 + int(e.x)).r), int(texelFetch(tables, T_RES + 2048 + int(e.y)).r));
-    uvec3 s = uvec3(guide, bp.x, bp.y);
-    if (KIND0 != 0u && KIND1 != 0u) {
-        if (DUAL != 0u) {   // both channels clamp the input by channel 0's bounds
-            uvec3 c = clamp(s, P.lo[0].xyz, P.hi[0].xyz);
-            o_chroma = mmr(c, c, true, r);
-        } else
-            o_chroma = mmr(clamp(s, P.lo[0].xyz, P.hi[0].xyz), clamp(s, P.lo[1].xyz, P.hi[1].xyz), false, r);
-    } else {
-        // polynomial channels: the chroma mapping table (an MMR one: its own)
-        uvec2 mm = (KIND0 != 0u || KIND1 != 0u)
-                       ? mmr(clamp(s, P.lo[0].xyz, P.hi[0].xyz), clamp(s, P.lo[1].xyz, P.hi[1].xyz), false, r)
-                       : uvec2(0u);
-        o_chroma = uvec2(KIND0 == 0u ? recon(texelFetch(tables, T_CMAP + int(bp.x)).r, r.x) : mm.x,
-                         KIND1 == 0u ? recon(texelFetch(tables, T_CMAP + 1024 + int(bp.y)).r, r.y) : mm.y);
-    }
-    }
+            ivec2 r = ivec2(int(texelFetch(tables, T_RES + 1024 + int(e.x)).r), int(texelFetch(tables, T_RES + 2048 + int(e.y)).r));
+            uvec3 s = uvec3(guide, bp.x, bp.y);
+            if (KIND0 != 0u && KIND1 != 0u) {
+                if (DUAL != 0u) {   // both channels clamp the input by channel 0's bounds
+                    uvec3 c = clamp(s, P.lo[0].xyz, P.hi[0].xyz);
+                    o_chroma = mmr(c, c, true, r);
+                } else
+                    o_chroma = mmr(clamp(s, P.lo[0].xyz, P.hi[0].xyz), clamp(s, P.lo[1].xyz, P.hi[1].xyz), false, r);
+            } else {
+                // polynomial channels: the chroma mapping table (an MMR one: its own)
+                uvec2 mm = (KIND0 != 0u || KIND1 != 0u)
+                               ? mmr(clamp(s, P.lo[0].xyz, P.hi[0].xyz), clamp(s, P.lo[1].xyz, P.hi[1].xyz), false, r)
+                               : uvec2(0u);
+                o_chroma = uvec2(KIND0 == 0u ? recon(texelFetch(tables, T_CMAP + int(bp.x)).r, r.x) : mm.x,
+                                 KIND1 == 0u ? recon(texelFetch(tables, T_CMAP + 1024 + int(bp.y)).r, r.y) : mm.y);
+            }
+        }
     }
 }

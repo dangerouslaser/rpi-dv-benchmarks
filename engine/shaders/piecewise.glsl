@@ -8,7 +8,6 @@ struct Piece { uint method, order; uvec2 bias; uvec2 coefficient[21]; };
 struct Curve { uint pivot_count; uint pivots[9]; Piece piece[8]; };
 layout(binding = 11, std430) readonly buffer Mapping { uint base_depth, denominator; Curve curve[3]; };
 
-uvec2 pw_add64(uvec2 a, uvec2 b) { uint c; uint lo = uaddCarry(a.x, b.x, c); return uvec2(lo, a.y + b.y + c); }
 bool pw_negative(uvec2 a) { return int(a.y) < 0; }
 // a * b mod 2^64, b zero-extended
 uvec2 pw_mul_u32(uvec2 a, uint b) { uint hi, lo; umulExtended(a.x, b, hi, lo); return uvec2(lo, hi + a.y * b); }
@@ -98,13 +97,13 @@ uvec3 reshape_tuple(uvec3 input_)
         if ((P.narrow[c] & (1u << pc)) != 0u) {
             uvec2 value = pw_mul_u32(curve[c].piece[pc].bias, 1u << q);
             if (method == 0u) {
-                value = pw_add64(value, pw_mul_u32(curve[c].piece[pc].coefficient[0], s[c] << bits));
+                value = add64(value, pw_mul_u32(curve[c].piece[pc].coefficient[0], s[c] << bits));
                 if (order == 2u)
-                    value = pw_add64(value, pw_mul_u32(curve[c].piece[pc].coefficient[1], s[c] * s[c]));
+                    value = add64(value, pw_mul_u32(curve[c].piece[pc].coefficient[1], s[c] * s[c]));
             } else
                 for (uint o = 0u; o < order; ++o)
                     for (uint k = 0u; k < 7u; ++k)
-                        value = pw_add64(value, pw_mul_u32(curve[c].piece[pc].coefficient[o * 7u + k],
+                        value = add64(value, pw_mul_u32(curve[c].piece[pc].coefficient[o * 7u + k],
                                                            pw_feature(s, bits, q, o, k)));
             result[c] = min((pw_map16(value, denominator + q - 16u) + 8u) >> 4, 4095u);
             continue;
@@ -140,7 +139,7 @@ uvec3 reshape_order2_chroma(uvec3 input_)
         uvec2 value = pw_mul_u32(curve[c].piece[0].bias, 1048576u);
         for (uint o = 0u; o < 2u; ++o)
             for (uint k = 0u; k < 7u; ++k)
-                value = pw_add64(value, pw_mul_u32(curve[c].piece[0].coefficient[o * 7u + k], pw_feature(s, 10u, 20u, o, k)));
+                value = add64(value, pw_mul_u32(curve[c].piece[0].coefficient[o * 7u + k], pw_feature(s, 10u, 20u, o, k)));
         result[c] = min((pw_map16(value, denominator + 4u) + 8u) >> 4, 4095u);
     }
     return result;

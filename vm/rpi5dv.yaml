@@ -1,9 +1,9 @@
 # Lima VM for running the aarch64 build without a Pi: Debian 13 (trixie, the
-# base of Raspberry Pi OS) on Apple's hypervisor. Its kernel has udmabuf, which
-# the bench needs for real dmabufs (Docker Desktop's and OrbStack's kernels
-# don't). The GPUs are Mesa's software drivers: lavapipe (Vulkan), llvmpipe
-# (GLES). Use scripts/vm-setup.sh, which fills in @REPO@ (this checkout,
-# mounted read-write at the same path) and the size overrides.
+# base of Raspberry Pi OS) on Apple's hypervisor. Its kernel has udmabuf, where
+# the bench allocates its dmabufs off the Pi (bench/alloc.c; Docker Desktop's
+# and OrbStack's kernels don't have it). The GPU is Mesa's software Vulkan,
+# lavapipe, which runs the engine. Use scripts/vm-setup.sh, which fills in @REPO@
+# (this checkout, mounted read-write at the same path), @CPUS@ and @MEMORY@.
 minimumLimaVersion: 2.0.0
 vmType: vz
 arch: aarch64
@@ -32,10 +32,12 @@ provision:
       set -eux -o pipefail
       export DEBIAN_FRONTEND=noninteractive
       apt-get update -qq
-      # Runtime of the aarch64 build: Mesa software Vulkan/GLES, loaders, the
-      # libraries dvbench and the engines link, and tools for poking around.
+      # Runtime of the aarch64 build: Mesa software Vulkan, its loader, the
+      # libraries dvbench (the engine is linked in) links, the
+      # validation layer for tests/check.sh --validate, and tools for poking
+      # around.
       apt-get install -y -qq --no-install-recommends \
-        mesa-vulkan-drivers vulkan-tools libvulkan1 libegl-mesa0 libegl1 libgles2 libgbm1 \
+        mesa-vulkan-drivers vulkan-tools libvulkan1 \
         libdrm2 libudev1 mesa-utils-bin python3 gcc libc6-dev \
         vulkan-validationlayers
       # /dev/udmabuf for every user (the bench allocates its buffers there).

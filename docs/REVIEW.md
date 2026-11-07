@@ -1,10 +1,10 @@
 # Code review: before LibreELEC integration
 
 A review of the whole repository (except the vendored planner and FFmpeg
-patches), November 2026. So far the engine has only run inside `dvbench`,
-which runs once and exits. Inside Kodi it will run for hours, through new
-files, seeks and stream changes. Most findings are about that difference.
-Line numbers are as of commit `ff53c4e`.
+patches), November 2026. Until then the engine had only run inside
+`dvbench`, which runs once and exits. Inside Kodi it will run for hours,
+through new files, seeks and stream changes. Most findings were about that
+difference. Line numbers are as of commit `ff53c4e`.
 
 Severity:
 - **P0:** breaks real playback in Kodi.
@@ -12,264 +12,251 @@ Severity:
 - **P2:** hardening.
 - **P3:** debt and cleanup.
 
-Strike items out here as they are fixed.
+**Every finding below is addressed** (2026-11-07). Each is struck out, with
+what was done. The changes were checked as follows:
+- Every golden case reproduces in every exact MMR mode, with Vulkan
+  validation clean (`tests/check.sh`, `--mmr split|exact64`, `--validate`).
+- Hashes are identical to the pre-review engine on every clip, filter set and
+  mode, on lavapipe and on the Pi's V3D. The one deliberate change: P3 #2's
+  float fast path on route 3.
+- Real-time play on the Pi (`docs/ENGINE.md` "Performance").
 
 ## P0: breaks playback in a long-lived engine
 
-1. **Rebinding an output slot renders into the old buffer**
-   (`engine/pi_engine.c:560`). `output_half` makes a new image, but it only
-   makes a view `if (!o->view)`. The framebuffer is therefore built from the
-   old image's view. The old image, memory, framebuffer and `out_buf` leak.
-   There is also no wait before a slot that may still be busy is rebound.
-   - **Fix:** wait on the slot, destroy the old objects, then rebuild.
-2. **The pipeline caches are fixed in size, and a full one fails every later
-   frame** (`:112`, `:869`, `:1048`).
-   - P2's cache has 8 entries, and P2's key alone has up to 12 combinations
-     plus the bars pipeline. P1's cache has 16, and P1's key includes
-     per-scene MMR kinds and orders.
-   - Once a cache is full, `variant()` returns NULL and `pi_submit` fails for
-     the life of the engine.
-   - **Fix:** a growable cache, and a `VkPipelineCache` kept on disk (P1 #4).
-3. **Decoder imports are never released** (`:200-248`). The import list only
-   grows. Each import keeps a decoder dmabuf, which is CMA memory, alive. The
-   V4L2 decoder allocates new buffers on each reinitialisation, so every file
-   leaks CMA until allocation fails.
-   - **Fix:** release the imports per stream (`pi_stream_close`).
-   - **Note:** identifying a buffer by its inode (`:207`) is only safe while
-     the engine holds a reference to it.
-4. **The input frames' lifetime is undefined.** The GPU reads BL and EL after
-   `pi_submit` returns. If the caller frees its `AVFrame` first, the decoder
-   can recycle the buffer while the GPU is still reading it.
-   - **Fix:** take `av_frame_ref` on BL and EL per slot, and release them in
-     `pi_wait`/`pi_done`.
-5. **`pi_destroy` leaks everything but the device and instance**
-   (`:1129-1135`; "the process exits right after"). Destroying a device that
-   still has live objects is invalid Vulkan. A `create` that fails part-way
-   goes through the same path (`:519`).
-   - **Fix:** full teardown in reverse order, safe to call on a partial
-     create.
-
-6. **Done: Profile 8.4 is real time.** It took 184–298 ms per picture,
-   because the fast piecewise path needed the split MMR and the split's
+1. ~~**Rebinding an output slot renders into the old buffer**~~
+   (`engine/pi_engine.c:560`). `output_half` made a new image, but it only
+   made a view `if (!o->view)`, and the old objects leaked.
+   - **Done:** outputs are objects the caller imports and releases
+     (`pi_output_import`, `pi_output_release`). Nothing is rebound;
+     releasing waits for the output's last render.
+2. ~~**The pipeline caches are fixed in size, and a full one fails every
+   later frame**~~ (`:112`, `:869`, `:1048`).
+   - **Done:** the variant sets grow, behind a lock. A `VkPipelineCache`
+     is read from and written to `pi_options.pipeline_cache`.
+3. ~~**Decoder imports are never released**~~ (`:200-248`). Each import
+   kept a decoder dmabuf (CMA) alive.
+   - **Done:** imports belong to the stream: `pi_stream_close` releases
+     them. Within a stream, imports no render has read for 64 frames, and
+     none in flight reads, are released once there are more than 48 (a
+     decoder that reallocates mid-stream). The import holds the buffer, so
+     its inode can't be reused while it is listed.
+4. ~~**The input frames' lifetime is undefined.**~~ The GPU read BL and EL
+   after `pi_submit` returned.
+   - **Done:** `pi_render` takes `av_frame_clone` references and drops them
+     when the render's fence is seen.
+5. ~~**`pi_destroy` leaks everything but the device and instance**~~
+   (`:1129-1135`).
+   - **Done:** `pi_engine_destroy` tears everything down in reverse order,
+     and is what a failed create calls. Validation reported 214 objects
+     alive at `vkDestroyDevice` before; it reports none now.
+6. ~~**Profile 8.4 isn't real time on the Pi.**~~ It took 184–298 ms per
+   picture: the fast piecewise path needed the split MMR, and the split's
    error check (64 × 2⁻²⁴ × m < 0.25) refused this stream.
-   - The fast path now runs the stream's `--mmr` mode.
-   - The check is now 32 × 2⁻²⁴ × m < 0.5, from a count of the roundings.
-   - A frame that still fails checks each sample (`SPLIT_GUARD`) instead of
-     dropping to `exact64` whole. Both variants are built together.
-   - Result: 30.5–35.5 ms, and the whole film plays with 1 late frame.
-   - Still to do: an 8.4 golden case in a regression script.
+   - The fast path runs the stream's `--mmr` mode.
+   - The check is 32 × 2⁻²⁴ × m < 0.5, from a count of the roundings.
+   - A frame that fails it checks each sample (`SPLIT_GUARD`).
+   - **Done:** 30.8 ms, and the whole film plays with 1 late frame.
+     `tests/golden/hashes.txt` has 8.4 cases (4K with both filter sets,
+     1080p), and `bundle/run-bench.sh`'s `--play` is the real-time check.
 
 ## P1: what integration needs
 
-1. **An API for a long-lived caller.** The bench drives the engine through
-   3 fixed slots. Kodi needs:
-   - stream open and close (which also resets the planner state: K5 below)
-   - outputs it owns and imports (validated)
-   - fences
-   - error codes it can tell apart
-
-   A sketch:
-   ```c
-   int  pi_engine_create(const struct pi_options *, struct pi_engine **);
-   void pi_engine_destroy(struct pi_engine *);
-   int  pi_stream_open(struct pi_engine *, const struct pi_stream_info *); // size, profile, siting; prewarm
-   void pi_stream_close(struct pi_engine *);                                // wait, release imports and frames
-   int  pi_output_import(struct pi_engine *, int fd, uint32_t stride, uint64_t size, struct pi_output **);
-   void pi_output_release(struct pi_engine *, struct pi_output *);
-   int  pi_render(struct pi_engine *, const AVFrame *bl, const AVFrame *el, const AVFrameSideData *dovi,
-                  struct pi_output *, int acquire_fd, int *release_fd);
-   enum pi_error { PI_OK, PI_E_UNSUPPORTED_FORMAT, PI_E_UNSUPPORTED_PLAN, PI_E_BAD_RPU, PI_E_VULKAN, PI_E_NOMEM };
-   ```
-   `bench/dvbench.c` `play()` (`:239-295`) is the reference for the
-   submit/wait/late loop.
-2. **Sync with the display plane.** The only sync today is the CPU waiting.
-   - Export a sync_file (`VK_KHR_external_fence_fd`) for KMS `IN_FENCE_FD`.
-   - Take an acquire fence for buffers KMS may still be scanning out.
-   - Whether v3d's implicit `dma_resv` fences are enough on their own is
-     unverified.
-   - Queue-family ownership transfers to `VK_QUEUE_FAMILY_FOREIGN_EXT` are
-     missing (`:261`, `:435`). This is a spec gap that is probably harmless
-     on v3dv.
-3. **Sizes other than 3840×2160.** The size is hard-coded (`:440`, `:891`).
-   Confirmed: Dolby's 1080p samples of Profiles 5, 8.1 and 8.4 all return 2.
-   Profile 8.1 at 1080p, which is common in streaming, is refused. The refusal
-   uses the same return code (2) as "the planner can't do this", so the
-   caller can't tell the two apart.
-4. **Pipelines compile on the render thread** (`:875`), and P1's key changes
-   with the scene's MMR order.
-   - Prewarm the pipelines at stream open.
-   - Pass a `VkPipelineCache` saved under Kodi's userdata (today it is
-     `VK_NULL_HANDLE`, `:327`).
-5. **K5: planner state across streams.** `dvvk_plan_state_reset` is never
-   called, so packet-id continuity and cached tables carry over between
-   files. Reset at stream open.
-6. **Logging and options.**
-   - One `e->warned` counter silences every warning after the first
-     (`:909`, `:972`, `:1014`).
-   - `getenv` runs per frame (`PI_DEBUG`, `PI_ALL_ROWS`, `PI_MARK` and
-     others), and `static int shown` (`:670`) is global to the process.
-   - Errors go to stderr, which Kodi doesn't capture.
-   - **Fix:** a `pi_options` struct at create, a log callback, and one flag
-     per warning.
-7. **Packaging.**
-   - `glslc` is required. Either commit the generated SPIR-V headers, or
-     confirm LibreELEC's host glslang can build them.
-   - `bench/` always builds and pulls in EGL/GLES: add
-     `option(PI_BUILD_BENCH OFF)`.
-   - Add `install()` rules and a header for Kodi.
-   - **Licence:** the planner is GPL-3.0-or-later, so a Kodi binary linking
-     it is effectively GPLv3. Kodi is GPL-2.0-or-later, so this is allowed,
-     but it has to be stated. The repository root has no LICENSE file.
-   - Kodi's FFmpeg in LibreELEC must carry `patches/ffmpeg`
-     (`DV_FFMPEG_RAW_EXTENSIONS`).
-8. **Input glue to move next to the engine** (from `bench/source.c` and
-   `dvbench.c`):
-   - the single-track Profile 7 BL/EL split (`source.c:226-302`), and the
-     pairing of BL and EL pictures
-   - the chroma siting policy `top_left()` (`dvbench.c:148`)
-   - the SAND128 modifier check, duplicated in `pi_engine.c:665`
-   - the output size rule, as `pi_output_size()` (`dvbench.c:75-85`)
+1. ~~**An API for a long-lived caller.**~~
+   - **Done:** `engine/pi_engine.h`. The calls are `pi_engine_create`
+     (options), `pi_stream_open`/`close`, `pi_output_size`/`import`/`release`
+     and `pi_render` (sync_files). Errors are `enum pi_status`.
+     `docs/ENGINE.md` "Using the engine" summarises it.
+2. ~~**Sync with the display plane.**~~
+   - **Done:** `pi_render` returns a sync_file signalled when the output is
+     complete. It is a semaphore exported as `SYNC_FD`, not the fence:
+     exporting a fence resets it.
+   - It takes an acquire sync_file, imported as a semaphore. One already
+     signalled is closed instead: on v3dv a semaphore wait stops a frame's
+     work overlapping the last one's, which made 1917 drop frames.
+   - Queue-family ownership moves to and from `VK_QUEUE_FAMILY_FOREIGN_EXT`
+     for the decoder buffers and the output. The barriers cost nothing
+     measurable.
+   - `dvbench --play` drives all of it as a display would. Without
+     `VK_KHR_external_semaphore_fd` (lavapipe) it waits on the CPU.
+   - Still untested: whether v3d's implicit `dma_resv` fences would be
+     enough without the sync_files.
+   - **Open, found while testing this:** exporting the release sync_file
+     sometimes stalls the render thread. 1917 drops 0, 5 and 1 frames in
+     three 120 s runs (worst 21 ms) with fences, and none in three without.
+     `docs/ENGINE.md` "Open" has the next steps.
+3. ~~**Sizes other than 3840×2160.**~~
+   - **Done:** the size is the stream's (`pi_stream_open`), and outputs are
+     validated against it. Dolby's 1080p Profile 5, 8.1 and 8.4 samples
+     render at 4.7 ms. They match yblod's render of the same pictures,
+     centred in a 4K canvas, except the metadata packets' LSBs.
+   - A refusal is `PI_E_UNSUPPORTED_PLAN` (or `PI_E_BAD_RPU`), distinct from
+     `PI_E_UNSUPPORTED_FORMAT`.
+4. ~~**Pipelines compile on the render thread**~~ (`:875`), and P1's key
+   changes with the scene's MMR order.
+   - **Done:** after a stream's first frame, a worker thread at idle
+     priority builds the variants the stream may need next: all MMR order
+     pairs, and the split's guard on and off. A render thread that still
+     misses compiles that one variant itself.
+   - The pipeline cache file (P0 #2) makes later runs fast.
+5. ~~**K5: planner state across streams.**~~
+   - **Done:** `pi_stream_open` calls `dvvk_plan_state_reset`, and marks
+     every context's tables stale.
+6. ~~**Logging and options.**~~
+   - **Done:** `struct pi_options` at create. It has a log callback with
+     levels (stderr without one) and one flag per warning, so each warns
+     once. The engine reads no environment; `static int shown` is gone.
+     dvbench maps the old `PI_*` variables onto the options.
+7. ~~**Packaging.**~~
+   - **Done:** glslc is optional. Without it the build uses the committed
+     SPIR-V binaries (`engine/shaders/spirv/*.spv`), and the binary is
+     byte-identical. `update-spirv` refreshes them, and the build warns while
+     they are stale.
+   - Unoptimised SPIR-V (glslang without `-O`) runs 7–9% slower on V3D. So
+     LibreELEC's glslang alone isn't a substitute for glslc, and the
+     committed files are built with `-O`.
+   - `option(PI_BUILD_BENCH OFF)`; bench/ alone needs libdrm.
+   - `install()` rules for the libraries and `pi_engine.h`.
+   - `LICENSE` (GPL-3.0). README.md and ENGINE.md state the GPLv3
+     consequence for Kodi, and that Kodi's FFmpeg needs `patches/ffmpeg`.
+8. ~~**Input glue to move next to the engine.**~~
+   - **Done:** `engine/pi_input.c` has `pi_p7_split` (the single-track
+     Profile 7 split), `pi_chroma_top_left` and `pi_is_sand128` (used by the
+     engine's own input check). `pi_output_size` is in the engine.
+   - Pairing BL and EL pictures stays with the decoder loop (`bench/source.c`
+     `take()`, the reference): see P2 #6.
 
 ## P2: hardening
 
-1. **The input frame isn't checked** (`pi_engine.c:662`). `data[0]` is
-   treated as an `AVDRMFrameDescriptor` without checking the frame's format,
-   and `object_index` isn't bounds-checked (`:683`). A software-decode
-   fallback in Kodi would make the engine read pixel bytes as fds.
-2. **Unvalidated indices and buffers.**
-   - Slot indices are never bounds-checked (`:571`, `:887`, `:1095`,
-     `:1113`, `:1119`).
-   - The output's stride, alignment and size (`stride*(h+1)`) aren't
-     validated (`:532`).
-3. **Shader reads past the plane at the right edge.**
-   - `sand4` (`p1_chroma.frag:69-74`) always fetches word `w+1`. At the last
-     chroma column, that word lies past the end of the BL chroma plane, and
-     of the EL plane on every dual frame.
-   - The same happens in `sand2(el_y)` (`:439`) and in the `PIECE==2` guide
-     (`:427`).
-   - The values are discarded, but without robust buffer access the read is
-     undefined behaviour.
-   - **Fix:** fetch the second word only when it's needed, or clamp the
-     index. Either way the output stays bit-identical.
-4. **MMR96 and MMR128 streams render in float, not exactly**
-   (`pi_engine.c:970`). The planner emits these kinds for MMR curves that
-   don't fit the 64-bit LUT (`planner/plan.c:316-332`). Every test clip and
-   film so far has used the LUT kind.
-   - **Fix:** route them through `exact64` and give them a golden case.
-5. **`dvbench` accepts unknown option values as the default**
-   (`dvbench.c:331`, `:343`, `:346-350`). `--mmr exat` runs `exact`, and a
-   bad `--mmr` in `tests/check.sh` would compare exact against exact and
-   pass. Reject unknown values.
-6. **Decoder feed** (`bench/source.c`). This is bench code, but it is the
-   template for P1 #8.
-   - Packets are dropped on `EAGAIN` (`:345`, `:356`).
-   - BL and EL are paired by arrival order, not PTS (`:376`).
-   - The EL is dropped for the whole run if the BL gets 8 pictures ahead
-     (`:371`).
-   - The context leaks on an `avcodec_open2` failure (`:221`).
-   - Allocations are unchecked.
-7. **Smaller issues:**
-   - `qf[qfam]` is read past its end when there's no graphics queue
-     (`:387`).
-   - `VK_INCOMPLETE` from enumerating devices is treated as an error
-     (`:354`).
-   - Shader modules leak on `pipeline()` errors (`:292-327`).
-   - `memtype` falls back to type 0 instead of failing (`:136`).
-   - The JSON writes file names unescaped (`dvbench.c:482`).
-   - `fopen` failures for `--json` and `--dump` are silent.
-   - `bundle/run-bench.sh` always exits 0.
-   - `scripts/make-bundle.sh:13` hides a missing `libavcodec`.
-   - `scripts/build-ffmpeg.sh` doesn't rebuild when the patches or flags
-     change.
-8. **Safeguards that cost nothing at run time:**
-   - `_Static_assert(sizeof(struct params) == 1456)`
-   - `_Static_assert(offsetof(struct params, packets) == 816)`
-   - an assert that a specialisation map fits its 16 entries (rule 5 in
-     `ENGINE.md`)
+1. ~~**The input frame isn't checked**~~ (`pi_engine.c:662`).
+   - **Done:** the engine checks the frame format (DRM PRIME), the
+     descriptor, its object and layer counts, the SAND128 modifier, each
+     plane's object index and offset, and the frame's size. Any failure is
+     `PI_E_UNSUPPORTED_FORMAT`.
+2. ~~**Unvalidated indices and buffers.**~~
+   - **Done:** there are no slot indices any more. An output's size, stride
+     and byte count are checked against `pi_output_size`'s rules and the
+     dmabuf's real size.
+3. ~~**Shader reads past the plane at the right edge.**~~
+   - **Done:**
+     - `uvq` reads the last chroma column together with its left neighbour.
+     - The EL luma read (`sand1`) fetches one word.
+     - The `PIECE==2` guide is now `guide_row`, which reads its second word
+       only when a sample is in it.
+   - Every read now holds a sample that exists. Clamping each read instead
+     cost 1.3 ms on 1917. The output is bit-identical.
+4. ~~**MMR96 and MMR128 streams render in float, not exactly**~~
+   (`pi_engine.c:970`).
+   - **Done:** routing them through `exact64` would have been wrong: their
+     sums don't fit 64 bits. They get emulated 128-bit instead
+     (`p1_chroma.frag` `mmr_wide`), from the planner's int128 parameters, in
+     every exact mode.
+   - No stream tested has these kinds. `--measure force_wide` sends a 64-bit
+     LUT stream down this path; it is identical on both FEL MMR clips with
+     both filter sets, and has a golden case.
+5. ~~**`dvbench` accepts unknown option values as the default.**~~
+   - **Done:** unknown values, malformed numbers and a second file are
+     errors (exit 2).
+6. ~~**Decoder feed**~~ (`bench/source.c`).
+   - **Done:**
+     - A packet the decoder can't take yet is kept and sent again; it is
+       not dropped.
+     - The EL is given up only if no EL picture has ever arrived.
+     - Contexts are freed on every `open_decoder` failure, and allocations
+       are checked.
+   - **Pairing BL and EL by timestamp was tried and is wrong.** On the "All
+     Layers" test clip the EL's coding order differs from the packets', so
+     EL timestamps (each its packet's) don't follow display order. Both
+     decoders output in display order, so the k-th pictures pair, as before.
+     A BL picture with no EL left is shown without one, with a warning.
+7. ~~**Smaller issues.**~~
+   - **Done:**
+     - A device with no graphics queue is an error.
+     - `VK_INCOMPLETE` is accepted.
+     - Shader modules are freed on every path.
+     - `memtype` fails instead of falling back to type 0.
+     - JSON strings are escaped.
+     - `--json`/`--dump` open and write failures are reported and fail the
+       run.
+     - `run-bench.sh` exits 1 on any failure.
+     - `make-bundle.sh` fails without the FFmpeg libraries dvbench links.
+     - `build-ffmpeg.sh` rebuilds when the patches or flags change.
+8. ~~**Safeguards that cost nothing at run time.**~~
+   - **Done:** static asserts on `struct params`'s size and offsets, on
+     `T_WORDS`, on the packet size, and on the specialisation maps fitting.
 
 ## P3: debt and cleanup
 
-1. **Measurement knobs in production code.** These all need to be either
-   compile-time options (`-DPI_MEASURE`) or `pi_options` fields:
-   - `PI_ABLATE` and `PI_MARK`, which are in the pipeline keys
-   - `PI_PIECE_GENERAL`, `PI_ALL_ROWS`, `PI_DRAW_BARS` and `PI_COPY_OUTPUT`
-2. **Modes.**
-   - Drop `exact32`: it is slower than `exact64` and never chosen. That
-     frees `fprod`, a 30-line branch, 192 bytes of the UBO and
-     `PI_MMR_EXACT32`.
-   - Keep `float` as the MMR96/128 fallback only until P2 #4 is fixed.
-   - Unrolling `exact64` (three nested loops, against rule 4) may speed up
-     the fallback.
-   - On the piecewise route, `--mmr float` turns off the fast path.
-3. **A shipping path breaks shader rule 3.** `PIECE==2` uses `uint o[4]`,
-   filled in a loop (`p1_chroma.frag:408-434`).
-   - **Fix:** a `row422(cx, k, r)` helper, called twice with literal `r`.
-   - `reshape_chroma` (`:390`) has several returns: make it one.
-4. **Dead code in the engine:**
-   - `sand()` in `common.glsl`
-   - `SPLIT_W`
-   - the UBO fields `sel` and `sel2` (written, never read)
-   - descriptor binding 9 (no shader uses it)
-   - `p->horizontal_fused` handling
-   - `pass()`, which duplicates `pass_bands()`
-   - the unused third entries of `rp[3]`, `fb[3]` and `pass_ms[3]`
-   - an unreachable branch in `float_mmr` (`:635`)
-   - `spec[0] = PI_MMR_FLOAT`
-5. **Duplicated code:**
-   - `pw_add64` and `add64`
-   - the SAND word addressing, written three times
-   - the guide row (`p1:426` against `guide_row`)
-   - the black-pixel packing, in C and in GLSL
-6. **Names and comments:**
-   - `spv_p3` is now P2.
-   - The enum names don't match the documented modes: `PI_MMR_HYBRID` is
-     `split` and `PI_MMR_BOUNDED` is `exact`.
-   - Comments still mention "three passes" and "pass 3", and leave out mode 4
-     (`p1:23`).
-   - `PI_MARK` writes 65535, not the documented 4095 (`p1:48`).
-   - `--filters yblod` is named after a removed engine; `phase` would
-     describe it.
-   - A 4-way nested ternary sits at `:400`.
-   - The magic numbers (`T_*`, 3072, `0x07`/4 SAND128, `0xff000000`) need
-     names.
-7. **`pi_submit` is 207 lines.** Split it into plan, upload tables, choose
-   variants and record. All tables are re-uploaded every frame, so track
-   `tables_generation` per slot.
-8. **Tools.**
-   - Remove `vk-micro` and `bench/micro/`: their question is answered, they
-     describe yblod and CB1 as current, and they are the only reason the
-     build needs EGL/GLES.
-   - Cut `probe-dmabuf` down to a `dvbench --probe` built on `alloc.c`. As
-     it stands it only tries udmabuf, returns 0 when it fails, and crashes on
-     its error paths.
-   - Remove the P010 software layout (`source.c`), which the engine
-     rejects.
-   - Remove `dv_drm`, `dv_is_sand128` and `dv_dmabuf_kind`, which have no
-     callers.
-9. **Build and scripts.**
-   - Drop `meson`, `python3-jinja2`, `python3-markupsafe` and
-     `libgl1-mesa-dri` from `docker/packages.txt`.
-   - Drop the git branch of `scripts/fetch-sources.sh`.
-   - Drop `-e DV_THREADS` (`in-docker.sh`).
-   - Drop `.cache/` from `.gitignore`.
-   - Fix the stale comments in `source.c`/`.h` and `vm/rpi5dv.yaml`.
-10. **Test clips.**
-    - `tests/make-test-clips.sh` can't reproduce the golden clip names, so
-      they were renamed by hand; give it an output-name argument.
-    - Its header says `SECONDS`, but it reads `SECONDS_`.
-    - It doesn't create `clips/`.
-    - `check.sh --validate` uses the first golden clip even when it's
-      missing.
-11. **The image note.** `image/customize.sh` tells users to run
-    `run-bench.sh clips/*` with the default filters. Profile 8.1 MMR clips
-    need `--filters yblod`, so `run-bench.sh` should pick the filters per
-    clip.
+1. ~~**Measurement knobs in production code.**~~
+   - **Done:** they are `pi_options.measure` bits and `pi_options.ablate`.
+     dvbench sets them from the `PI_*` variables or `--measure`.
+2. ~~**Modes.**~~
+   - **Done:** `exact32` is gone, with `fprod`'s 10-bit form, its branch and
+     192 bytes of UBO.
+   - `float` stays as a user choice only. The wide kinds no longer need it.
+   - Unrolling `exact64` was measured and rejected. The guarded variant went
+     from 6 spills to 92; `exact64` is now only that variant's rare fallback.
+   - On the piecewise route, `--mmr float` uses the fast path (a deliberate
+     output change: float there was exact before).
+3. ~~**A shipping path breaks shader rule 3.**~~
+   - **Done:** `row422(cx, k, r)`, called with literal `r`. `reshape_chroma`
+     has one return.
+4. ~~**Dead code in the engine.**~~
+   - **Done:** removed:
+     - `sand()` and `SPLIT_W`;
+     - the `sel`/`sel2` UBO fields, binding 9 and `pass()`;
+     - the third entries of `rp`, `fb` and `pass_ms`;
+     - `float_mmr`'s unreachable branch and `spec[0]`.
+   - There was no `horizontal_fused` handling in the engine; the planner
+     sets the field.
+5. ~~**Duplicated code.**~~
+   - **Done:**
+     - One `add64` (`common.glsl`).
+     - One SAND word index (`sand_index`), used by both passes.
+     - The `PIECE==2` guide is `guide_row`.
+     - The pixel packing is one macro shared by C and GLSL (`shaders/pack.h`).
+6. ~~**Names and comments.**~~
+   - **Done:**
+     - `spv_p2`.
+     - `PI_MMR_SPLIT` and `PI_MMR_EXACT`.
+     - Comments: two passes, every mode, `PI_MARK`'s values.
+     - `--filters phase` (`yblod` still accepted).
+     - `mode_name()` in place of the nested ternary.
+     - Named constants: `T_*`, `PI_PACKET_PIXELS`, `PI_MOD_VENDOR_BROADCOM`
+       and `PI_MOD_SAND128`, and the alpha inside `PI_PACK`.
+7. ~~**`pi_submit` is 207 lines.**~~
+   - **Done:** `pi_render` is split into the plan, `prepare` (the tables,
+     per planner generation), `bind_inputs`, `frame_params`, `keys`,
+     `record` and `submit`.
+   - A context copies the tables only when `tables_generation` (or the
+     route) changed since its last copy.
+8. ~~**Tools.**~~
+   - **Done:**
+     - `vk-micro`, `bench/micro/` and `probe-dmabuf` are removed;
+       `dvbench --probe` replaces the latter.
+     - EGL and GLES are gone from the build image, the VM and the Pi image.
+     - The P010 layout, `dv_drm` and `dv_is_sand128` are removed.
+       `dv_dmabuf_kind` stays, for `--probe`.
+9. ~~**Build and scripts.**~~
+   - **Done:**
+     - The packages are dropped (nothing used them).
+     - The git branch of `fetch-sources.sh` is dropped, and so are
+       `DV_THREADS` and `.cache/`.
+     - The comments in `source.c`/`.h` and `vm/rpi5dv.yaml` are fixed.
+10. ~~**Test clips.**~~
+    - **Done:** `make-test-clips.sh` has `--name` and `--kinds`, and its
+      header lists how to recreate every golden name. It reads `SECONDS_`
+      consistently and creates `clips/`.
+    - `check.sh --validate` uses the first golden clip that is present.
+11. ~~**The image note.**~~
+    - **Done:** `run-bench.sh` runs each clip with CB1's filters, and reruns
+      it with the phase filters when the plan is refused. The image note
+      says so.
 
 ## What checked out
 
 - The C and GLSL agree on the UBO layout, the descriptor bindings and the
   specialisation constant IDs. There are no push constants.
-- The `exact32` accumulators stay within range. The error in
-  `fprod_split` (about 2⁻¹⁶) is far below the rounding threshold.
+- The error in `fprod_split` (about 2⁻¹⁶) is far below the rounding
+  threshold.
 - The letterbox row window is 8-aligned, so the odd-row case can't happen.
 - `engine/planner/README.md` and `patches/ffmpeg/README.md` match the build.

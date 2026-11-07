@@ -48,6 +48,10 @@ The redesign, in steps:
    at 37 ms.
 7. **A tighter split bound, checked per sample where it fails:** Profile
    8.4 from 184 ms to 31–35 ms, and the 8.1 MMR cuts to 26–28 ms.
+8. **The integration review** (`docs/REVIEW.md`): an API for a long-lived
+   player (streams, imported outputs, sync_file fences, error codes), any
+   stream size (1080p), exact MMR96/128, pipelines cached and built ahead.
+   Fewer shader instructions on the way: 1917 at 33 ms, 8.4 at 31 ms.
 
 Tested on the NAS's real films over SMB: 1917 and Dune.
 

@@ -49,7 +49,7 @@ echo 'chroot: upgrading and installing (several minutes)'
 chroot \$R bash -c 'export DEBIAN_FRONTEND=noninteractive; apt-get update -qq &&
   apt-get -y -qq -o Dpkg::Options::=--force-confold full-upgrade >/dev/null &&
   apt-get install -y -qq --no-install-recommends mesa-vulkan-drivers libvulkan1 vulkan-tools mesa-utils-bin \
-    libegl1 libgles2 libegl-mesa0 v4l-utils python3 htop >/dev/null && apt-get clean'
+    v4l-utils python3 htop >/dev/null && apt-get clean'
 chroot \$R dpkg-query -W mesa-vulkan-drivers linux-image-rpi-2712 | sed 's/^/installed: /'
 bash '$ROOT/image/customize.sh' \$R '$BUNDLE' '$CLIPS'
 rm -f \$R/usr/sbin/policy-rc.d; rm -f \$R/etc/resolv.conf; mv \$R/etc/resolv.conf.orig \$R/etc/resolv.conf

@@ -27,6 +27,9 @@ own HEVC decoder.
   cd ~ && dvbench/run-bench.sh --quick clips/*      # correctness only, a few minutes
   cd ~ && dvbench/run-bench.sh clips/*              # everything (a few minutes a clip)
 
+Each clip gets CB1's filters, or yblod's when CB1's contract refuses it
+(profile 8.1 MMR clips); the summary says which. It exits 1 on any failure.
+
 Results land in ~/results/HOST-DATE/. Copy that directory back, e.g. from
 your computer:  scp -r dv@dvbench.local:results .   (or the Pi's IP address)
 

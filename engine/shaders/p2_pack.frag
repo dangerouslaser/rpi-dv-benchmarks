@@ -27,7 +27,7 @@ layout(location = 0) out uvec2 o_even;   // row 2k:   pixels 2px, 2px+1
 layout(location = 1) out uvec2 o_odd;    // row 2k+1
 layout(constant_id = 1) const uint ANNEXB = 1;
 layout(constant_id = 2) const uint TOP_LEFT = 0;
-// Measurement only (PI_ABLATE): 1 no luma tables, 2 no EL gathers, 4 no chroma
+// Measurement only (pi_options.ablate): 1 no luma tables, 2 no EL gathers, 4 no chroma
 // rows, 8 no SAND reads, 16 the pass with no work, 32 no tunnel packing, 64 no 4:2:2 filter.
 layout(constant_id = 3) const uint ABLATE = 0;
 layout(constant_id = 4) const uint BARS = 0;
@@ -46,8 +46,9 @@ uvec4 bl_block(uint x, uint y0)
 {
     if ((ABLATE & 8u) != 0u)
         return uvec4(x, x + 1u, x + y0, x) & 1023u;
-    uint w = uint(float(x) * 0.33333334 + 0.1), sub = x - 3u * w, b = w * 4u;
-    int i = int(P.bl.x + ((b & 127u) >> 2) + y0 * 32u + (b >> 7) * 32u * P.bl.z);
+    // x + 1 < w: a word's last sample's neighbour is in the row's next word
+    uint w = div3(x), sub = x - 3u * w, b = w * 4u;
+    int i = sand_index(P.bl.x, P.bl.z, w, y0);
     uint a0 = texelFetch(bl_y, i).r, a1 = texelFetch(bl_y, i + 32).r;
     uvec4 v;
     if (sub == 2u) {
@@ -76,13 +77,13 @@ uint finish(uint x, uint y, uint yy, uint c)
         return yy | (c << 16);
     if (y < P.pk.w) {
         uint i = y * P.size.x + x;
-        if (i < P.pk.x * 3072u) {
+        if (i < P.pk.x * PI_PACKET_PIXELS) {
             uint bit_index = i & 1023u;
-            uint bit = (packet_byte((i / 3072u) * 128u + (bit_index >> 3)) >> (7u - (bit_index & 7u))) & 1u;
+            uint bit = (packet_byte((i / PI_PACKET_PIXELS) * 128u + (bit_index >> 3)) >> (7u - (bit_index & 7u))) & 1u;
             c = (c & 4094u) | (bit ^ (uint(bitCount(yy) + bitCount(c >> 1)) & 1u));
         }
     }
-    return (((c & 15u) << 4) | (yy & 15u)) | ((yy >> 4) << 8) | ((c >> 4) << 16) | 0xff000000u;
+    return PI_PACK(yy, c);
 }
 
 vec2 crow(uint cx, int k, int i, int last)

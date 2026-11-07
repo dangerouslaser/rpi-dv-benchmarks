@@ -1,7 +1,7 @@
 #!/bin/bash
 # out/dvbench-rpi5-<rev>.tar.gz: everything the Pi needs beyond Raspberry Pi
-# OS (trixie, 64-bit): dvbench (the engine is linked in), vk-micro,
-# probe-dmabuf, the matched FFmpeg, run-bench.sh. Build first (build-all.sh).
+# OS (trixie, 64-bit): dvbench (the engine is linked in; --probe checks the
+# machine), the matched FFmpeg, run-bench.sh. Build first (build-all.sh).
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 P=$ROOT/build/prefix
@@ -9,8 +9,18 @@ REV=$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo dev)$(git -C "$R
 NAME=dvbench-rpi5-$REV
 STAGE=$ROOT/out/$NAME
 rm -rf "$STAGE" && mkdir -p "$STAGE/bin" "$STAGE/lib"
-cp "$P/bin/dvbench" "$P/bin/probe-dmabuf" "$P/bin/vk-micro" "$STAGE/bin/"
-cp -P "$P"/lib/lib{avcodec,avformat,avutil,avfilter,swscale,swresample,postproc,avdevice}.so* "$STAGE/lib/" 2>/dev/null || true
+cp "$P/bin/dvbench" "$STAGE/bin/"
+# FFmpeg's libraries: the ones dvbench links must be there; the rest of the
+# build (avfilter, swscale, ...) goes along when it was built.
+for lib in avcodec avformat avutil; do
+  ls "$P/lib/lib$lib.so."* >/dev/null 2>&1 || { echo "missing $P/lib/lib$lib.so.*: build FFmpeg first (scripts/build-all.sh)" >&2; exit 1; }
+done
+for lib in avcodec avformat avutil avfilter swscale swresample postproc avdevice; do
+  for f in "$P/lib/lib$lib.so"*; do
+    [ -e "$f" ] || [ -L "$f" ] || continue
+    cp -P "$f" "$STAGE/lib/"
+  done
+done
 cp "$ROOT/bundle/run-bench.sh" "$ROOT/bundle/summarize.py" "$ROOT/bundle/README.md" "$STAGE/"
 {
   echo "bundle $NAME built $(date -u +%Y-%m-%dT%H:%MZ)"

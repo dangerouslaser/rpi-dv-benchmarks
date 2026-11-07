@@ -1,8 +1,8 @@
 # Debian trixie / Raspberry Pi OS trixie packages for building everything
 # (docker/Dockerfile and scripts/install-native-deps.sh both read this).
-build-essential cmake ninja-build meson pkg-config git curl ca-certificates xz-utils patch
-python3 python3-jinja2 python3-markupsafe
+build-essential cmake ninja-build pkg-config git curl ca-certificates xz-utils patch
+python3
 glslc spirv-tools
-libdrm-dev libgbm-dev libegl-dev libgles-dev libudev-dev
-libvulkan-dev vulkan-tools mesa-vulkan-drivers libegl-mesa0 libgl1-mesa-dri libgbm1
+libdrm-dev libudev-dev
+libvulkan-dev vulkan-tools mesa-vulkan-drivers
 zlib1g-dev

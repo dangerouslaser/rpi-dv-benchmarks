@@ -10,13 +10,13 @@
 #                                            any validation error fails)
 # Exit 1 on any difference. dvbench must be on PATH (the VM's is).
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit 2
 VALIDATE=0 MMR=exact
 while [ $# -gt 0 ]; do
   case "$1" in
     --validate) VALIDATE=1 ;;
     --mmr) MMR=$2; shift ;;
-    *) echo "usage: tests/check.sh [--mmr exact|split|exact64|exact32] [--validate]"; exit 2 ;;
+    *) echo "usage: tests/check.sh [--mmr exact|split|exact64] [--validate]"; exit 2 ;;
   esac
   shift
 done
@@ -47,8 +47,20 @@ while IFS= read -r case; do
     fail=1
   fi
 done <<<"$cases"
+# The validation run: the first golden clip in clips/ whose case takes CB1's
+# filters (so both filter sets accept it).
+clip=
 if [ $VALIDATE = 1 ]; then
-  clip=$(grep -v '^#' "$GOLDEN" | head -1 | awk -F' [|] ' '{print $1}')
+  while IFS= read -r case; do
+    if [ -z "${case#* | }" ] && [ -e "clips/${case%% | *}" ]; then clip=${case%% | *}; break; fi
+  done <<<"$cases"
+  if [ -z "$clip" ] && [ $ran -gt 0 ]; then
+    echo "FAIL  validation: no golden clip with CB1's filters in clips/"; fail=1
+  elif [ -z "$clip" ]; then
+    echo "skip  validation: no golden clip in clips/"
+  fi
+fi
+if [ -n "$clip" ]; then
   for opts in "" "--filters yblod"; do
     log=$WORK/validate${opts:+-yblod}.log
     # shellcheck disable=SC2086

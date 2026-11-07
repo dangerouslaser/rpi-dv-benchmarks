@@ -36,7 +36,7 @@ The repo is mounted read-write at the same path inside the VM, so
 
 ```sh
 scripts/vm.sh dvbench --hash clips/X.mkv
-scripts/vm.sh dvbench --filters yblod --mmr float clips/X.mkv
+scripts/vm.sh dvbench --filters phase --mmr float clips/X.mkv
 scripts/vm.sh bash          # a shell, PATH and LD_LIBRARY_PATH set
 limactl stop rpi5dv         # when done; limactl delete rpi5dv to remove it
 ```
@@ -81,10 +81,16 @@ Media isn't in git (`clips/` is ignored). `tests/check.sh` runs the cases in
     test clip, and 6 s of Dune Part Two from 50:00.
 
   `START` and `SECONDS_` set the cut. The script names its output
-  `PREFIX-NAME.mkv` from the source's file name; `tests/check.sh` looks for
-  the exact names in `tests/golden/hashes.txt`, so rename to match (several
-  there, e.g. `p81-All_Layers_Te.mkv` and `p81mmr-al.mkv`, were renamed by
-  hand).
+  `PREFIX-NAME.mkv`, NAME from the source's file name or `--name`;
+  `--kinds` picks which of `p81`, `mmr` and `p81mmr` to make. Its header
+  lists the commands that recreate every golden clip name `tests/check.sh`
+  looks for.
+- **Dolby's samples** (Profiles 5, 8.1, 8.4 at 4K and 1080p):
+  [DolbyLaboratories/dolby-vision-contents](https://github.com/DolbyLaboratories/dolby-vision-contents)'s
+  Sol Levante files, in `clips/dvc/`. The golden cases use 2 s raw-HEVC cuts
+  in `clips/sol/` (`p5|p81|p84-2160|1080-100.hevc`: 100 s in, the parameter
+  sets prepended). These MP4s carry their parameter sets only in the first
+  access unit; `dvbench --start` primes the decoder with them.
 
 Full films (1917, Dune) were measured from the NAS over SMB. See
 `docs/ENGINE.md`.
@@ -93,7 +99,10 @@ Full films (1917, Dune) were measured from the NAS over SMB. See
 
 - **Edit:** `engine/pi_engine.c`, `engine/shaders/*`, and `engine/planner/*`
   (vendored; note changes in its README).
-- **Build:** `scripts/in-docker.sh bash scripts/build-engine.sh`.
+- **Build:** `scripts/in-docker.sh bash scripts/build-engine.sh`. After a
+  shader change, `scripts/in-docker.sh cmake --build /work/build/engine
+  --target update-spirv` refreshes the committed SPIR-V (the build warns
+  while it is stale).
 - **Check:** `scripts/vm.sh tests/check.sh`, then measure on the Pi.
 
 A change that alters output on purpose needs new golden hashes, and a

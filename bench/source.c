@@ -1,28 +1,25 @@
-/* See source.h. The layer split and pairing follow dvvk-mr-compare's decode.c
- * (intel-dv-libreelec yblod-engine/vk/tools).
+/* See source.h.
  * SPDX-License-Identifier: GPL-3.0-or-later */
 #define _GNU_SOURCE
 #include "source.h"
 #include "alloc.h"
+#include "pi_engine.h"
 #include <drm_fourcc.h>
-#include <fcntl.h>
 #include <libavutil/dovi_meta.h>
 #include <libavutil/hwcontext.h>
+#include <libavutil/hwcontext_drm.h>
 #include <libavutil/pixdesc.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/ioctl.h>
-#include <sys/mman.h>
 #include <time.h>
-#include <unistd.h>
 
-#define QUEUE 32
-#define POOL 160
+#define QUEUE 32   /* decoded pictures held per layer */
+#define POOL 160   /* the software path's dmabufs */
 
 /* A dmabuf the software path copies pictures into; reused once released. */
-struct udma {
+struct pooled {
     struct dv_dmabuf buf;
     _Atomic int busy;   /* released by whichever thread frees the picture */
 };
@@ -34,10 +31,11 @@ struct dv_source {
     AVRational time_base;
     AVBufferRef *device;
     AVCodecContext *dec[2];
+    AVPacket *pending[2];   /* a packet the decoder couldn't take yet (its output queue full) */
     AVFrame *queue[2][QUEUE];
     int queued[2];
-    int profile, el_present, eof, nal_size_len;
-    struct udma pool[POOL];
+    int profile, el_present, el_seen, eof, nal_size, warned;
+    struct pooled pool[POOL];
     double copy_ms;
 };
 
@@ -48,13 +46,13 @@ static double cpu_now_ms(void)
     return t.tv_sec * 1e3 + t.tv_nsec / 1e6;
 }
 
-/* ---- udmabuf pictures ---------------------------------------------------- */
+/* ---- software pictures in dmabufs ------------------------------------------ */
 
-static struct udma *udma_get(struct dv_source *s, size_t size)
+static struct pooled *pool_get(struct dv_source *s, size_t size)
 {
-    struct udma *free_slot = NULL;
+    struct pooled *free_slot = NULL;
     for (int i = 0; i < POOL; i++) {
-        struct udma *u = &s->pool[i];
+        struct pooled *u = &s->pool[i];
         if (!u->busy && u->buf.map && u->buf.size == size) {
             u->busy = 1;
             return u;
@@ -72,56 +70,34 @@ static struct udma *udma_get(struct dv_source *s, size_t size)
     return free_slot;
 }
 
-static void udma_release(void *opaque, uint8_t *data)
+static void pool_release(void *opaque, uint8_t *data)
 {
-    ((struct udma *)opaque)->busy = 0;
+    ((struct pooled *)opaque)->busy = 0;
     av_free(data);
 }
 
 static inline size_t align(size_t v, size_t a) { return (v + a - 1) / a * a; }
 
-/* yuv420p10 (or p010) samples, 10-bit values. */
+/* yuv420p10 sample, 10-bit. */
 static inline unsigned sample(const AVFrame *f, int plane, int x, int y)
 {
-    if (f->format == AV_PIX_FMT_P010) {
-        const uint16_t *row = (const uint16_t *)(f->data[plane ? 1 : 0] + (size_t)y * f->linesize[plane ? 1 : 0]);
-        return plane == 0 ? row[x] >> 6 : row[2 * x + (plane - 1)] >> 6;
-    }
     const uint16_t *row = (const uint16_t *)(f->data[plane] + (size_t)y * f->linesize[plane]);
     return row[x] & 0x3ff;
 }
 
-static void write_p010(const AVFrame *f, uint8_t *dst, size_t pitch, size_t chroma_offset)
-{
-    int w = f->width, h = f->height;
-    for (int y = 0; y < h; y++) {
-        uint16_t *row = (uint16_t *)(dst + (size_t)y * pitch);
-        for (int x = 0; x < w; x++)
-            row[x] = (uint16_t)(sample(f, 0, x, y) << 6);
-    }
-    for (int y = 0; y < h / 2; y++) {
-        uint16_t *row = (uint16_t *)(dst + chroma_offset + (size_t)y * pitch);
-        for (int x = 0; x < w / 2; x++) {
-            row[2 * x] = (uint16_t)(sample(f, 1, x, y) << 6);
-            row[2 * x + 1] = (uint16_t)(sample(f, 2, x, y) << 6);
-        }
-    }
-}
-
 /* SAND128 P030: 128-byte columns `colh` rows tall; three 10-bit samples per
- * 32-bit word; luma rows 0..h-1, chroma (U V interleaved) from row `luma_rows`
- * in each column. As the Pi's V4L2_PIX_FMT_NV12_10_COL128. */
+ * 32-bit word; luma rows 0..h-1, chroma (U V interleaved, w samples a row)
+ * from row `luma_rows` in each column. As the Pi's V4L2_PIX_FMT_NV12_10_COL128. */
 static void write_sand30(const AVFrame *f, uint8_t *dst, uint32_t colh, uint32_t luma_rows)
 {
     int w = f->width, h = f->height;
     for (int plane = 0; plane < 2; plane++) {
         int rows = plane ? h / 2 : h;
-        int samples = plane ? w : w; /* chroma: w/2 pairs = w samples */
         size_t base = plane ? (size_t)luma_rows * 128 : 0;
         for (int y = 0; y < rows; y++) {
-            for (int n0 = 0; n0 < samples; n0 += 3) {
+            for (int n0 = 0; n0 < w; n0 += 3) {
                 uint32_t word = 0;
-                for (int k = 0; k < 3 && n0 + k < samples; k++) {
+                for (int k = 0; k < 3 && n0 + k < w; k++) {
                     int n = n0 + k;
                     unsigned v = plane ? sample(f, 1 + (n & 1), n >> 1, y) : sample(f, 0, n, y);
                     word |= (uint32_t)v << (10 * k);
@@ -134,59 +110,50 @@ static void write_sand30(const AVFrame *f, uint8_t *dst, uint32_t colh, uint32_t
     }
 }
 
-/* A software-decoded picture as a DRM PRIME frame on a udmabuf, described as
+/* A software-decoded picture as a DRM PRIME frame on a dmabuf, described as
  * the Pi decoder describes its own (one object, one layer, two planes). */
 static AVFrame *to_drm(struct dv_source *s, AVFrame *sw)
 {
-    if (sw->format != AV_PIX_FMT_YUV420P10 && sw->format != AV_PIX_FMT_P010) {
-        fprintf(stderr, "source: software decoder gave %s, need 10-bit 4:2:0\n", av_get_pix_fmt_name(sw->format));
+    if (sw->format != AV_PIX_FMT_YUV420P10) {
+        fprintf(stderr, "source: software decoder gave %s, need yuv420p10\n", av_get_pix_fmt_name(sw->format));
         return NULL;
     }
     double c0 = cpu_now_ms();
     int w = sw->width, h = sw->height;
+    uint32_t luma_rows = (uint32_t)align((size_t)h, 16), colh = luma_rows * 3 / 2;
+    size_t columns = ((size_t)w + 95) / 96;
+    size_t size = align(columns * 128 * colh, 4096);   /* dmabuf sizes are whole pages */
+    uint64_t modifier = DRM_FORMAT_MOD_BROADCOM_SAND128_COL_HEIGHT(colh);
     AVDRMFrameDescriptor *desc = av_mallocz(sizeof(*desc));
-    AVDRMLayerDescriptor *layer = &desc->layers[0];
-    size_t size;
-    uint64_t modifier;
-    if (s->o.layout == DV_LAYOUT_SAND30) {
-        uint32_t luma_rows = (uint32_t)align((size_t)h, 16), colh = luma_rows * 3 / 2;
-        size_t columns = ((size_t)w + 95) / 96;
-        size = columns * 128 * colh;
-        modifier = DV_MOD_SAND128(colh);
-        layer->format = DRM_FORMAT_P030;
-        layer->planes[1].offset = (ptrdiff_t)luma_rows * 128;
-        layer->planes[0].pitch = layer->planes[1].pitch = w * 2; /* as FFmpeg's V4L2 request code */
-    } else {
-        size_t pitch = align((size_t)w * 2, 256);
-        size = pitch * (size_t)h * 3 / 2;
-        modifier = DRM_FORMAT_MOD_LINEAR;
-        layer->format = DRM_FORMAT_P010;
-        layer->planes[1].offset = (ptrdiff_t)(pitch * (size_t)h);
-        layer->planes[0].pitch = layer->planes[1].pitch = (ptrdiff_t)pitch;
-    }
-    size = align(size, 4096); /* dmabuf sizes are whole pages */
-    struct udma *u = udma_get(s, size);
+    AVFrame *f = av_frame_alloc();
+    struct pooled *u = desc && f ? pool_get(s, size) : NULL;
     if (!u) {
         av_free(desc);
+        av_frame_free(&f);
         return NULL;
     }
+    AVDRMLayerDescriptor *layer = &desc->layers[0];
+    layer->format = DRM_FORMAT_P030;
+    layer->nb_planes = 2;
+    layer->planes[1].offset = (ptrdiff_t)luma_rows * 128;
+    layer->planes[0].pitch = layer->planes[1].pitch = w * 2;   /* as FFmpeg's V4L2 request code */
     dv_dmabuf_cpu(&u->buf, 1, 1);
-    if (s->o.layout == DV_LAYOUT_SAND30)
-        write_sand30(sw, u->buf.map, dv_sand_height(modifier), (uint32_t)(layer->planes[1].offset / 128));
-    else
-        write_p010(sw, u->buf.map, (size_t)layer->planes[0].pitch, (size_t)layer->planes[1].offset);
+    write_sand30(sw, u->buf.map, colh, luma_rows);
     dv_dmabuf_cpu(&u->buf, 0, 1);
     desc->nb_objects = 1;
     desc->objects[0] = (AVDRMObjectDescriptor){.fd = u->buf.fd, .size = size, .format_modifier = modifier};
     desc->nb_layers = 1;
-    layer->nb_planes = 2;
-
-    AVFrame *f = av_frame_alloc();
+    f->buf[0] = av_buffer_create((uint8_t *)desc, sizeof(*desc), pool_release, u, 0);
+    if (!f->buf[0]) {
+        u->busy = 0;
+        av_free(desc);
+        av_frame_free(&f);
+        return NULL;
+    }
     f->format = AV_PIX_FMT_DRM_PRIME;
     f->width = w;
     f->height = h;
     f->data[0] = (uint8_t *)desc;
-    f->buf[0] = av_buffer_create((uint8_t *)desc, sizeof(*desc), udma_release, u, 0);
     av_frame_copy_props(f, sw);
     s->copy_ms += cpu_now_ms() - c0;
     return f;
@@ -207,11 +174,13 @@ static enum AVPixelFormat pick_drm(AVCodecContext *c, const enum AVPixelFormat *
 static AVCodecContext *open_decoder(struct dv_source *s, const AVCodecParameters *par, int hw)
 {
     const AVCodec *codec = avcodec_find_decoder(par->codec_id);
-    AVCodecContext *c = avcodec_alloc_context3(codec);
+    AVCodecContext *c = codec ? avcodec_alloc_context3(codec) : NULL;
     if (!c || avcodec_parameters_to_context(c, par) < 0)
-        return NULL;
+        goto fail;
     if (hw) {
         c->hw_device_ctx = av_buffer_ref(s->device);
+        if (!c->hw_device_ctx)
+            goto fail;
         c->get_format = pick_drm;
         c->extra_hw_frames = s->o.extra_frames;
     } else {
@@ -219,42 +188,11 @@ static AVCodecContext *open_decoder(struct dv_source *s, const AVCodecParameters
     }
     c->pkt_timebase = s->time_base;
     if (avcodec_open2(c, codec, NULL) < 0)
-        return NULL;
+        goto fail;
     return c;
-}
-
-/* Single-track Profile 7: BL = all NALs but 63; EL = each NAL 63's payload. */
-static int split_packet(const struct dv_source *s, const AVPacket *in, AVPacket *out, int el)
-{
-    size_t room = (size_t)in->size + 64 * 4;
-    if (av_new_packet(out, (int)room) < 0)
-        return AVERROR(ENOMEM);
-    size_t n = 0;
-    const uint8_t *q = in->data, *end = in->data + in->size;
-    while (end - q > s->nal_size_len) {
-        uint32_t len = 0;
-        for (int i = 0; i < s->nal_size_len; i++)
-            len = len << 8 | q[i];
-        q += s->nal_size_len;
-        if (len < 2 || len > (size_t)(end - q))
-            break;
-        int type = (q[0] >> 1) & 63;
-        if (el && type == 63 && len > 2) {
-            static const uint8_t start[4] = {0, 0, 0, 1};
-            if (n + 4 + len - 2 > room)
-                break;
-            memcpy(out->data + n, start, 4);
-            memcpy(out->data + n + 4, q + 2, len - 2);
-            n += 4 + len - 2;
-        } else if (!el && type != 63) {
-            memcpy(out->data + n, q - s->nal_size_len, s->nal_size_len + len);
-            n += s->nal_size_len + len;
-        }
-        q += len;
-    }
-    av_packet_copy_props(out, in);
-    out->size = (int)n;
-    return 0;
+fail:
+    avcodec_free_context(&c);
+    return NULL;
 }
 
 static void prime_parameter_sets(struct dv_source *s, const AVCodecParameters *par);
@@ -262,8 +200,10 @@ static void prime_parameter_sets(struct dv_source *s, const AVCodecParameters *p
 struct dv_source *dv_source_open(const char *path, const struct dv_source_options *o)
 {
     struct dv_source *s = calloc(1, sizeof(*s));
+    if (!s)
+        return NULL;
     s->o = *o;
-    s->nal_size_len = 4;
+    s->nal_size = 4;
     if (avformat_open_input(&s->fmt, path, NULL, NULL) < 0 || avformat_find_stream_info(s->fmt, NULL) < 0)
         goto fail;
     s->stream = av_find_best_stream(s->fmt, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
@@ -292,9 +232,12 @@ struct dv_source *dv_source_open(const char *path, const struct dv_source_option
             fprintf(stderr, "source: Profile 7 needs hvcC (MKV/MP4)\n");
             goto fail;
         }
-        s->nal_size_len = (par->extradata[21] & 3) + 1;
+        s->nal_size = (par->extradata[21] & 3) + 1;
         AVCodecParameters *elp = avcodec_parameters_alloc();
-        avcodec_parameters_copy(elp, par);
+        if (!elp || avcodec_parameters_copy(elp, par) < 0) {
+            avcodec_parameters_free(&elp);
+            goto fail;
+        }
         av_freep(&elp->extradata);
         elp->extradata_size = 0;
         s->dec[1] = open_decoder(s, elp, hw && !o->el_software);
@@ -357,12 +300,14 @@ AVRational dv_source_rate(const struct dv_source *s)
     return s->fmt->streams[s->stream]->avg_frame_rate;
 }
 
+/* Decoded pictures into the layer's queue, until it is full or the decoder
+ * has none ready. */
 static int drain_decoder(struct dv_source *s, int layer)
 {
-    for (;;) {
-        if (s->queued[layer] >= QUEUE)
-            return 0;
+    while (s->queued[layer] < QUEUE) {
         AVFrame *f = av_frame_alloc();
+        if (!f)
+            return AVERROR(ENOMEM);
         int r = avcodec_receive_frame(s->dec[layer], f);
         if (r < 0) {
             av_frame_free(&f);
@@ -375,26 +320,53 @@ static int drain_decoder(struct dv_source *s, int layer)
                 return AVERROR(EINVAL);
             f = d;
         }
+        if (layer)
+            s->el_seen = 1;
         s->queue[layer][s->queued[layer]++] = f;
+    }
+    return 0;
+}
+
+/* Sends pkt (NULL: flush) to the layer's decoder. 0 sent; 1 not taken (the
+ * layer's queue is full: send it again once pictures are taken); <0 error. */
+static int send_layer(struct dv_source *s, int layer, const AVPacket *pkt)
+{
+    for (;;) {
+        int r = avcodec_send_packet(s->dec[layer], pkt);
+        if (r == AVERROR(EAGAIN)) {
+            int d = drain_decoder(s, layer);
+            if (d < 0)
+                return d;
+            if (s->queued[layer] >= QUEUE)
+                return 1;
+            continue;
+        }
+        if (r < 0 && r != AVERROR_EOF)
+            return r;
+        return drain_decoder(s, layer);
     }
 }
 
-static int feed(struct dv_source *s, int layer, const AVPacket *pkt)
+/* The layer's share of a stream packet: single-layer, the packet; Profile 7,
+ * pi_p7_split's. NULL if empty. */
+static AVPacket *layer_packet(struct dv_source *s, int layer, const AVPacket *in)
 {
-    if (!s->dec[1]) {
-        int r = avcodec_send_packet(s->dec[0], pkt);
-        return r == AVERROR_EOF || r == AVERROR(EAGAIN) ? 0 : r;
-    }
-    if (!pkt) {
-        avcodec_send_packet(s->dec[layer], NULL);
-        return 0;
-    }
     AVPacket *out = av_packet_alloc();
-    int r = split_packet(s, pkt, out, layer);
-    if (!r && out->size)
-        r = avcodec_send_packet(s->dec[layer], out);
-    av_packet_free(&out);
-    return r == AVERROR(EAGAIN) ? 0 : r;
+    if (!out)
+        return NULL;
+    if (!s->dec[1]) {
+        if (av_packet_ref(out, in) < 0)
+            av_packet_free(&out);
+        return out;
+    }
+    int room = in->size + 64 * 4;
+    int n = av_new_packet(out, room) < 0 ? -1 : pi_p7_split(in->data, in->size, s->nal_size, layer, out->data, room);
+    if (n <= 0 || av_packet_copy_props(out, in) < 0) {
+        av_packet_free(&out);
+        return NULL;
+    }
+    out->size = n;
+    return out;
 }
 
 static AVFrame *pop(struct dv_source *s, int layer)
@@ -404,53 +376,103 @@ static AVFrame *pop(struct dv_source *s, int layer)
     return f;
 }
 
+/* The next picture from the queues; 0 if none can be made yet. The layers
+ * pair in output order: each decoder outputs in display order, so the k-th
+ * BL and EL pictures share a POC. Not by timestamp: an EL picture's is its
+ * packet's, and where the EL's coding order differs from the packets' (the
+ * "All Layers" test clip) EL timestamps don't follow display order. */
+static int take(struct dv_source *s, struct dv_picture *p, int layers)
+{
+    if (!s->queued[0])
+        return 0;
+    if (layers == 2 && !s->queued[1] && s->queued[0] < QUEUE && s->eof < 2)
+        return 0;   /* wait for its EL */
+    p->bl = pop(s, 0);
+    if (layers == 2 && s->queued[1])
+        p->el = pop(s, 1);
+    else if (layers == 2 && !s->warned++)
+        fprintf(stderr, "source: a base-layer picture without its enhancement layer\n");
+    p->dovi = av_frame_get_side_data(p->bl, AV_FRAME_DATA_DOVI_METADATA);
+    if (!p->dovi && p->el)
+        p->dovi = av_frame_get_side_data(p->el, AV_FRAME_DATA_DOVI_METADATA);
+    return 1;
+}
+
 int dv_source_next(struct dv_source *s, struct dv_picture *p)
 {
     memset(p, 0, sizeof(*p));
     for (;;) {
         int layers = s->dec[1] ? 2 : 1;
-        if (layers == 2 && s->queued[1] == 0 && (s->queued[0] >= 8 || s->eof == 2)) {
+        if (layers == 2 && !s->el_seen && (s->queued[0] >= 8 || s->eof == 2)) {
             fprintf(stderr, "source: no enhancement-layer pictures; base layer only\n");
             avcodec_free_context(&s->dec[1]);
+            av_packet_free(&s->pending[1]);
             layers = 1;
         }
-        if (s->queued[0] > 0 && (layers == 1 || s->queued[1] > 0)) {
-            p->bl = pop(s, 0);
-            if (layers == 2)
-                p->el = pop(s, 1);
-            p->dovi = av_frame_get_side_data(p->bl, AV_FRAME_DATA_DOVI_METADATA);
-            if (!p->dovi && p->el)
-                p->dovi = av_frame_get_side_data(p->el, AV_FRAME_DATA_DOVI_METADATA);
+        if (take(s, p, layers))
             return 1;
+        /* packets the decoders couldn't take: again, now pictures are gone */
+        int blocked = 0;
+        for (int l = 0; l < layers; l++)
+            if (s->pending[l]) {
+                int r = send_layer(s, l, s->pending[l]);
+                if (r < 0)
+                    return r;
+                if (r == 0)
+                    av_packet_free(&s->pending[l]);
+                blocked |= r == 1;
+            }
+        if (blocked) {
+            if (take(s, p, layers))
+                return 1;
+            fprintf(stderr, "source: decoders stalled\n");
+            return AVERROR(EAGAIN);
         }
-        if (s->eof == 2)
+        if (s->eof == 2) {   /* flushed: the decoders' last pictures, as the queues empty */
+            int got = 0;
+            for (int l = 0; l < layers; l++) {
+                int before = s->queued[l], r = drain_decoder(s, l);
+                if (r < 0)
+                    return r;
+                got |= s->queued[l] != before;
+            }
+            if (got)
+                continue;
             return 0;
+        }
         if (s->eof) {
             s->eof = 2;
             for (int l = 0; l < layers; l++) {
-                feed(s, l, NULL);
-                drain_decoder(s, l);
+                int r = send_layer(s, l, NULL);
+                if (r < 0)
+                    return r;
             }
             continue;
         }
         AVPacket *pkt = av_packet_alloc();
+        if (!pkt)
+            return AVERROR(ENOMEM);
         if (av_read_frame(s->fmt, pkt) < 0) {
             av_packet_free(&pkt);
             s->eof = 1;
             continue;
         }
-        if (pkt->stream_index == s->stream) {
+        if (pkt->stream_index == s->stream)
             for (int l = 0; l < layers; l++) {
-                int r = feed(s, l, pkt);
-                if (r >= 0)
-                    r = drain_decoder(s, l);
+                AVPacket *lp = layer_packet(s, l, pkt);
+                if (!lp)
+                    continue;
+                int r = send_layer(s, l, lp);
+                if (r == 1)
+                    s->pending[l] = lp;
+                else
+                    av_packet_free(&lp);
                 if (r < 0) {
                     fprintf(stderr, "source: layer %d: %s\n", l, av_err2str(r));
                     av_packet_free(&pkt);
                     return r;
                 }
             }
-        }
         av_packet_free(&pkt);
     }
 }
@@ -468,6 +490,7 @@ void dv_source_close(struct dv_source *s)
     for (int l = 0; l < 2; l++) {
         while (s->queued[l])
             av_frame_free(&s->queue[l][--s->queued[l]]);
+        av_packet_free(&s->pending[l]);
         avcodec_free_context(&s->dec[l]);
     }
     av_buffer_unref(&s->device);

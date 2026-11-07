@@ -87,3 +87,53 @@ p81mmr-dune2.mkv | --filters yblod | 002 | 93670cb1b5acedad
 p81mmr-dune2.mkv | --filters yblod | 003 | 4390a6b4fc108a05
 p81mmr-dune2.mkv | --filters yblod | 004 | 33e22c1bfb857351
 p81mmr-dune2.mkv | --filters yblod | 005 | 58019c160c10690d
+# Added 2026-11-07, verified on the same day:
+#   sol/*: Dolby's Sol Levante samples (clips/sol, docs/SETUP.md). The 4K 5 and
+#   8.1 cuts, and 8.4 with --filters yblod, are identical to yblod's engine;
+#   8.4 under cb1 has no yblod reference (it refuses it): exact, split and
+#   exact64 agree on V3D. 1080p: identical to yblod's render of the same
+#   pictures centred in a 4K canvas, but for the metadata packets' LSBs.
+#   --measure force_wide: the 128-bit MMR path on a 64-bit LUT stream; equal
+#   to that clip's default case.
+sol/p5-2160-100.hevc |  | 000 | 5b78fd7fc5eaa46a
+sol/p5-2160-100.hevc |  | 001 | c917dd06b11f866a
+sol/p5-2160-100.hevc |  | 002 | f2614066aa55f974
+sol/p5-2160-100.hevc |  | 003 | b357af146863072f
+sol/p5-2160-100.hevc |  | 004 | 72c1ea9881b5ebcc
+sol/p5-2160-100.hevc |  | 005 | d34a87e49a8c95c7
+sol/p81-2160-100.hevc |  | 000 | 8e218d2a58db3ce5
+sol/p81-2160-100.hevc |  | 001 | a3399542f9baf681
+sol/p81-2160-100.hevc |  | 002 | 02882b011b939935
+sol/p81-2160-100.hevc |  | 003 | d0737a0f66639d69
+sol/p81-2160-100.hevc |  | 004 | 500c20a86c537d85
+sol/p81-2160-100.hevc |  | 005 | 188bc68df64f7a9d
+sol/p84-2160-100.hevc |  | 000 | f376f0a4383dbf67
+sol/p84-2160-100.hevc |  | 001 | 16736429664f3e9d
+sol/p84-2160-100.hevc |  | 002 | 7eddd8209bb3ec96
+sol/p84-2160-100.hevc |  | 003 | 97cdcdb16e1a4014
+sol/p84-2160-100.hevc |  | 004 | b74e23068da77a1c
+sol/p84-2160-100.hevc |  | 005 | 44b7f8d873ed61ee
+sol/p84-2160-100.hevc | --filters yblod | 000 | 2220ae8d19e2eca7
+sol/p84-2160-100.hevc | --filters yblod | 001 | b8f35d7c3ee24cfd
+sol/p84-2160-100.hevc | --filters yblod | 002 | 59e227492c48fe26
+sol/p84-2160-100.hevc | --filters yblod | 003 | f4d42a88440c9c84
+sol/p84-2160-100.hevc | --filters yblod | 004 | 70a802d6930dfe1c
+sol/p84-2160-100.hevc | --filters yblod | 005 | 43435a219b6d850e
+sol/p5-1080-100.hevc |  | 000 | cacc2f7f790491af
+sol/p5-1080-100.hevc |  | 001 | 9bcb30cbd4301a0b
+sol/p5-1080-100.hevc |  | 002 | ca2a2787d9d3fddb
+sol/p5-1080-100.hevc |  | 003 | 2d6a626f0f560987
+sol/p5-1080-100.hevc |  | 004 | a507726f0dd1dbfd
+sol/p5-1080-100.hevc |  | 005 | c8387fcd3e880527
+sol/p84-1080-100.hevc | --filters yblod | 000 | ecd954b1c31dde64
+sol/p84-1080-100.hevc | --filters yblod | 001 | a25ed558285aadc5
+sol/p84-1080-100.hevc | --filters yblod | 002 | 9cdfc5c01fdfdd67
+sol/p84-1080-100.hevc | --filters yblod | 003 | 76393e1ebbe3745a
+sol/p84-1080-100.hevc | --filters yblod | 004 | f63205439a966f78
+sol/p84-1080-100.hevc | --filters yblod | 005 | 81fc17331392d00f
+DV FEL Power Rangers Credits Test.mkv | --measure force_wide | 000 | 4e4d363c2c133115
+DV FEL Power Rangers Credits Test.mkv | --measure force_wide | 001 | 3ecfa4a41087f236
+DV FEL Power Rangers Credits Test.mkv | --measure force_wide | 002 | d090704d2a82f8e3
+DV FEL Power Rangers Credits Test.mkv | --measure force_wide | 003 | 4162bcb7cdd3025a
+DV FEL Power Rangers Credits Test.mkv | --measure force_wide | 004 | 4474c8d481f9b92f
+DV FEL Power Rangers Credits Test.mkv | --measure force_wide | 005 | 98415e452cef8ffa

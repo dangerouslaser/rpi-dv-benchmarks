@@ -25,10 +25,10 @@ if ! limactl list -q 2>/dev/null | grep -qx "$VM"; then
   rm -f "$cfg"
 fi
 limactl start --tty=false "$VM"
-# Verify: udmabuf, EGL/GLES and Vulkan dmabuf import (needs the build).
-if [ -x "$ROOT/build/prefix/bin/probe-dmabuf" ]; then
-  "$ROOT/scripts/vm.sh" "$ROOT/build/prefix/bin/probe-dmabuf"
+# Verify: the dmabuf allocator, the Vulkan device and an output import (needs the build).
+if [ -x "$ROOT/build/prefix/bin/dvbench" ]; then
+  "$ROOT/scripts/vm.sh" dvbench --probe
 else
-  echo "(run scripts/build-all.sh, then scripts/vm.sh build/prefix/bin/probe-dmabuf to verify dmabuf import)"
+  echo "(run scripts/build-all.sh, then scripts/vm.sh dvbench --probe to verify dmabuf import)"
 fi
 echo "vm $VM ready: scripts/vm.sh CMD..."
