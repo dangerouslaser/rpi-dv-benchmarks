@@ -37,6 +37,9 @@
 static const uint32_t spv_vert[] =
 #include "shaders/fullscreen.vert.h"
     ;
+static const uint32_t spv_p0[] =
+#include "shaders/p0_elv.frag.h"
+    ;
 static const uint32_t spv_p1[] =
 #include "shaders/p1_chroma.frag.h"
     ;
@@ -83,12 +86,14 @@ static const struct {
     {8, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER},  /* P1's EL luma */
     {10, VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER},   /* tables, RGBA32UI */
     {11, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER},         /* route 3: dv_single_reshape */
+    {12, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER}, /* P0's EL chroma, filtered vertically */
 };
 enum { NB = sizeof(bindings) / sizeof(bindings[0]) };
 
-/* Specialisation keys: P1's constant ids 0..14, P2's 1..7. */
+/* Specialisation keys: P1's constant ids 0..14, and K1_PRE, which selects P0's
+ * shader (its METHOD and ELUP are P1's ids); P2's 1..7. */
 enum { K1_MODE, K1_METHOD, K1_DUAL, K1_KIND0, K1_KIND1, K1_ORDER0, K1_ORDER1, K1_SINGLE, K1_PIECE, K1_ORDER2,
-       K1_FAST, K1_MARK, K1_GUARD, K1_ELUP, K1_ELOUT, K1_N };
+       K1_FAST, K1_MARK, K1_GUARD, K1_ELUP, K1_ELOUT, K1_PRE, K1_N };
 enum { K2_ANNEXB, K2_TOP_LEFT, K2_ABLATE, K2_BARS, K2_SINGLE, K2_FULL422, K2_ELUP, K2_N };
 enum { MAX_SPEC = 16, KEY_MAX = K1_N };
 _Static_assert((int)K1_N <= (int)MAX_SPEC && (int)K2_N + 1 <= (int)MAX_SPEC, "a specialisation map fits its entries");
@@ -146,6 +151,9 @@ struct pi_output {
 struct ctx {
     struct image c420, ely;
     VkFramebuffer fb;
+    struct image elv;     /* P0's target: the EL chroma's vertical filter, ew x ch (Annex B, bicubic, Lanczos) */
+    VkFramebuffer fb0;
+    int elv_read;         /* elv is in SHADER_READ_ONLY_OPTIMAL (P0 has run, or the transition below) */
     VkBuffer tables, ubo, reshape;
     VkDeviceMemory tables_mem, ubo_mem, reshape_mem;
     uint32_t *tmap;
@@ -214,7 +222,7 @@ struct pi_engine {
     VkDescriptorSetLayout dsl;
     VkPipelineLayout pl;
     VkDescriptorPool dpool;
-    VkRenderPass rp[2];   /* P1, P2 */
+    VkRenderPass rp[3];   /* P1, P2, P0 */
     VkPipelineCache cache;
 
     pthread_mutex_t lock;   /* the variants and the prewarm queue */
@@ -560,7 +568,7 @@ static int render_pass(struct pi_engine *e, int n, const VkFormat *formats, VkIm
 /* ---- pipelines ------------------------------------------------------------------ */
 
 static int pipeline(struct pi_engine *e, const uint32_t *spv, size_t bytes, VkRenderPass rp, const uint32_t *spec,
-                    uint32_t nspec, uint32_t first, VkPipeline *p)
+                    uint32_t nspec, uint32_t first, uint32_t attachments, VkPipeline *p)
 {
     VkShaderModuleCreateInfo mi = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = bytes, .pCode = spv};
     VkShaderModule fs = VK_NULL_HANDLE, vs = VK_NULL_HANDLE;
@@ -590,7 +598,7 @@ static int pipeline(struct pi_engine *e, const uint32_t *spv, size_t bytes, VkRe
                                                .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT};
     VkPipelineColorBlendAttachmentState cba[2] = {{.colorWriteMask = 0xf}, {.colorWriteMask = 0xf}};
     VkPipelineColorBlendStateCreateInfo cbs = {.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
-                                               .attachmentCount = 2, .pAttachments = cba};
+                                               .attachmentCount = attachments, .pAttachments = cba};
     VkDynamicState dyn[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
     VkPipelineDynamicStateCreateInfo ds = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
                                            .dynamicStateCount = 2, .pDynamicStates = dyn};
@@ -635,8 +643,10 @@ static VkPipeline build(struct pi_engine *e, int p2, const uint32_t *key)
         return p;
     double t0 = now_ms();
     VkPipeline made;
-    if (p2 ? pipeline(e, spv_p2, sizeof(spv_p2), e->rp[1], key, n, 1, &made)
-           : pipeline(e, spv_p1, sizeof(spv_p1), e->rp[0], key, n, 0, &made))
+    int pre = !p2 && key[K1_PRE];   /* P0: its own shader and one-target pass, keyed with P1's selectors */
+    if (p2 ? pipeline(e, spv_p2, sizeof(spv_p2), e->rp[1], key, n, 1, 2, &made)
+         : pre ? pipeline(e, spv_p0, sizeof(spv_p0), e->rp[2], key, n, 0, 1, &made)
+               : pipeline(e, spv_p1, sizeof(spv_p1), e->rp[0], key, n, 0, 2, &made))
         return VK_NULL_HANDLE;
     pthread_mutex_lock(&e->lock);
     p = find_locked(s, key, n);   /* the other thread may have made it meanwhile */
@@ -657,7 +667,7 @@ static VkPipeline build(struct pi_engine *e, int p2, const uint32_t *key)
     pthread_mutex_unlock(&e->lock);
     if (made)
         vkDestroyPipeline(e->dev, made, NULL);
-    logf_(e, PI_LOG_DEBUG, "pipeline %s variant made in %.0f ms", p2 ? "P2" : "P1", now_ms() - t0);
+    logf_(e, PI_LOG_DEBUG, "pipeline %s variant made in %.0f ms", p2 ? "P2" : pre ? "P0" : "P1", now_ms() - t0);
     return p;
 }
 
@@ -1045,6 +1055,7 @@ static int create(struct pi_engine *e)
     const VkFormat f1[2] = {VK_FORMAT_R16G16_UINT, VK_FORMAT_R16_UINT},
                    f2[2] = {VK_FORMAT_R32G32_UINT, VK_FORMAT_R32G32_UINT};
     if ((rc = render_pass(e, 2, f1, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 0, &e->rp[0])) ||
+        (rc = render_pass(e, 1, f1, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 0, &e->rp[2])) ||
         (rc = render_pass(e, 2, f2, e->modifiers ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, 1,
                           &e->rp[1])))
         return rc;
@@ -1228,9 +1239,12 @@ static void stream_images_destroy(struct pi_engine *e)
     for (int k = 0; k < PI_FRAMES_IN_FLIGHT; k++) {
         struct ctx *c = &e->c[k];
         vkDestroyFramebuffer(e->dev, c->fb, NULL);
-        c->fb = VK_NULL_HANDLE;
+        vkDestroyFramebuffer(e->dev, c->fb0, NULL);
+        c->fb = c->fb0 = VK_NULL_HANDLE;
         image_destroy(e, &c->c420);
         image_destroy(e, &c->ely);
+        image_destroy(e, &c->elv);
+        c->elv_read = 0;
     }
 }
 
@@ -1275,7 +1289,8 @@ int pi_stream_open(struct pi_engine *e, const struct pi_stream_info *info)
             struct ctx *c = &e->c[k];
             int rc;
             if ((rc = image(e, &c->c420, VK_FORMAT_R16G16_UINT, cw, ch, rt)) ||
-                (rc = image(e, &c->ely, VK_FORMAT_R16_UINT, cw, ch, rt))) {
+                (rc = image(e, &c->ely, VK_FORMAT_R16_UINT, cw, ch, rt)) ||
+                (rc = image(e, &c->elv, VK_FORMAT_R16G16_UINT, cw / 2, ch, rt))) {
                 stream_images_destroy(e);
                 e->w = e->h = 0;
                 return rc;
@@ -1285,15 +1300,20 @@ int pi_stream_open(struct pi_engine *e, const struct pi_stream_info *info)
                                            .attachmentCount = 2, .pAttachments = v, .width = cw, .height = ch,
                                            .layers = 1};
             VKC(e, vkCreateFramebuffer(e->dev, &fbi, NULL, &c->fb));
-            VkDescriptorImageInfo ii[2] = {{e->sampler, c->c420.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
-                                           {e->sampler, c->ely.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}};
-            VkWriteDescriptorSet wr[2];
-            for (int i = 0; i < 2; i++)
+            VkFramebufferCreateInfo fb0 = {.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, .renderPass = e->rp[2],
+                                           .attachmentCount = 1, .pAttachments = &c->elv.view, .width = cw / 2,
+                                           .height = ch, .layers = 1};
+            VKC(e, vkCreateFramebuffer(e->dev, &fb0, NULL, &c->fb0));
+            VkDescriptorImageInfo ii[3] = {{e->sampler, c->c420.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+                                           {e->sampler, c->ely.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+                                           {e->sampler, c->elv.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}};
+            VkWriteDescriptorSet wr[3];
+            for (int i = 0; i < 3; i++)
                 wr[i] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = c->ds,
-                                               .dstBinding = 7u + (uint32_t)i, .descriptorCount = 1,
+                                               .dstBinding = i < 2 ? 7u + (uint32_t)i : 12u, .descriptorCount = 1,
                                                .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                                                .pImageInfo = &ii[i]};
-            vkUpdateDescriptorSets(e->dev, 2, wr, 0, NULL);
+            vkUpdateDescriptorSets(e->dev, 3, wr, 0, NULL);
         }
     }
     e->open = 1;
@@ -1476,6 +1496,7 @@ void pi_engine_destroy(struct pi_engine *e)
         vkDestroyPipelineCache(e->dev, e->cache, NULL);
         vkDestroyRenderPass(e->dev, e->rp[0], NULL);
         vkDestroyRenderPass(e->dev, e->rp[1], NULL);
+        vkDestroyRenderPass(e->dev, e->rp[2], NULL);
         vkDestroyDescriptorPool(e->dev, e->dpool, NULL);   /* frees the sets */
         vkDestroyPipelineLayout(e->dev, e->pl, NULL);
         vkDestroyDescriptorSetLayout(e->dev, e->dsl, NULL);
@@ -1944,7 +1965,7 @@ static void pass(struct pi_engine *e, struct ctx *c, int i, VkFramebuffer fb, ui
         vkCmdDraw(c->cmd, 3, 1, 0, 0);
     }
     vkCmdEndRenderPass(c->cmd);
-    if (c->qp)
+    if (c->qp && i < 2)   /* P0's time is counted in P1's */
         vkCmdWriteTimestamp(c->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, c->qp, (uint32_t)i + 1);
 }
 
@@ -1996,8 +2017,8 @@ static void ownership(struct pi_engine *e, struct ctx *c, struct pi_output *o, i
     vkCmdPipelineBarrier(c->cmd, src, dst, 0, 0, NULL, nb, bb, ni, ib);
 }
 
-static int record(struct pi_engine *e, struct ctx *c, const dvvk_plan *p, struct pi_output *o, VkPipeline p1,
-                  VkPipeline p2, VkPipeline pb)
+static int record(struct pi_engine *e, struct ctx *c, const dvvk_plan *p, struct pi_output *o, VkPipeline p0,
+                  VkPipeline p1, VkPipeline p2, VkPipeline pb)
 {
     uint32_t w = e->w, h = e->h, cw = w / 2, ch = h / 2;
     VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -2027,6 +2048,24 @@ static int record(struct pi_engine *e, struct ctx *c, const dvvk_plan *p, struct
     if (p->row_last > p->row_first && !all) {
         c0 = p->row_first / 2;
         crows = (p->row_last - p->row_first) / 2;   /* row_last: exclusive */
+    }
+    if (p0) {   /* P0: the EL chroma's vertical filter, over the same rows */
+        struct band b0 = {p0, c0, crows};
+        pass(e, c, 2, c->fb0, cw / 2, ch, c0, crows, &b0, 1, NULL);
+        c->elv_read = 1;
+    } else if (!c->elv_read) {
+        /* P1 binds P0's image whether or not it reads it: give it the layout
+         * its descriptor names, once */
+        VkImageMemoryBarrier ib = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                                   .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+                                   .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+                                   .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                   .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                   .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .image = c->elv.img,
+                                   .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+        vkCmdPipelineBarrier(c->cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0,
+                             NULL, 0, NULL, 1, &ib);
+        c->elv_read = 1;
     }
     struct band b1 = {p1, c0, crows};
     pass(e, c, 0, c->fb, cw, ch, c0, crows, &b1, 1, NULL);
@@ -2206,8 +2245,12 @@ int pi_render(struct pi_engine *e, const struct pi_frame *f, struct pi_output *o
     /* pipelines */
     uint32_t k1[K1_N], k2[K2_N], kb[K2_N] = {[K2_BARS] = 1};
     keys(e, p, k1, k2);
-    VkPipeline p1 = build(e, 0, k1), p2 = build(e, 1, k2), pb = build(e, 1, kb);
-    if (!p1 || !p2 || !pb) {
+    VkPipeline p1 = build(e, 0, k1), p2 = build(e, 1, k2), pb = build(e, 1, kb), p0 = VK_NULL_HANDLE;
+    if (k1[K1_ELUP]) {   /* P0: only the EL selectors matter */
+        uint32_t k0[K1_N] = {[K1_METHOD] = k1[K1_METHOD], [K1_ELUP] = k1[K1_ELUP], [K1_PRE] = 1};
+        p0 = build(e, 0, k0);
+    }
+    if (!p1 || !p2 || !pb || (k1[K1_ELUP] && !p0)) {
         WARN_ONCE(e, W_PIPELINE, "a pipeline failed to build");
         rc = PI_E_VULKAN;
         goto release;
@@ -2216,7 +2259,7 @@ int pi_render(struct pi_engine *e, const struct pi_frame *f, struct pi_output *o
 
     /* record and submit */
     e->serial++;
-    if ((rc = record(e, c, p, o, p1, p2, pb)))
+    if ((rc = record(e, c, p, o, p0, p1, p2, pb)))
         goto release;
     rc = submit(e, c, acquire_fd, release_fd);
     acquire_fd = -1;   /* submit takes it */

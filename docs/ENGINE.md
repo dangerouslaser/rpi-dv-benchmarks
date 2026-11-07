@@ -17,6 +17,9 @@ It is TV-led, as in Kodi's DV engines for other platforms:
 HEVC decoder (V4L2 request) ── BL, EL: SAND128 P030 dmabufs ──────┐
 RPU (the frames' side data) ── planner (CPU, ~0.5 ms) ── tables, packets ─┤
                                                                          ▼
+P0  w/4 × h/2   (bicubic, Annex B and Lanczos EL upscales only) the EL
+                chroma's phase and vertical filter, once per EL chroma
+                column and chroma row → RG16UI
 P1  w/2 × h/2   chroma: BL chroma phase, luma guide, the EL chroma
                 upscaled, MMR / polynomial / piecewise chroma mapping + NLQ
                 residual → RG16UI chroma (12-bit), R16UI EL luma
@@ -27,7 +30,7 @@ P2  w/2 × h/2   one fragment per 2×2 output block: 4:2:2 vertical filter,
 ```
 
 - **One render job per pass.** Each pass is a single render pass, which v3dv
-  runs as one V3D render job. There are no compute dispatches; v3dv makes
+  runs as one V3D render job: two per frame, three with P0. There are no compute dispatches; v3dv makes
   every dispatch its own kernel job with a cache flush (`pi5/V3DV.md` §2).
 - **Inputs are the decoder's own buffers.** They are read as `R32UI` texel
   buffers, with no detile copy.
@@ -191,15 +194,20 @@ sample positions in every option:
   its mirror) and the 8-tap horizontal (22 94 −524 2456 2456 −524 94 22 /
   4096) on the odd columns; the EL chroma through the 64/192 vertical
   filter (both upscales') and the same 8-tap. Pass 2 reads 12 gathers per
-  fragment for it, pass 1 four EL column pairs on odd columns.
+  fragment for it.
 - **`bicubic`:** Catmull-Rom at the same sample positions, luma and chroma:
   vertical −9 111 29 −3 / 128 and its mirror (Annex B's luma vertical),
   horizontal −1 9 9 −1 / 16 on the odd columns. Pass 2 reads 6 gathers per
-  fragment; pass 1 four EL rows per column.
+  fragment.
 - **`lanczos`:** Lanczos-3 at the same positions, luma and chroma, its
   weights normalised to 1024: vertical 8 −70 277 914 −136 31 and its mirror,
   horizontal 25 −139 626 626 −139 25 on the odd columns. Pass 2 reads 12
-  gathers per fragment; pass 1 six EL rows per column.
+  gathers per fragment.
+
+For these three, P0 (`p0_elv.frag`) filters the EL chroma vertically once per
+frame, an EL chroma column by a chroma row (960 × 1080 at 4K), and P1's
+horizontal filter reads those columns, rather than computing the vertical
+filter again for every column each odd sample's horizontal filter takes.
 
 ## Exactness
 
@@ -264,18 +272,22 @@ upscale:
 LibreELEC 13 (the same kernel, Mesa 26.2.5) measures the same: 4K FEL
 31–34 ms on the letterboxed test clips.
 
-**The EL upscale's cost** (4K FEL, GPU time per picture, P1 + P2, LibreELEC
-13; 24p allows 41.7 ms). Only bilinear is real time:
+**The EL upscale's cost** (4K FEL, GPU time per picture, P0 + P1 + P2,
+LibreELEC 13; 24p allows 41.7 ms):
 
 | Clip | `bilinear` | `bicubic` | `annexb` | `lanczos` |
 |---|---|---|---|---|
-| Power Rangers credits (2.40:1) | 34.3 ms | 63.0 ms | 63.3 ms | 84.5 ms |
-| the same, every row (`PI_ALL_ROWS=1`, as a 16:9 film) | 42.8 ms | 82.6 ms | 81.7 ms | 111.8 ms |
-| DV FEL CMV4.0 test (dual track) | 25.3 ms | 56.1 ms | 56.7 ms | 85.2 ms |
+| Power Rangers credits (2.40:1) | 31.0 ms | 37.8 ms | 41.4 ms | 42.2 ms |
+| the same, every row (`PI_ALL_ROWS=1`, as a 16:9 film) | 42.0 ms | 48.3 ms | 52.2 ms | 53.2 ms |
+| DV FEL CMV4.0 test (dual track) | 25.3 ms | 30.7 ms | 35.3 ms | 36.4 ms |
 
-Most of the difference is P1 (18.6 ms bilinear, 66.5 ms Lanczos on the
-first clip): each chroma sample computes its EL neighbourhood's vertical
-filter afresh, for every column the horizontal filter takes.
+P0 takes the EL chroma's share down to 3.7–5.6 ms over bilinear (P0 + P1 on
+the first clip: 21.2 ms bicubic, 23.1 ms Lanczos, against 17.5 ms bilinear);
+the rest is P2's EL luma, whose gathers already share the vertical filter's
+rows across each 2×2 block. A luma pre-pass of the same kind (P0L: the
+vertical filter at every EL column and output row, 1920 × 2160) measured
+slower for bicubic and Lanczos and at most 2.5 ms faster for Annex B: its
+4 M fragments cost about what P2's gathers save.
 
 Notes:
 - The HEVC decoder alone does 44–79 fps for BL and EL, over SMB.
@@ -391,8 +403,10 @@ On the Pi itself, `V3D_DEBUG=shaderdb` prints the compiler's statistics,
   tunnel frame is the stream's size), and a FEL picture without its EL: the
   planner refuses it (`PI_E_UNSUPPORTED_PLAN`), so a player can't show a
   FEL stream's base layer alone through the engine.
-- **The sharper EL upscales** (`bicubic`, `annexb`, `lanczos`) aren't real
-  time for 4K FEL on the Pi 5 (Performance).
+- **The sharper EL upscales** (`bicubic`, `annexb`, `lanczos`) fit 4K24 FEL
+  only where the film is letterboxed, by GPU time: bicubic with margin,
+  Annex B and Lanczos at the limit; on a full-height 16:9 film none of them
+  does (Performance).
 - **`--filters phase` on single-layer MMR** isn't real time at 24p: it
   reshapes both output rows' chroma, twice pass 1's MMR. Profile 8.4 takes
   43–53 ms per picture, an 8.1 MMR cut of 1917 66 ms. With the default

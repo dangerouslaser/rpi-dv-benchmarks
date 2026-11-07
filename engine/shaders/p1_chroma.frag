@@ -13,12 +13,12 @@
 // their 32-bit word, and a dual MMR fetches Cb's and Cr's tables at once.
 #include "common.glsl"
 #include "piecewise.glsl"
+#include "el_chroma.glsl"
 
 layout(binding = 3) uniform usamplerBuffer bl_y;
-layout(binding = 4) uniform usamplerBuffer bl_c;
 layout(binding = 5) uniform usamplerBuffer el_y;
-layout(binding = 6) uniform usamplerBuffer el_c;
 layout(binding = 10) uniform usamplerBuffer tables128;   // the tables as RGBA32UI
+layout(binding = 12) uniform usampler2D el_cv;          // P0: the EL chroma's vertical filter (ELUP != 0)
 layout(location = 0) out uvec2 o_chroma;
 layout(location = 1) out uint o_el;
 
@@ -28,9 +28,8 @@ layout(location = 1) out uint o_el;
 // the split where the bound could change the 12-bit result.
 layout(constant_id = 0) const uint MMR_MODE = 4;
 // The stream's selectors (pi_engine.c makes a pipeline per combination):
-// chroma phase method; dual MMR; chroma kind (0 polynomial, 1 MMR128, 2
-// MMR96, 3 MMR64 with LUTs) and MMR order per channel.
-layout(constant_id = 1) const uint METHOD = 2;
+// chroma phase method (METHOD, el_chroma.glsl); dual MMR; chroma kind (0
+// polynomial, 1 MMR128, 2 MMR96, 3 MMR64 with LUTs) and MMR order per channel.
 layout(constant_id = 2) const uint DUAL = 1;
 layout(constant_id = 3) const uint KIND0 = 3;
 layout(constant_id = 4) const uint KIND1 = 3;
@@ -60,149 +59,41 @@ layout(constant_id = 11) const uint MARK = 0;
 // frame's largest magnitudes fails, so the split checks each sample's own
 // and takes emulated 64-bit where that fails too.
 layout(constant_id = 12) const uint SPLIT_GUARD = 0;
-// The EL upscale (pi_engine.h enum pi_el_upscale): 0 bilinear, 1 CCM
-// Annex B (the horizontal 8-tap; the vertical 64/192 is both's), 2 bicubic
-// (Catmull-Rom: the vertical 4-tap, the horizontal -1 9 9 -1 / 16), 3
-// Lanczos-3 (6-tap vertical and horizontal, / 1024).
-layout(constant_id = 13) const uint ELUP = 0;
+// The EL upscale: ELUP (el_chroma.glsl). For ELUP != 0, pass 0 (p0_elv.frag)
+// has filtered the EL chroma vertically into el_cv.
 // Measurement only (pi_options.measure PI_MEASURE_EL_OUT): the dual route
 // writes the upscaled EL chroma as its chroma.
 layout(constant_id = 14) const uint EL_OUT = 0;
 
 
-// ---- SAND reads ------------------------------------------------------------
-// Every read stays in its row: a word is read only when it holds a sample
-// that exists (the last column's neighbours are taken from the left).
-uint word(usamplerBuffer buf, uint base, uint colh, uint w, uint row)
+// P0's vertical result at EL chroma column x (clamped to the plane), row k.
+ivec2 evc(int x, uint k)
 {
-    return texelFetch(buf, sand_index(base, colh, w, row)).r;
-}
-// sample j (0..5) of the word pair a, b
-uint pick(uint a, uint b, uint j) { return ((j < 3u ? a : b) >> (10u * (j < 3u ? j : j - 3u))) & 1023u; }
-// sample n
-uint sand1(usamplerBuffer buf, uint base, uint colh, uint n, uint row)
-{
-    uint w = div3(n);
-    return (word(buf, base, colh, w, row) >> (10u * (n - 3u * w))) & 1023u;
-}
-// samples n, n+1 (one word unless n is a word's last); n + 1 must exist
-uvec2 sand2(usamplerBuffer buf, uint base, uint colh, uint n, uint row)
-{
-    uint w = div3(n), sub = n - 3u * w, a = word(buf, base, colh, w, row);
-    uint b = sub == 2u ? word(buf, base, colh, w + 1u, row) : a;
-    return uvec2(pick(a, b, sub), pick(a, b, sub + 1u));
-}
-// samples n .. n+3 (two words: n + 3 is in the second); n + 3 must exist
-uvec4 sand4(usamplerBuffer buf, uint base, uint colh, uint n, uint row)
-{
-    uint w = div3(n), sub = n - 3u * w;
-    uint a = word(buf, base, colh, w, row), b = word(buf, base, colh, w + 1u, row);
-    return uvec4(pick(a, b, sub), pick(a, b, sub + 1u), pick(a, b, sub + 2u), pick(a, b, sub + 3u));
-}
-uvec2 bl_chroma(uint cx, uint row) { return sand2(bl_c, P.bl.y, P.bl.w, 2u * cx, row); }
-
-// (Cb, Cr) of chroma column x and of x + 1 (clamped to the plane: the last
-// column's pair is read with its left neighbour, in the plane)
-uvec4 uvq(bool enh, uint x, uint row)
-{
-    uint cw = enh ? P.el_size.x : P.size.z, n = 2u * min(x, cw - 2u);
-    uvec4 q = enh ? sand4(el_c, P.el.y, P.el.w, n, row) : sand4(bl_c, P.bl.y, P.bl.w, n, row);
-    return x + 1u < cw ? q : q.zwzw;
+    return ivec2(texelFetch(el_cv, ivec2(clamp(x, 0, int(P.el_size.x) - 1), int(k)), 0).xy);
 }
 
-// phase_uv_sample of columns x and x + 1: 2 none (the decoded chroma), 0 the
-// 2-tap, 1 the 4-tap.
-uvec4 phase(bool enh, uint x, int row, uint h)
+// The horizontal filter at the odd chroma column between EL chroma columns
+// ex and ex + 1, over P0's columns: Annex B's 22 94 -524 2456 2456 -524 94 22
+// / 4096 (ex-3 .. ex+4), bicubic's -1 9 9 -1 / 16 (ex-1 .. ex+2) or
+// Lanczos-3's 25 -139 626 626 -139 25 / 1024 (ex-2 .. ex+3), clamped to
+// 0 .. 1023 (dv_annex_b_scale2x).
+uvec2 el_horizontal(uint ex, uint k)
 {
-    // one return (V3D's compiler turns returns inside branches into loops)
-    uint y = uint(edge(row, h));
-    uvec4 res;
-    if (METHOD == 2u)
-        res = min(uvq(enh, x, y), uvec4(1023u));
-    else if (METHOD == 0u) {
-        ivec4 v = 3 * ivec4(uvq(enh, x, y)) + ivec4(uvq(enh, x, uint(edge(int(y) + 1, h))));
-        res = min(uvec4(max(v + 2, ivec4(0)) >> 2), uvec4(1023u));
-    } else {
-        ivec4 v = -9 * ivec4(uvq(enh, x, uint(edge(int(y) - 1, h)))) + 111 * ivec4(uvq(enh, x, y)) +
-                  29 * ivec4(uvq(enh, x, uint(edge(int(y) + 1, h)))) - 3 * ivec4(uvq(enh, x, uint(edge(int(y) + 2, h))));
-        res = min(uvec4(max(v + 64, ivec4(0)) >> 7), uvec4(1023u));
-    }
-    return res;
-}
-
-// phase_vertical_uv at EL chroma columns ex, ex + 1, for chroma row k: the
-// 64/192 vertical, or (bicubic) Catmull-Rom's at the same position, even k
-// -3 29 111 -9 over rows yy-2 .. yy+1, odd -9 111 29 -3 over yy-1 .. yy+2,
-// / 128, floored at 0 (the horizontal filter clamps the result).
-uvec4 el_vertical(uint ex, uint k)
-{
-    int yy = int(k >> 1);
-    uint eh = P.el_size.y;
-    bool even = (k & 1u) == 0u;
-    uvec4 res;
-    if (ELUP == 3u) {   // Lanczos-3: even k 8 -70 277 914 -136 31 over yy-3 .. yy+2, odd mirrored over yy-2 .. yy+3
-        int r = even ? yy - 3 : yy - 2;
-        ivec4 a = ivec4(phase(true, ex, r, eh)), b = ivec4(phase(true, ex, r + 1, eh)),
-              c = ivec4(phase(true, ex, r + 2, eh)), d = ivec4(phase(true, ex, r + 3, eh)),
-              f = ivec4(phase(true, ex, r + 4, eh)), g = ivec4(phase(true, ex, r + 5, eh));
-        ivec4 s = even ? 8 * a - 70 * b + 277 * c + 914 * d - 136 * f + 31 * g
-                       : 31 * a - 136 * b + 914 * c + 277 * d - 70 * f + 8 * g;
-        res = uvec4(max((s + 512) >> 10, ivec4(0)));
+    int s = int(ex);
+    ivec2 v;
+    if (ELUP == 1u) {
+        ivec2 sum = 22 * (evc(s - 3, k) + evc(s + 4, k)) + 94 * (evc(s - 2, k) + evc(s + 3, k)) -
+                    524 * (evc(s - 1, k) + evc(s + 2, k)) + 2456 * (evc(s, k) + evc(s + 1, k));
+        v = (sum + 2048) >> 12;
     } else if (ELUP == 2u) {
-        int r = even ? yy - 2 : yy - 1;
-        ivec4 a = ivec4(phase(true, ex, r, eh)), b = ivec4(phase(true, ex, r + 1, eh)),
-              c = ivec4(phase(true, ex, r + 2, eh)), d = ivec4(phase(true, ex, r + 3, eh));
-        ivec4 s = even ? -3 * a + 29 * b + 111 * c - 9 * d : -9 * a + 111 * b + 29 * c - 3 * d;
-        res = uvec4(max((s + 64) >> 7, ivec4(0)));
+        ivec2 sum = -evc(s - 1, k) + 9 * (evc(s, k) + evc(s + 1, k)) - evc(s + 2, k);
+        v = (sum + 8) >> 4;
     } else {
-        uvec4 b = phase(true, ex, yy, eh), n = phase(true, ex, even ? yy - 1 : yy + 1, eh);
-        res = (192u * b + 64u * n + 128u) >> 8;
+        ivec2 sum = 25 * (evc(s - 2, k) + evc(s + 3, k)) - 139 * (evc(s - 1, k) + evc(s + 2, k)) +
+                    626 * (evc(s, k) + evc(s + 1, k));
+        v = (sum + 512) >> 10;
     }
-    return res;
-}
-
-// el_vertical's pair at EL chroma columns s, s + 1, clamped to the plane
-// (el_vertical clamps the right edge).
-uvec4 el_pair(int s, uint k)
-{
-    uvec4 v;
-    if (s >= 0)
-        v = el_vertical(uint(s), k);
-    else
-        v = el_vertical(0u, k).xyxy;
-    return v;
-}
-
-// Annex B's horizontal 8-tap at the odd chroma column between EL chroma
-// columns ex and ex + 1: taps 22 94 -524 2456 2456 -524 94 22 / 4096 over
-// columns ex - 3 .. ex + 4 (dv_annex_b_scale2x).
-uvec2 el_annexb(uint ex, uint k)
-{
-    int s = int(ex);
-    ivec4 a = ivec4(el_pair(s - 3, k)), b = ivec4(el_pair(s - 1, k)), c = ivec4(el_pair(s + 1, k)),
-          d = ivec4(el_pair(s + 3, k));
-    ivec2 sum = 22 * (a.xy + d.zw) + 94 * (a.zw + d.xy) - 524 * (b.xy + c.zw) + 2456 * (b.zw + c.xy);
-    return uvec2(clamp((sum + 2048) >> 12, ivec2(0), ivec2(1023)));
-}
-
-// Bicubic's horizontal -1 9 9 -1 / 16 at the odd chroma column between EL
-// chroma columns ex and ex + 1 (columns ex - 1 .. ex + 2).
-uvec2 el_bicubic(uint ex, uint k)
-{
-    int s = int(ex);
-    ivec4 a = ivec4(el_pair(s - 1, k)), b = ivec4(el_pair(s + 1, k));
-    ivec2 sum = -a.xy + 9 * (a.zw + b.xy) - b.zw;
-    return uvec2(clamp((sum + 8) >> 4, ivec2(0), ivec2(1023)));
-}
-
-// Lanczos-3's horizontal 25 -139 626 626 -139 25 / 1024 at the odd chroma
-// column between EL chroma columns ex and ex + 1 (columns ex - 2 .. ex + 3).
-uvec2 el_lanczos(uint ex, uint k)
-{
-    int s = int(ex);
-    ivec4 a = ivec4(el_pair(s - 2, k)), b = ivec4(el_pair(s, k)), c = ivec4(el_pair(s + 2, k));
-    ivec2 sum = 25 * (a.xy + c.zw) - 139 * (a.zw + c.xy) + 626 * (b.xy + b.zw);
-    return uvec2(clamp((sum + 512) >> 10, ivec2(0), ivec2(1023)));
+    return uvec2(clamp(v, ivec2(0), ivec2(1023)));
 }
 
 // ---- MMR -------------------------------------------------------------------
@@ -584,14 +475,10 @@ void main()
             // the EL chroma at (cx, k): co-sited horizontally, bilinear (or
             // Annex B's 8-tap) between
             uvec2 e;
-            if (ELUP == 1u && (cx & 1u) != 0u)
-                e = el_annexb(cx >> 1, k);
-            else if (ELUP == 2u && (cx & 1u) != 0u)
-                e = el_bicubic(cx >> 1, k);
-            else if (ELUP == 3u && (cx & 1u) != 0u)
-                e = el_lanczos(cx >> 1, k);
-            else if (ELUP >= 2u)
-                e = min(el_vertical(cx >> 1, k).xy, uvec2(1023u));
+            if (ELUP != 0u && (cx & 1u) != 0u)
+                e = el_horizontal(cx >> 1, k);
+            else if (ELUP != 0u)
+                e = uvec2(min(evc(int(cx >> 1), k), ivec2(1023)));
             else {
                 uvec4 ev = el_vertical(cx >> 1, k);
                 e = min((cx & 1u) != 0u ? (ev.xy + ev.zw + 1u) >> 1 : ev.xy, uvec2(1023u));

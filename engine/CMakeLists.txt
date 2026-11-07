@@ -27,7 +27,7 @@ set(UPDATE)
 if(NOT GLSLC)
   message(STATUS "glslc not found: using the committed SPIR-V (engine/shaders/spirv)")
 endif()
-foreach(shader fullscreen.vert p1_chroma.frag p2_pack.frag)
+foreach(shader fullscreen.vert p0_elv.frag p1_chroma.frag p2_pack.frag)
   set(committed ${SHADERS}/spirv/${shader}.spv)
   set(header ${SPIRV_DIR}/shaders/${shader}.h)
   if(GLSLC)
@@ -36,7 +36,8 @@ foreach(shader fullscreen.vert p1_chroma.frag p2_pack.frag)
       COMMAND ${GLSLC} --target-env=vulkan1.2 ${GLSLC_OPT} -Werror -I${SHADERS} ${SHADERS}/${shader} -o ${spv}
       COMMAND ${CMAKE_COMMAND} -E compare_files ${spv} ${committed} ||
               ${CMAKE_COMMAND} -E echo "warning: engine/shaders/spirv/${shader}.spv is stale (target update-spirv)"
-      DEPENDS ${SHADERS}/${shader} ${SHADERS}/common.glsl ${SHADERS}/piecewise.glsl ${SHADERS}/pack.h VERBATIM)
+      DEPENDS ${SHADERS}/${shader} ${SHADERS}/common.glsl ${SHADERS}/piecewise.glsl ${SHADERS}/el_chroma.glsl
+              ${SHADERS}/pack.h VERBATIM)
     list(APPEND UPDATE COMMAND ${CMAKE_COMMAND} -E copy ${spv} ${committed})
   else()
     set(spv ${committed})
