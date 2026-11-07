@@ -205,13 +205,15 @@ what was done. The changes were checked as follows:
      - The EL is given up only if no EL picture has ever arrived.
      - Contexts are freed on every `open_decoder` failure, and allocations
        are checked.
-     - **BL and EL pair by timestamp, but not by the EL's raw PTS, a
-       deliberate departure from the finding, accepted by the project owner
-       on 2026-11-07** (`source.c` `take()`). Equal
-       timestamps pair, an EL picture older than its BL is dropped, and a
-       BL picture without an EL is shown alone. The EL's timestamps are
-       corrected first, because raw PTS pairing is wrong. An EL picture's
-       own timestamp is its packet's. Where the EL's coding order differs from the packets'
+     - **BL and EL pair by PTS, no longer by arrival order** (`source.c`
+       `take()`). Equal PTS pair, an EL picture older than its BL is
+       dropped, and a BL picture without an EL is shown alone. BL pictures
+       carry their own PTS. Each EL picture gets the PTS of its slot in
+       display order, from its packets' PTS values (`el_display_times()`,
+       below). The decoder attaches each packet's PTS to whichever EL
+       picture that packet carried, and that isn't always the picture's
+       display time. The project owner reviewed this choice on 2026-11-07,
+       over pairing by the attached PTS as it comes. Where the EL's coding order differs from the packets'
        (the "All Layers" test clip), that isn't its display time, and plain
        timestamp pairing lost pictures 1 and 4 of its first six. So
        `el_display_times()` sorts the output EL pictures' packet times
