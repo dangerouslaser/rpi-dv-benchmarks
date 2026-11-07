@@ -10,7 +10,6 @@ while read -r name url pin; do
   dest=$TP/$name
   if [[ $url == *.git ]]; then
     if [ -d "$dest/.git" ] && git -C "$dest" merge-base --is-ancestor "$pin" HEAD 2>/dev/null; then
-      [ "$name" = libplacebo ] && git -C "$dest" submodule update -q --init --depth 1 3rdparty/glad 3rdparty/fast_float
       echo "ok      $name @ ${pin:0:10}"; continue
     fi
     rm -rf "$dest"; mkdir -p "$dest"
@@ -18,7 +17,6 @@ while read -r name url pin; do
     git -C "$dest" remote add origin "$url"
     git -C "$dest" fetch -q --depth 1 origin "$pin"
     git -C "$dest" -c advice.detachedHead=false checkout -q FETCH_HEAD
-    [ "$name" = libplacebo ] && git -C "$dest" submodule update -q --init --depth 1 3rdparty/glad 3rdparty/fast_float
     if ls "$ROOT/patches/$name"/*.patch >/dev/null 2>&1; then
       git -C "$dest" checkout -q -b rpi5
       git -C "$dest" -c user.name=rpi5-dv -c user.email=rpi5-dv@localhost am -q --committer-date-is-author-date "$ROOT/patches/$name"/*.patch

@@ -1,20 +1,18 @@
 #!/bin/bash
-# FFmpeg 9.0 as LibreELEC builds it for PROJECT=RPi DEVICE=RPi5 (patch dirs
-# postproc + libreelec + rpi; V4L2 m2m + request + SAND), plus CB1's Generic
-# FFmpeg patches (a superset of yblod's three metadata patches, byte-identical).
-# Runs inside the build container.
+# FFmpeg 9.0 as LibreELEC builds it for PROJECT=RPi DEVICE=RPi5 (the postproc,
+# libreelec and rpi patch sets: V4L2 request decoding of the Pi's HEVC into
+# SAND128), plus the Dolby Vision metadata patches the planner reads
+# (patches/ffmpeg/README.md). Runs inside the build container.
 set -euo pipefail
 W=${WORK:-/work}   # this repo: /work in the build container, the checkout natively
-TP=$W/third_party
 SRC=$W/build/ffmpeg-src
-LE=$TP/cb1/packages/multimedia/ffmpeg/patches
-DV=$TP/cb1/projects/Generic/patches/ffmpeg
+PATCHES=$W/patches/ffmpeg
 
 if [ ! -f "$SRC/.patched" ]; then
   rm -rf "$SRC"; mkdir -p "$SRC"
-  tar -xJf $TP/ffmpeg-9.0.tar.xz -C "$SRC" --strip-components=1
+  tar -xJf $W/third_party/ffmpeg-9.0.tar.xz -C "$SRC" --strip-components=1
   echo 9.0 >"$SRC/RELEASE"
-  for p in $LE/postproc/*.patch $LE/libreelec/*.patch $LE/rpi/*.patch $DV/*.patch; do
+  for p in $PATCHES/postproc/*.patch $PATCHES/libreelec/*.patch $PATCHES/rpi/*.patch $PATCHES/dolby-vision/*.patch; do
     echo "patch $(basename "$p")"
     patch -d "$SRC" -p1 --forward --quiet <"$p"
   done

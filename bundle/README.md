@@ -1,17 +1,23 @@
 # dvbench for the Raspberry Pi 5
 
-Benchmarks yblod's Dolby Vision Vulkan engine against CroqueMr's CB1 (GLES)
-on the same decoded pictures. No Kodi, no display, no audio.
+Measures the Pi Dolby Vision engine on the Pi's own hardware decoder. It
+reconstructs each picture (BL, the FEL enhancement layer, the RPU) and packs
+it, with its metadata, into the TV-led HDMI tunnel frame. There's no Kodi,
+no display and no audio.
 
 ## Setup (Raspberry Pi OS trixie, 64-bit)
 
 The decoder needs more contiguous memory than the default (64 MB on some
-boards): add `dtoverlay=vc4-kms-v3d,cma-512` to `/boot/firmware/config.txt`
-(replacing the existing `vc4-kms-v3d` line) and reboot. `run-bench.sh` warns
-if CMA is under 256 MB.
+boards):
+1. In `/boot/firmware/config.txt`, replace the `dtoverlay=vc4-kms-v3d` line
+   with `dtoverlay=vc4-kms-v3d,cma-512`.
+2. Reboot.
+
+`run-bench.sh` warns if CMA is under 256 MB. The SD image
+(`scripts/make-image.sh`) is already set up this way.
 
 ```sh
-sudo apt install mesa-vulkan-drivers libvulkan1 libegl1 libgles2 vulkan-tools mesa-utils-bin v4l-utils
+sudo apt install mesa-vulkan-drivers libvulkan1 vulkan-tools v4l-utils python3
 tar xzf dvbench-rpi5-*.tar.gz && cd dvbench-rpi5-*
 sudo usermod -aG video,render $USER   # then log in again
 ```
@@ -19,48 +25,52 @@ sudo usermod -aG video,render $USER   # then log in again
 ## Run
 
 ```sh
-./run-bench.sh /path/to/clips/*.mkv
+./run-bench.sh /path/to/clips/*.mkv              # everything (a few minutes a clip)
+./run-bench.sh --quick /path/to/clips/*.mkv      # the correctness checks only
+./run-bench.sh --start 600 --play 300 film.mkv   # 5 minutes of real time, 10 minutes in
 ```
 
-Per clip, with the Pi's hardware decoder (V4L2 request, SAND128 frames):
+Per clip, all from the Pi's hardware decoder (V4L2 request, SAND128):
 
-- decode speed: pictures decoded per second (BL and, for Profile 7, the EL);
-- per picture, each engine on its own: import + render + GPU finish,
-  median / p95 milliseconds;
-- throughput: each engine flat out for 20 s, pipelined as in playback,
-  frames per second and CPU milliseconds per frame;
-- a correctness check first: CB1's and the Vulkan engine's 3840x2160 output,
-  byte for byte, on 12 pictures, and the Vulkan engine's output from the
-  hardware decoder vs software decoding (all should be identical);
-- each performance run 3 times, engine order alternating, with clocks,
-  temperature and throttling recorded (throttled runs are left out of the
-  medians in `table.txt`);
-- the engines' options, per picture: the Vulkan engine's switches
-  (specialized pipelines, narrow variants, the Annex B chroma tile) and its
-  FEL upscale (Master Reference's Annex B or bilinear), CB1 Master Reference
-  and CB1 Reference with bilinear FEL (`table.txt`, "options");
-- real-time playback for 30 s per engine and setting (Master Reference and
-  the bilinear compromise): decoding on its own thread, rendering at the
-  stream's frame rate; late pictures and decode stalls;
-- the Vulkan engine's per-stage GPU times;
-- the same with software decoding, for reference.
+1. **Correctness.** The output from hardware decoding must equal the output
+   from software decoding of the same pictures, byte for byte. Every exact
+   MMR mode must equal the others.
+2. **Speed.** Three timed runs. Each reports:
+   - decode fps
+   - per picture: plan + render + GPU finish, median and p95
+   - throughput: three frames in flight, as in playback
 
-Use an active cooler, and let `run-bench.sh` set the CPU governor
-(it needs passwordless `sudo`, the default on Raspberry Pi OS). `--quick`
-runs only the correctness checks (a couple of minutes).
+   Clocks, temperature and throttling are recorded around every run.
+   Throttled runs are left out of the medians.
+3. **MMR modes and passes.** Times for the exact (default), split and float
+   modes, with per-pass GPU times.
+4. **Real-time playback** for `--play` seconds (default 60). Decoding runs on
+   its own thread and rendering follows the stream's frame clock. It counts
+   pictures that missed their display deadline, and decode stalls.
+5. **V3D compiler statistics** for the engine's shaders: threads,
+   instructions, spills.
 
-Everything lands in `results/HOST-DATE/` (`summary.txt`, `table.txt`,
-`system.txt`, a log and a JSON per run). Send that directory back.
+Everything lands in `results/HOST-DATE/`: `summary.txt`, `system.txt`, and a
+log and JSON per run. Send that directory back.
 
-Useful clips: 4K Profile 7 FEL (two decodes per picture: the heaviest),
-Profile 7 MEL, Profile 8.1, Profile 5.
+- Let `run-bench.sh` set the CPU governor. It needs passwordless `sudo`, the
+  default on Raspberry Pi OS.
+- Without a cooler, watch the throttling column. Don't overclock the GPU for
+  these figures.
 
-## Notes
+## Running dvbench directly
 
-- Both engines receive the decoder's SAND128 buffers. The Vulkan engine
-  unpacks them in a compute pass; CB1 (which reads linear P010 planes) gets
-  the same unpacking as a GLES pass in the bench, counted in its time.
-- `dvbench --help`-style options are at the top of `bin/dvbench`'s source
-  (`bench/dvbench.c`); `run-bench.sh` is the intended entry point.
-- If the EL fails to decode in hardware next to the BL, run-bench retries
-  with the EL in software (`--el-sw`).
+```sh
+export LD_LIBRARY_PATH=$PWD/lib
+bin/dvbench --source v4l2 --frames 12 --warmup 2 --throughput 10 clip.mkv
+bin/dvbench --source v4l2 --start 600 --frames 4 --play 60 film.mkv
+bin/dvbench --help    # every option
+```
+
+- `--filters yblod` selects YBLOD's spatial filters. Use it for profile 8.1
+  streams with MMR chroma, which CB1's contract (the default) doesn't take.
+- `--mmr float|split|exact64` selects the MMR mode.
+- `PI_PROFILE=1` adds per-pass GPU times.
+
+`bin/vk-micro` runs one synthetic 4K pass as Vulkan compute, Vulkan
+fragment, GLES fragment and GLES compute, side by side.

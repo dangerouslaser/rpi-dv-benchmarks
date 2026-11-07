@@ -261,7 +261,7 @@ Each kind of access takes a different hardware path:
   [S] common/v3d_debug.c:43-108
 - **Kernel tracepoints** `v3d_submit_csd`, `v3d_csd_irq`, `v3d_cache_clean_begin/end`
   separate job overhead from shader time. [S] K/v3d_trace.h
-- Offline compiler statistics: our `scripts/shader-stats.sh` (Mesa's drm-shim, no hardware needed).
+- On the Pi: `V3D_DEBUG=shaderdb dvbench ...` (threads, instructions, loops, spills per shader).
 
 ## 7. The video path today
 

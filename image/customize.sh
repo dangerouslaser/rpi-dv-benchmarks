@@ -21,16 +21,17 @@ mkdir -p "$R/etc/skel"
 ln -sfn /opt/dvbench "$R/etc/skel/dvbench"
 ln -sfn /opt/dvbench/clips "$R/etc/skel/clips"
 cat >"$R/etc/skel/README-dvbench.txt" <<'EOF'
-Dolby Vision benchmark (yblod Vulkan engine vs CB1 GLES) on the Raspberry Pi 5.
+Dolby Vision on the Raspberry Pi 5: the Vulkan engine, measured on the Pi's
+own HEVC decoder.
 
   cd ~ && dvbench/run-bench.sh --quick clips/*      # correctness only, a few minutes
-  cd ~ && dvbench/run-bench.sh clips/*              # everything (long: 15-30 min per clip)
+  cd ~ && dvbench/run-bench.sh clips/*              # everything (a few minutes a clip)
 
 Results land in ~/results/HOST-DATE/. Copy that directory back, e.g. from
 your computer:  scp -r dv@dvbench.local:results .   (or the Pi's IP address)
 
 dvbench/README.md has the details. CMA is already set (cma-512 in
-/boot/firmware/config.txt). Use an active cooler.
+/boot/firmware/config.txt). Without a cooler, watch for throttling.
 EOF
 
 # First-boot user, hostname, SSH: cloud-init user-data, as Raspberry Pi Imager writes it

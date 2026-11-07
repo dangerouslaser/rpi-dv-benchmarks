@@ -1,80 +1,98 @@
 # Setting up a development machine
 
 Everything is built for aarch64 (the Pi 5's architecture) inside a Docker
-container, and run without a Pi in a Debian VM on Mesa's software GPUs.
-Only the Pi itself gives performance numbers; the VM is for building,
-correctness checks and A/B tests.
+container. Without a Pi, it runs in a Debian VM on Mesa's software GPUs.
+Only the Pi itself gives performance numbers; the VM is for building and
+correctness checks.
 
 ## Supported hosts
 
-| Host | Build (Docker) | Run (`scripts/vm.sh`) |
+| Host | Build | Run |
 | --- | --- | --- |
-| Mac, Apple Silicon | native arm64 containers | Lima VM, `vm/rpi5dv.yaml` |
-| Linux aarch64 (e.g. an Ampere box, or the Pi itself) | natively: `scripts/install-native-deps.sh` once, then `build-all.sh` (no Docker) | natively, if `/dev/udmabuf` exists (`sudo modprobe udmabuf`) |
-| x86-64 | works under QEMU emulation (`docker run --privileged --rm tonistiigi/binfmt --install arm64`), slowly | not supported (no fast aarch64 VM) |
+| Mac, Apple Silicon | Docker (native arm64 containers) | Lima VM, `vm/rpi5dv.yaml`, through `scripts/vm.sh` |
+| Linux aarch64 (an Ampere box, or the Pi itself) | Natively: `scripts/install-native-deps.sh` once, then `build-all.sh` (no Docker) | Natively, if `/dev/udmabuf` exists (`sudo modprobe udmabuf`) or a DMA heap |
+| x86-64 | Under QEMU emulation (`docker run --privileged --rm tonistiigi/binfmt --install arm64`), slowly | Not supported (no fast aarch64 VM) |
 
 ## macOS (Apple Silicon)
 
 ```sh
 brew install lima
-# Docker: Docker Desktop or OrbStack, either works (scripts use the current context)
+# Docker: Docker Desktop or OrbStack (the scripts use the current context)
 brew install ffmpeg dovi_tool mkvtoolnix     # optional: tests/make-test-clips.sh
 
 git clone <this repo> && cd librelec-rpi5-dv
-./scripts/build-all.sh      # fetch pinned sources, build everything, make the Pi bundle (~15 min first time)
-./scripts/vm-setup.sh       # create the VM from vm/rpi5dv.yaml, provision it, verify dmabuf import
-scripts/vm.sh tests/check.sh    # all byte-identical checks (needs clips/, below)
-scripts/vm.sh tests/check.sh --validate   # plus the Pi configuration under the Vulkan validation layer
-scripts/in-docker.sh bash scripts/build-mesa-shim.sh mesa      # once: Mesa's V3D compiler (as on the Pi)
-DVVK_PREPARE_VARIANTS=1 scripts/shader-stats.sh mesa           # V3D threads/registers/spills per pipeline, no Pi
+./scripts/build-all.sh          # fetch FFmpeg, build FFmpeg + the engine + tools, make the Pi bundle
+./scripts/vm-setup.sh           # create the VM from vm/rpi5dv.yaml, provision it, check dmabuf import
+scripts/vm.sh tests/check.sh    # the engine against tests/golden/hashes.txt (needs clips/, below)
+scripts/vm.sh tests/check.sh --validate     # plus the Khronos validation layer
 ```
 
-`scripts/vm-setup.sh` is idempotent. `--recreate` deletes and rebuilds the VM
-from the yaml; `VM_CPUS` / `VM_MEMORY` / `VM_NAME` override 8 CPUs, 10 GiB, `rpi5dv`.
+`scripts/vm-setup.sh` is idempotent:
+- `--recreate` deletes the VM and rebuilds it from the yaml.
+- `VM_CPUS`, `VM_MEMORY` and `VM_NAME` override 8 CPUs, 10 GiB and `rpi5dv`.
+
 The repo is mounted read-write at the same path inside the VM, so
 `scripts/vm.sh` runs any command against the build in place:
 
 ```sh
-scripts/vm.sh dvbench --hash --layout sand clips/X.mkv
-DVVK_NO_INT64=1 DVVK_NO_PUSH_DESCRIPTOR=1 scripts/vm.sh dvbench --engines vk clips/X.mkv   # the Pi 5 engine paths
+scripts/vm.sh dvbench --hash clips/X.mkv
+scripts/vm.sh dvbench --filters yblod --mmr float clips/X.mkv
 scripts/vm.sh bash          # a shell, PATH and LD_LIBRARY_PATH set
 limactl stop rpi5dv         # when done; limactl delete rpi5dv to remove it
 ```
 
-Why a VM and not Docker for running: the bench needs real dmabufs
+Why a VM and not Docker for running: `dvbench` needs real dmabufs
 (`/dev/udmabuf`), and neither Docker Desktop's nor OrbStack's kernel has
 udmabuf. Debian's cloud kernel does.
 
-## What the VM is
+**What the VM is** (`vm/rpi5dv.yaml`):
+- Debian 13 trixie arm64, the base of Raspberry Pi OS trixie.
+- Apple's `vz` hypervisor.
+- The cloud image is pinned by digest, with the daily image as a fallback.
+- Mesa's lavapipe for Vulkan 1.4.
+- A udev rule that makes `/dev/udmabuf` usable by everyone. A startup probe
+  fails the boot if it's missing.
 
-`vm/rpi5dv.yaml`: Debian 13 trixie arm64 (the base of Raspberry Pi OS
-trixie), Apple's `vz` hypervisor, the cloud image pinned by digest (daily as
-a fallback), Mesa's lavapipe (Vulkan 1.4) and llvmpipe (GLES 3.2), and a
-udev rule making `/dev/udmabuf` usable by everyone. A startup probe fails the
-boot if `/dev/udmabuf` is missing. Verified: Mesa 25.0.7, kernel 6.12.
+## On the Pi
+
+Two ways to get there:
+- **Flash an image:** `scripts/make-image.sh` builds `out/dvbench-rpi5-sd.img.xz`.
+  It is Raspberry Pi OS Lite with the bundle and `clips/`, first-boot user
+  `dv` / `dvbench`, SSH on, and `cma-512` set.
+- **Use an existing install:** copy `out/dvbench-rpi5-*.tar.gz` across. See
+  `bundle/README.md`.
+
+To build on the Pi itself: `scripts/install-native-deps.sh`, then
+`scripts/build-all.sh`.
 
 ## Test clips
 
-Media isn't in git (`clips/` is ignored). Put Dolby Vision files there:
+Media isn't in git (`clips/` is ignored). `tests/check.sh` runs the cases in
+`tests/golden/hashes.txt` whose clips are present:
 
-- Profile 7 FEL clips (the project used the "DV FEL Tests" set: "All Layers
-  Test (Woman at 80s)", "Power Rangers Credits Test", "Test DT DL P7 CMV4.0
-  4000nits v3"; ask Bryan for the shared copy).
-- `tests/make-test-clips.sh clips/<P7 FEL>.mkv` derives a Profile 8.1 and an
-  MMR single-layer clip from one, covering the engine's other routes.
-- Wanted, not yet available: yblod's golden clips (`1917-fel.mkv`,
-  `gemini-mel.mkv`, `28yl-p81.mkv`; `tools/golden.sha256`) and a Profile 5 clip.
+- **The DV FEL test set** (Profile 7 FEL): "DV FEL All Layers Test (Woman at
+  80s)", "DV FEL Power Rangers Credits Test" and "DV FEL Test DT DL P7 CMV4.0
+  4000nits v3". Ask Bryan for the shared copy.
+- **Derived clips:** `tests/make-test-clips.sh` makes profile 8.1 (`p81-`), MEL
+  (`mmr-`) and profile 8.1 MMR (`p81mmr-`) clips from Profile 7 sources:
+  - The test set's derivatives.
+  - The `p81-1917` and `p81mmr-1917` cuts: 6–8 s of 1917 from 10:00.
+  - The `p81mmr-al`, `-pr`, `-cmv` and `-dune2` cuts: the first 4 s of each
+    test clip, and 6 s of Dune Part Two from 50:00.
+
+Full films (1917, Dune) were measured from the NAS over SMB. See
+`docs/ENGINE.md`.
 
 ## Working on the engine
 
-`third_party/` is fetched, not committed. Engine changes:
+- **Edit:** `engine/pi_engine.c`, `engine/shaders/*`, and `engine/planner/*`
+  (vendored; note changes in its README).
+- **Build:** `scripts/in-docker.sh bash scripts/build-engine.sh`.
+- **Check:** `scripts/vm.sh tests/check.sh`, then measure on the Pi.
 
-```sh
-cd third_party/yblod            # branch rpi5 = pinned commit + patches/yblod/*.patch
-# edit yblod-engine/vk/..., then commit on rpi5
-cd ../.. && scripts/export-patches.sh      # rewrites patches/yblod/ from the branch
-scripts/in-docker.sh bash scripts/build-vk.sh && scripts/vm.sh tests/check.sh
-```
+A change that alters output on purpose needs new golden hashes, and a
+reason in the commit.
 
-A fresh `scripts/fetch-sources.sh` re-creates branch `rpi5` from the patches.
-To move a pin, change `sources.lock` and re-export the patches against it.
+Follow the shader rules in `docs/ENGINE.md` ("What V3D taught us"). After any
+shader change, check the V3D compiler's view on the Pi:
+`V3D_DEBUG=shaderdb dvbench --frames 1 …` gives threads, loops and spills.

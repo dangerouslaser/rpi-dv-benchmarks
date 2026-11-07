@@ -1,75 +1,67 @@
 #!/bin/bash
-# The Pi-path checks, on the aarch64 build, in the test VM (or natively on
-# aarch64 Linux): every one requires byte-identical output.
-#   scripts/vm.sh tests/check.sh [CLIP...]      (default: every file in clips/)
-#     1. dvvk-int64-check: the emulated 64-bit shader helpers vs native int64
-#     2. per clip, the Vulkan engine (CB1 contract, then yblod's own routes):
-#        linear P010 input == SAND128 input == SAND + no int64 + no push
-#        descriptors (the Pi 5 configuration)
-#     3. per clip, CB1 == the Vulkan engine (SAND input, CB1 contract)
-#     4. --validate: the Pi 5 configuration under the Khronos validation layer
-#        (tests/vulkan/vk_layer_settings.txt); any validation error fails.
-#        Core validation is proven to fire here (a planted misaligned
-#        vkCmdFillBuffer is reported). Sync validation is switched on too but
-#        did NOT report a planted transfer->dispatch hazard on lavapipe with
-#        layers 1.4.309, so don't read a clean run as "barriers verified".
-# FRAMES (default 8) pictures each. Exit 1 on any difference.
+# The engine's regression check: every case in tests/golden/hashes.txt whose
+# clip is in clips/, run with software decode into SAND128, must reproduce its
+# per-picture output hashes exactly. The golden hashes were verified identical
+# to yblod's Vulkan engine (bilinear FEL) sample for sample (see that file).
+#   scripts/vm.sh tests/check.sh            (or on the Pi / any aarch64 Linux)
+#   tests/check.sh --mmr split              (any exact MMR mode must match)
+#   tests/check.sh --validate               (also: the Khronos validation layer,
+#                                            tests/vulkan/vk_layer_settings.txt;
+#                                            any validation error fails)
+# Exit 1 on any difference. dvbench must be on PATH (the VM's is).
 set -u
 cd "$(dirname "$0")/.."
-FRAMES=${FRAMES:-8}
-VALIDATE=0
-[ "${1:-}" = --validate ] && { VALIDATE=1; shift; }
+VALIDATE=0 MMR=exact
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --validate) VALIDATE=1 ;;
+    --mmr) MMR=$2; shift ;;
+    *) echo "usage: tests/check.sh [--mmr exact|split|exact64|exact32] [--validate]"; exit 2 ;;
+  esac
+  shift
+done
+GOLDEN=tests/golden/hashes.txt
 WORK=${WORK:-build/check}
 mkdir -p "$WORK"
-CLIPS=("$@")
-[ ${#CLIPS[@]} -gt 0 ] || CLIPS=(clips/*)
-[ -e "${CLIPS[0]}" ] || { echo "no clips: put Dolby Vision files in clips/ (docs/SETUP.md)"; exit 2; }
-fail=0
-hashes() { # out, args...: the "hash ENGINE N VALUE" lines of one run
-  local out=$1; shift
-  dvbench --frames "$FRAMES" --warmup 0 --hash "$@" 2>"$out.err" | grep '^hash' >"$out"
-}
-same() { # label, files...: all non-empty and identical (engine names ignored)
-  local label=$1 first=$2; shift 2
-  if [ ! -s "$first" ]; then echo "skip  $label (engine declined these pictures)"; return; fi
-  for f in "$@"; do
-    if ! cmp -s <(cut -d' ' -f3- "$first") <(cut -d' ' -f3- "$f"); then
-      echo "FAIL  $label: $(basename "$f") differs (see $WORK)"; fail=1; return
+fail=0 ran=0
+# the cases: "clip | options", in file order
+cases=$(grep -v '^#' "$GOLDEN" | awk -F' [|] ' '{print $1 " | " $2}' | awk '!seen[$0]++')
+while IFS= read -r case; do
+  clip=${case%% | *}
+  opts=${case#* | }
+  if [ ! -e "clips/$clip" ]; then
+    echo "skip  $clip ($opts): not in clips/"
+    continue
+  fi
+  want=$(grep -F "$clip | $opts | " "$GOLDEN" | awk -F' [|] ' '{print $3, $4}')
+  n=$(echo "$want" | wc -l | tr -d ' ')
+  # shellcheck disable=SC2086
+  got=$(dvbench --frames "$n" --warmup 0 --hash --mmr "$MMR" $opts "clips/$clip" 2>"$WORK/last.err" |
+        awk '/^hash/ {print $2, $3}')
+  ran=$((ran + 1))
+  if [ "$got" = "$want" ]; then
+    echo "ok    $clip ${opts:-(cb1 filters)}: $n pictures identical"
+  else
+    echo "FAIL  $clip ${opts:-(cb1 filters)}: output differs (dvbench stderr: $WORK/last.err)"
+    diff <(echo "$want") <(echo "$got") | head -6 | sed 's/^/      /'
+    fail=1
+  fi
+done <<<"$cases"
+if [ $VALIDATE = 1 ]; then
+  clip=$(grep -v '^#' "$GOLDEN" | head -1 | awk -F' [|] ' '{print $1}')
+  for opts in "" "--filters yblod"; do
+    log=$WORK/validate${opts:+-yblod}.log
+    # shellcheck disable=SC2086
+    VK_LAYER_SETTINGS_PATH=$PWD/tests/vulkan VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation \
+      dvbench --frames 3 --warmup 0 $opts "clips/$clip" >"$log" 2>&1
+    v=$(grep -c "Validation Error" "$log")
+    if grep -q "Validation Layer Active" "$log" && [ "$v" = 0 ]; then
+      echo "ok    validation ${opts:-(cb1 filters)}: no errors"
+    else
+      echo "FAIL  validation ${opts:-(cb1 filters)}: $v errors (or the layer missing), see $log"; fail=1
     fi
   done
-  echo "ok    $label ($(wc -l <"$first") pictures)"
-}
-
-echo "== emulated 64-bit helpers vs native int64"
-dvvk-int64-check - 16 2>/dev/null | sed 's/^/   /'
-[ "${PIPESTATUS[0]}" = 0 ] || fail=1
-
-for clip in "${CLIPS[@]}"; do
-  t=$WORK/$(basename "$clip" | tr -c 'A-Za-z0-9\n' _ | cut -c1-40)
-  echo "== $clip"
-  for mode in cb1 yblod; do
-    extra=; [ $mode = yblod ] && extra=--yblod
-    hashes "$t-$mode-p010" --engines vk --layout p010 $extra "$clip"
-    hashes "$t-$mode-sand" --engines vk --layout sand $extra "$clip"
-    DVVK_NO_INT64=1 DVVK_NO_PUSH_DESCRIPTOR=1 hashes "$t-$mode-pi5" --engines vk --layout sand $extra "$clip"
-    same "vulkan $mode: P010 == SAND == Pi 5 mode" "$t-$mode-p010" "$t-$mode-sand" "$t-$mode-pi5"
-  done
-  hashes "$t-cb1" --engines cb1 --layout sand "$clip"
-  same "CB1 == vulkan (SAND, CB1 contract)" "$t-cb1-sand" "$t-cb1"
-  if [ $VALIDATE = 1 ]; then
-    for mode in "" --yblod; do
-      log=$t-validate${mode:+-yblod}.log
-      VK_LAYER_SETTINGS_PATH=$PWD/tests/vulkan VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation \
-        DVVK_NO_INT64=1 DVVK_NO_PUSH_DESCRIPTOR=1 \
-        dvbench --engines vk --frames 3 --warmup 0 --layout sand $mode "$clip" >"$log" 2>&1
-      n=$(grep -c "Validation Error" "$log")
-      if grep -q "Validation Layer Active" "$log" && [ "$n" = 0 ]; then
-        echo "ok    validation, Pi 5 mode${mode:+ (yblod)}: no errors"
-      else
-        echo "FAIL  validation, Pi 5 mode${mode:+ (yblod)}: $n errors (or layer missing), see $log"; fail=1
-      fi
-    done
-  fi
-done
-[ $fail = 0 ] && echo "all checks passed" || echo "CHECKS FAILED"
+fi
+[ $ran -gt 0 ] || { echo "no clips: put the test clips in clips/ (docs/SETUP.md)"; exit 2; }
+[ $fail = 0 ] && echo "all $ran checks passed" || echo "CHECKS FAILED"
 exit $fail

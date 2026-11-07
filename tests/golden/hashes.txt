@@ -1,0 +1,89 @@
+# Per-picture output hashes of the Pi engine (dvbench --hash), first 6 pictures,
+# software decode into SAND128 (the Pi decoder's layout; its hardware decode is
+# picture-identical). Each case was verified identical to yblod's Vulkan engine
+# (bilinear FEL) sample for sample before yblod was removed (2026-11-06).
+# clip | options | picture | hash
+DV FEL All Layers Test (Woman at 80s).mkv |  | 000 | 2a98b8898c1f6f85
+DV FEL All Layers Test (Woman at 80s).mkv |  | 001 | 6a3d6a03975adcbd
+DV FEL All Layers Test (Woman at 80s).mkv |  | 002 | a1af8363351c0a41
+DV FEL All Layers Test (Woman at 80s).mkv |  | 003 | 699533ff51049dad
+DV FEL All Layers Test (Woman at 80s).mkv |  | 004 | 83ecb70571fdea91
+DV FEL All Layers Test (Woman at 80s).mkv |  | 005 | a95edcd49048a1d9
+DV FEL Power Rangers Credits Test.mkv |  | 000 | 4e4d363c2c133115
+DV FEL Power Rangers Credits Test.mkv |  | 001 | 3ecfa4a41087f236
+DV FEL Power Rangers Credits Test.mkv |  | 002 | d090704d2a82f8e3
+DV FEL Power Rangers Credits Test.mkv |  | 003 | 4162bcb7cdd3025a
+DV FEL Power Rangers Credits Test.mkv |  | 004 | 4474c8d481f9b92f
+DV FEL Power Rangers Credits Test.mkv |  | 005 | 98415e452cef8ffa
+DV FEL Test DT DL P7 CMV4.0 4000nits v3.mp4 |  | 000 | 48fad1cab5e6d03a
+DV FEL Test DT DL P7 CMV4.0 4000nits v3.mp4 |  | 001 | 35ff09fe98023db4
+DV FEL Test DT DL P7 CMV4.0 4000nits v3.mp4 |  | 002 | abd415fb18adc874
+DV FEL Test DT DL P7 CMV4.0 4000nits v3.mp4 |  | 003 | b72b95264c0e9c69
+DV FEL Test DT DL P7 CMV4.0 4000nits v3.mp4 |  | 004 | 358581c9b86a8aa9
+DV FEL Test DT DL P7 CMV4.0 4000nits v3.mp4 |  | 005 | 4d386f7d46dbcf78
+mmr-DV_FEL_Test_DT_DL_P7_CMV.mkv |  | 000 | 6bc6b841cda5b30d
+mmr-DV_FEL_Test_DT_DL_P7_CMV.mkv |  | 001 | e3cc4f3fe6e3e7e1
+mmr-DV_FEL_Test_DT_DL_P7_CMV.mkv |  | 002 | 49b3ba32f4055f09
+mmr-DV_FEL_Test_DT_DL_P7_CMV.mkv |  | 003 | a05eba272a5c14a5
+mmr-DV_FEL_Test_DT_DL_P7_CMV.mkv |  | 004 | 32d4f62c9b0cbbcd
+mmr-DV_FEL_Test_DT_DL_P7_CMV.mkv |  | 005 | cfdc4ae842abfafd
+p81-1917.mkv |  | 000 | a0a5ebed1eb78f25
+p81-1917.mkv |  | 001 | ae573cc1c24084e1
+p81-1917.mkv |  | 002 | 1437ce8948ff6b71
+p81-1917.mkv |  | 003 | 416fa2447e0eaf51
+p81-1917.mkv |  | 004 | 3d2939d5b06b6911
+p81-1917.mkv |  | 005 | 8a8608751f260bd5
+p81-All_Layers_Te.mkv |  | 000 | 2a98b8898c1f6f85
+p81-All_Layers_Te.mkv |  | 001 | 014a40ff7f67665d
+p81-All_Layers_Te.mkv |  | 002 | 972abf1f3528f4c1
+p81-All_Layers_Te.mkv |  | 003 | 1cb41d09c4511bbd
+p81-All_Layers_Te.mkv |  | 004 | 08f312de472e8171
+p81-All_Layers_Te.mkv |  | 005 | 72f1c840afe5d059
+p81-DV_FEL_Test_DT_DL_P7_CMV.mkv |  | 000 | 6bc6b841cda5b30d
+p81-DV_FEL_Test_DT_DL_P7_CMV.mkv |  | 001 | e3cc4f3fe6e3e7e1
+p81-DV_FEL_Test_DT_DL_P7_CMV.mkv |  | 002 | 49b3ba32f4055f09
+p81-DV_FEL_Test_DT_DL_P7_CMV.mkv |  | 003 | a05eba272a5c14a5
+p81-DV_FEL_Test_DT_DL_P7_CMV.mkv |  | 004 | 32d4f62c9b0cbbcd
+p81-DV_FEL_Test_DT_DL_P7_CMV.mkv |  | 005 | cfdc4ae842abfafd
+DV FEL All Layers Test (Woman at 80s).mkv | --filters yblod | 000 | 2a98b8898c1f6f85
+DV FEL All Layers Test (Woman at 80s).mkv | --filters yblod | 001 | e5a13f307aa153ad
+DV FEL All Layers Test (Woman at 80s).mkv | --filters yblod | 002 | 89a9bf81cc802611
+DV FEL All Layers Test (Woman at 80s).mkv | --filters yblod | 003 | 2c7ae33d89a99d2d
+DV FEL All Layers Test (Woman at 80s).mkv | --filters yblod | 004 | 2c9e82fbeb16b671
+DV FEL All Layers Test (Woman at 80s).mkv | --filters yblod | 005 | 4d63ecf8d22ba409
+DV FEL Power Rangers Credits Test.mkv | --filters yblod | 000 | 3f10d3b8a5e2fd45
+DV FEL Power Rangers Credits Test.mkv | --filters yblod | 001 | c076676ba3064a26
+DV FEL Power Rangers Credits Test.mkv | --filters yblod | 002 | 0ffc2e0eb148d7f3
+DV FEL Power Rangers Credits Test.mkv | --filters yblod | 003 | 56cd32046d78ca3a
+DV FEL Power Rangers Credits Test.mkv | --filters yblod | 004 | 928dccebcd802b8f
+DV FEL Power Rangers Credits Test.mkv | --filters yblod | 005 | 3b3ea56bcb0f756a
+p81mmr-1917.mkv | --filters yblod | 000 | caaac28c9b0303c5
+p81mmr-1917.mkv | --filters yblod | 001 | 087bb7a53e00afc1
+p81mmr-1917.mkv | --filters yblod | 002 | 28d3e88588bbf411
+p81mmr-1917.mkv | --filters yblod | 003 | 8e916698a4ca0f91
+p81mmr-1917.mkv | --filters yblod | 004 | fb113fe8d11fadc1
+p81mmr-1917.mkv | --filters yblod | 005 | 476d3e96e025d685
+p81mmr-al.mkv | --filters yblod | 000 | 2a98b8898c1f6f85
+p81mmr-al.mkv | --filters yblod | 001 | a7606ecffc1e1f3d
+p81mmr-al.mkv | --filters yblod | 002 | df127589b217bda1
+p81mmr-al.mkv | --filters yblod | 003 | 86383c7ec910028d
+p81mmr-al.mkv | --filters yblod | 004 | 294875b94e1285f1
+p81mmr-al.mkv | --filters yblod | 005 | d573d2d56dfaf1d9
+p81mmr-pr.mkv | --filters yblod | 000 | fa6f830961bc6649
+p81mmr-pr.mkv | --filters yblod | 001 | 737630973f37e3ca
+p81mmr-pr.mkv | --filters yblod | 002 | b2431295f4bddde1
+p81mmr-pr.mkv | --filters yblod | 003 | 62b6d401d10966f2
+p81mmr-pr.mkv | --filters yblod | 004 | 38e7cead2914b377
+p81mmr-pr.mkv | --filters yblod | 005 | e50bec97e438066c
+p81mmr-cmv.mkv | --filters yblod | 000 | 482f797012845cfd
+p81mmr-cmv.mkv | --filters yblod | 001 | 578cf84b2190fee1
+p81mmr-cmv.mkv | --filters yblod | 002 | ccea8dc95b6a5349
+p81mmr-cmv.mkv | --filters yblod | 003 | 492a51761f3cff35
+p81mmr-cmv.mkv | --filters yblod | 004 | 58c876c7b8aa919d
+p81mmr-cmv.mkv | --filters yblod | 005 | d5c2cb9d25cd3f2d
+p81mmr-dune2.mkv | --filters yblod | 000 | 98a5e0f6ab35e671
+p81mmr-dune2.mkv | --filters yblod | 001 | f5a36d0f9fe0e37d
+p81mmr-dune2.mkv | --filters yblod | 002 | 93670cb1b5acedad
+p81mmr-dune2.mkv | --filters yblod | 003 | 4390a6b4fc108a05
+p81mmr-dune2.mkv | --filters yblod | 004 | 33e22c1bfb857351
+p81mmr-dune2.mkv | --filters yblod | 005 | 58019c160c10690d
