@@ -1,4 +1,5 @@
 #version 450
+// SPDX-License-Identifier: GPL-2.0-or-later
 #extension GL_GOOGLE_include_directive : require
 // Pass 1, one fragment per 4:2:0 chroma sample (cx, k), cw x ch:
 //   - the reconstructed chroma (12-bit Cb, Cr): BL chroma phase, the luma

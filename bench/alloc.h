@@ -2,7 +2,7 @@
  * engine outputs): udmabuf where the kernel has it, else a DMA heap
  * (Raspberry Pi OS: /dev/dma_heap/linux,cma and system). DVBENCH_ALLOC=
  * udmabuf|cma|system picks one.
- * SPDX-License-Identifier: GPL-3.0-or-later */
+ * SPDX-License-Identifier: GPL-2.0-or-later */
 #pragma once
 #include <stddef.h>
 #include <stdint.h>

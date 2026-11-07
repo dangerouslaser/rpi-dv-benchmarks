@@ -27,6 +27,17 @@
  *                        stream's frame clock; counts pictures that missed
  *                        their display deadline and decode stalls
  *     --no-fences        --play: wait on the engine instead of its sync_files
+ *     --kms-writeback    then show the output on a KMS plane with the render's
+ *                        sync_file as IN_FENCE_FD, captured by a writeback
+ *                        connector (no display needed), and compare the
+ *                        capture with the finished frame; again without the
+ *                        fence, as the control
+ *     --reopen           then close the stream, open it again in the same engine
+ *                        and render the pictures again: identical output
+ *                        (the planner's state reset, the imports released)
+ *     --implicit-sync    per picture: does the output dmabuf carry an implicit
+ *                        fence (what KMS waits on without a sync_file), busy
+ *                        right after the render is submitted, idle after?
  *     --hash             print a hash of every output picture
  *     --dump DIR         write each output as DIR/pi-N.bgra
  *     --json FILE        machine-readable summary
@@ -44,7 +55,7 @@
  * before the next starts: wall time from submit to completion. Outputs are
  * the HDMI tunnel's BGRA frame at the stream's size (12-bit 4:2:2 packed
  * with the metadata).
- * SPDX-License-Identifier: GPL-3.0-or-later */
+ * SPDX-License-Identifier: GPL-2.0-or-later */
 #define _GNU_SOURCE
 #include "source.h"
 #include "alloc.h"
@@ -52,6 +63,11 @@
 #include <errno.h>
 #include <math.h>
 #include <poll.h>
+#include <drm_fourcc.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <xf86drm.h>
+#include <xf86drmMode.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -189,7 +205,7 @@ static void json_string(FILE *f, const char *s)
 /* ---- one picture ------------------------------------------------------------ */
 
 static struct pi_engine *g_pi;
-static int g_profile, g_fel = 1, g_fences = 1;
+static int g_profile, g_fel = 1, g_fences = 1, g_implicit, g_reopen, g_kms;
 
 /* acquire_fd: taken; release_fd: NULL, or the render's sync_file (-1 none). */
 static int render_fenced(const struct dv_picture *q, double pts, struct out_buf *o, int acquire_fd, int *release_fd)
@@ -463,6 +479,216 @@ static int env_on(const char *name)
     return v && *v && strcmp(v, "0") != 0;
 }
 
+/* ---- KMS: the output on a plane, the release sync_file as IN_FENCE_FD ------ */
+
+static uint32_t prop_id(int fd, uint32_t obj, uint32_t type, const char *name)
+{
+    drmModeObjectProperties *p = drmModeObjectGetProperties(fd, obj, type);
+    uint32_t id = 0;
+    for (uint32_t i = 0; p && i < p->count_props && !id; i++) {
+        drmModePropertyRes *r = drmModeGetProperty(fd, p->props[i]);
+        if (r && !strcmp(r->name, name))
+            id = r->prop_id;
+        drmModeFreeProperty(r);
+    }
+    drmModeFreeObjectProperties(p);
+    return id;
+}
+
+struct kms {
+    int fd;
+    uint32_t crtc, conn, plane, mode_blob, fb_in, fb_wb, wb_handle, wb_pitch;
+    uint8_t *wb_map;
+    size_t wb_size;
+};
+
+/* A writeback connector, a CRTC and a plane for it, the output as a
+ * framebuffer and a dumb buffer to capture into. 0 OK. */
+static int kms_open(struct kms *k, const struct out_buf *o)
+{
+    memset(k, 0, sizeof(*k));
+    for (int card = 0; card < 4; card++) {
+        char path[32];
+        snprintf(path, sizeof(path), "/dev/dri/card%d", card);
+        k->fd = open(path, O_RDWR | O_CLOEXEC);
+        if (k->fd < 0)
+            continue;
+        drmModeRes *res = NULL;
+        if (!drmSetClientCap(k->fd, DRM_CLIENT_CAP_ATOMIC, 1) &&
+            !drmSetClientCap(k->fd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1) &&
+            !drmSetClientCap(k->fd, DRM_CLIENT_CAP_WRITEBACK_CONNECTORS, 1))
+            res = drmModeGetResources(k->fd);
+        for (int i = 0; res && i < res->count_connectors && !k->conn; i++) {
+            drmModeConnector *c = drmModeGetConnector(k->fd, res->connectors[i]);
+            if (c && c->connector_type == DRM_MODE_CONNECTOR_WRITEBACK && c->count_encoders) {
+                drmModeEncoder *enc = drmModeGetEncoder(k->fd, c->encoders[0]);
+                int ci = enc ? __builtin_ffs((int)enc->possible_crtcs) - 1 : -1;
+                for (int m = 0; ci >= 0 && ci < res->count_crtcs && m < c->count_modes && !k->conn; m++)
+                    if (c->modes[m].hdisplay == o->w && c->modes[m].vdisplay == o->h &&
+                        !drmModeCreatePropertyBlob(k->fd, &c->modes[m], sizeof(c->modes[m]), &k->mode_blob)) {
+                        k->conn = c->connector_id;
+                        k->crtc = res->crtcs[ci];
+                        drmModePlaneRes *pr = drmModeGetPlaneResources(k->fd);
+                        for (uint32_t p = 0; pr && p < pr->count_planes && !k->plane; p++) {
+                            drmModePlane *pl = drmModeGetPlane(k->fd, pr->planes[p]);
+                            for (uint32_t f = 0; pl && (pl->possible_crtcs & (1u << ci)) && f < pl->count_formats; f++)
+                                if (pl->formats[f] == DRM_FORMAT_XRGB8888)
+                                    k->plane = pl->plane_id;
+                            drmModeFreePlane(pl);
+                        }
+                        drmModeFreePlaneResources(pr);
+                    }
+                drmModeFreeEncoder(enc);
+            }
+            drmModeFreeConnector(c);
+        }
+        drmModeFreeResources(res);
+        if (k->conn && k->plane)
+            break;
+        close(k->fd);
+        k->fd = -1;
+        k->conn = 0;
+    }
+    if (k->fd < 0) {
+        fprintf(stderr, "kms: no writeback connector with a %ux%u mode and an XRGB8888 plane\n", o->w, o->h);
+        return -1;
+    }
+    uint32_t h, handles[4] = {0}, pitches[4] = {o->stride}, offsets[4] = {0};
+    if (drmPrimeFDToHandle(k->fd, o->buf.fd, &h))
+        return -1;
+    handles[0] = h;
+    if (drmModeAddFB2(k->fd, o->w, o->h, DRM_FORMAT_XRGB8888, handles, pitches, offsets, &k->fb_in, 0))
+        return -1;
+    struct drm_mode_create_dumb cd = {.width = o->w, .height = o->h, .bpp = 32};
+    if (drmIoctl(k->fd, DRM_IOCTL_MODE_CREATE_DUMB, &cd))
+        return -1;
+    k->wb_handle = cd.handle;
+    k->wb_pitch = cd.pitch;
+    k->wb_size = cd.size;
+    handles[0] = cd.handle;
+    pitches[0] = cd.pitch;
+    struct drm_mode_map_dumb md = {.handle = cd.handle};
+    if (drmModeAddFB2(k->fd, o->w, o->h, DRM_FORMAT_XRGB8888, handles, pitches, offsets, &k->fb_wb, 0) ||
+        drmIoctl(k->fd, DRM_IOCTL_MODE_MAP_DUMB, &md))
+        return -1;
+    k->wb_map = mmap(NULL, k->wb_size, PROT_READ | PROT_WRITE, MAP_SHARED, k->fd, (off_t)md.offset);
+    return k->wb_map == MAP_FAILED ? -1 : 0;
+}
+
+/* One commit: the output on the plane (IN_FENCE_FD = in_fence unless -1),
+ * captured. Blocking: KMS waits for the plane's fence before it reads. */
+static int kms_commit(struct kms *k, const struct out_buf *o, int in_fence)
+{
+    int32_t wb_fence = -1;
+    drmModeAtomicReq *r = drmModeAtomicAlloc();
+    uint32_t P = DRM_MODE_OBJECT_PLANE, C = DRM_MODE_OBJECT_CRTC, N = DRM_MODE_OBJECT_CONNECTOR;
+    drmModeAtomicAddProperty(r, k->crtc, prop_id(k->fd, k->crtc, C, "MODE_ID"), k->mode_blob);
+    drmModeAtomicAddProperty(r, k->crtc, prop_id(k->fd, k->crtc, C, "ACTIVE"), 1);
+    drmModeAtomicAddProperty(r, k->conn, prop_id(k->fd, k->conn, N, "CRTC_ID"), k->crtc);
+    drmModeAtomicAddProperty(r, k->conn, prop_id(k->fd, k->conn, N, "WRITEBACK_FB_ID"), k->fb_wb);
+    drmModeAtomicAddProperty(r, k->conn, prop_id(k->fd, k->conn, N, "WRITEBACK_OUT_FENCE_PTR"),
+                             (uint64_t)(uintptr_t)&wb_fence);
+    drmModeAtomicAddProperty(r, k->plane, prop_id(k->fd, k->plane, P, "FB_ID"), k->fb_in);
+    drmModeAtomicAddProperty(r, k->plane, prop_id(k->fd, k->plane, P, "CRTC_ID"), k->crtc);
+    drmModeAtomicAddProperty(r, k->plane, prop_id(k->fd, k->plane, P, "SRC_X"), 0);
+    drmModeAtomicAddProperty(r, k->plane, prop_id(k->fd, k->plane, P, "SRC_Y"), 0);
+    drmModeAtomicAddProperty(r, k->plane, prop_id(k->fd, k->plane, P, "SRC_W"), (uint64_t)o->w << 16);
+    drmModeAtomicAddProperty(r, k->plane, prop_id(k->fd, k->plane, P, "SRC_H"), (uint64_t)o->h << 16);
+    drmModeAtomicAddProperty(r, k->plane, prop_id(k->fd, k->plane, P, "CRTC_X"), 0);
+    drmModeAtomicAddProperty(r, k->plane, prop_id(k->fd, k->plane, P, "CRTC_Y"), 0);
+    drmModeAtomicAddProperty(r, k->plane, prop_id(k->fd, k->plane, P, "CRTC_W"), o->w);
+    drmModeAtomicAddProperty(r, k->plane, prop_id(k->fd, k->plane, P, "CRTC_H"), o->h);
+    if (in_fence >= 0)
+        drmModeAtomicAddProperty(r, k->plane, prop_id(k->fd, k->plane, P, "IN_FENCE_FD"), (uint64_t)in_fence);
+    int rc = drmModeAtomicCommit(k->fd, r, DRM_MODE_ATOMIC_ALLOW_MODESET, NULL);
+    drmModeAtomicFree(r);
+    if (rc) {
+        fprintf(stderr, "kms: atomic commit failed: %s\n", strerror(errno));
+        return -1;
+    }
+    if (wb_fence >= 0) {   /* the capture written */
+        fence_done(wb_fence, 1000);
+        close(wb_fence);
+    }
+    return 0;
+}
+
+static void kms_close(struct kms *k)
+{
+    if (k->fd < 0)
+        return;
+    drmModeAtomicReq *r = drmModeAtomicAlloc();   /* everything off again */
+    drmModeAtomicAddProperty(r, k->plane, prop_id(k->fd, k->plane, DRM_MODE_OBJECT_PLANE, "FB_ID"), 0);
+    drmModeAtomicAddProperty(r, k->plane, prop_id(k->fd, k->plane, DRM_MODE_OBJECT_PLANE, "CRTC_ID"), 0);
+    drmModeAtomicAddProperty(r, k->conn, prop_id(k->fd, k->conn, DRM_MODE_OBJECT_CONNECTOR, "CRTC_ID"), 0);
+    drmModeAtomicAddProperty(r, k->crtc, prop_id(k->fd, k->crtc, DRM_MODE_OBJECT_CRTC, "ACTIVE"), 0);
+    drmModeAtomicAddProperty(r, k->crtc, prop_id(k->fd, k->crtc, DRM_MODE_OBJECT_CRTC, "MODE_ID"), 0);
+    drmModeAtomicCommit(k->fd, r, DRM_MODE_ATOMIC_ALLOW_MODESET, NULL);
+    drmModeAtomicFree(r);
+    if (k->wb_map && k->wb_map != MAP_FAILED)
+        munmap(k->wb_map, k->wb_size);
+    if (k->fb_wb)
+        drmModeRmFB(k->fd, k->fb_wb);
+    if (k->fb_in)
+        drmModeRmFB(k->fd, k->fb_in);
+    if (k->wb_handle) {
+        struct drm_mode_destroy_dumb dd = {.handle = k->wb_handle};
+        drmIoctl(k->fd, DRM_IOCTL_MODE_DESTROY_DUMB, &dd);
+    }
+    if (k->mode_blob)
+        drmModeDestroyPropertyBlob(k->fd, k->mode_blob);
+    close(k->fd);
+}
+
+/* Per picture: the output filled with a marker, rendered, committed at once
+ * (fenced or not), captured; then the capture against the finished frame.
+ * Returns the pictures whose capture was the finished frame. */
+static int kms_run(struct kms *k, const struct dv_picture *pics, int count, double period, struct out_buf *o,
+                   int fenced, int *marked)
+{
+    int match = 0;
+    *marked = 0;
+    for (int i = 0; i < count; i++) {
+        dv_dmabuf_cpu(&o->buf, 1, 1);
+        memset(o->buf.map, 0xa5, o->buf.size);
+        dv_dmabuf_cpu(&o->buf, 0, 1);
+        int fence = -1;
+        if (!render_fenced(&pics[i], i * period, o, -1, fenced ? &fence : NULL))
+            continue;
+        if (fenced && fence < 0) {
+            fprintf(stderr, "kms: no release sync_file from the engine\n");
+            return -1;
+        }
+        int busy = !pi_output_done(g_pi, o->out);
+        double t0 = now_ms();
+        int rc = kms_commit(k, o, fence);
+        double t1 = now_ms() - t0;
+        if (getenv("DVBENCH_KMS_DEBUG"))
+            fprintf(stderr, "kms: %s commit: GPU %s at commit, commit + capture %.1f ms, GPU %s after\n",
+                    fenced ? "fenced" : "bare", busy ? "busy" : "done", t1,
+                    pi_output_done(g_pi, o->out) ? "done" : "busy");
+        if (fence >= 0)
+            close(fence);
+        pi_output_wait(g_pi, o->out);
+        if (rc)
+            return -1;
+        dv_dmabuf_cpu(&o->buf, 1, 0);
+        int same = 1, mark = 0;
+        for (uint32_t y = 0; y < o->h; y++) {
+            const uint32_t *a = (const uint32_t *)(o->buf.map + (size_t)y * o->stride);
+            const uint32_t *b = (const uint32_t *)(k->wb_map + (size_t)y * k->wb_pitch);
+            for (uint32_t x = 0; x < o->w; x++) {
+                same &= ((a[x] ^ b[x]) & 0xffffffu) == 0;
+                mark |= (b[x] & 0xffffffu) == 0xa5a5a5u;
+            }
+        }
+        dv_dmabuf_cpu(&o->buf, 0, 0);
+        match += same;
+        *marked += mark;
+    }
+    return match;
+}
+
 /* --probe: what dvbench and the engine need from this machine. */
 static int probe(struct pi_options *po)
 {
@@ -504,6 +730,12 @@ int main(int argc, char **argv)
             i++;
         } else if (!strcmp(a, "--no-fences"))
             g_fences = 0;
+        else if (!strcmp(a, "--implicit-sync"))
+            g_implicit = 1;
+        else if (!strcmp(a, "--reopen"))
+            g_reopen = 1;
+        else if (!strcmp(a, "--kms-writeback"))
+            g_kms = 1;
         else if (!strcmp(a, "--el-sw"))
             so.el_software = 1;
         else if (!strcmp(a, "--frames") && takes) {
@@ -662,9 +894,22 @@ int main(int argc, char **argv)
     double *times = calloc((size_t)count, sizeof(double)), pass_sum[2] = {0}, plan_sum = 0;
     if (!times)
         return 1;
+    int implicit_busy = 0, implicit_idle = 0, implicit_later = 0, gpu_later = 0;
+    uint64_t *first_hash = calloc((size_t)count, sizeof(uint64_t));
     for (int i = 0; i < count; i++) {
         double t0 = now_ms();
-        int ok = render(&pics[i], i * period, &out[0]) && pi_output_wait(g_pi, out[0].out) == 0;
+        int ok = render(&pics[i], i * period, &out[0]);
+        if (ok && g_implicit) {   /* POLLOUT: every fence on the dmabuf (read and write) signalled */
+            struct pollfd pf = {.fd = out[0].buf.fd, .events = POLLOUT};
+            implicit_busy += poll(&pf, 1, 0) == 0;
+            struct timespec ms2 = {0, 2000000};
+            nanosleep(&ms2, NULL);
+            implicit_later += !pi_output_done(g_pi, out[0].out) && poll(&pf, 1, 0) == 0;
+            gpu_later += !pi_output_done(g_pi, out[0].out);
+            pi_output_wait(g_pi, out[0].out);
+            implicit_idle += poll(&pf, 1, 0) > 0;
+        }
+        ok = ok && pi_output_wait(g_pi, out[0].out) == 0;
         double t = now_ms() - t0;
         if (!ok) {
             failed++;
@@ -678,8 +923,10 @@ int main(int argc, char **argv)
                 pass_sum[k] += st.pass_ms[k];
             plan_sum += st.plan_ms;
         }
+        if (hash || g_reopen)
+            first_hash[i] = out_hash(&out[0]);
         if (hash)
-            printf("hash %03d %016llx\n", i, (unsigned long long)out_hash(&out[0]));
+            printf("hash %03d %016llx\n", i, (unsigned long long)first_hash[i]);
         if (dump && out_dump(&out[0], dump, i))
             status = 1;
     }
@@ -693,6 +940,40 @@ int main(int argc, char **argv)
                    pass_sum[1] / s.n);
         printf("\n");
     }
+    if (g_kms) {
+        struct kms k;
+        if (kms_open(&k, &out[0])) {
+            printf("kms: no writeback setup (see stderr)\n");
+            status = 1;
+        } else {
+            int marked_f, marked_n;
+            int fenced = kms_run(&k, pics, count, period, &out[0], 1, &marked_f);
+            int bare = kms_run(&k, pics, count, period, &out[0], 0, &marked_n);
+            printf("kms: IN_FENCE_FD: %d of %d captures are the finished frame (%d show the unfinished marker); "
+                   "without a fence: %d (%d)\n", fenced, count - failed, marked_f, bare, marked_n);
+            if (fenced != count - failed)
+                status = 1;
+        }
+        kms_close(&k);
+    }
+    if (g_reopen) {
+        pi_stream_close(g_pi);
+        int same = 0, done = 0;
+        if (pi_stream_open(g_pi, &si) == 0)
+            for (int i = 0; i < count; i++)
+                if (render(&pics[i], i * period, &out[0]) && pi_output_wait(g_pi, out[0].out) == 0) {
+                    done++;
+                    same += first_hash[i] && out_hash(&out[0]) == first_hash[i];
+                }
+        printf("reopen: %d of %d pictures identical to the first stream's%s\n", same, count - failed,
+               same == count - failed && done == same ? "" : " FAILURES");
+        if (same != count - failed)
+            status = 1;
+    }
+    if (g_implicit)
+        printf("implicit sync: the output dmabuf busy right after submit for %d of %d pictures; 2 ms later for %d "
+               "of the %d still rendering; idle after completion for %d\n", implicit_busy, count - failed,
+               implicit_later, gpu_later, implicit_idle);
     if (failed) {
         printf("%d pictures failed\n", failed);
         status = 1;
@@ -774,6 +1055,7 @@ int main(int argc, char **argv)
     pi_engine_destroy(g_pi);
     dv_source_close(src);
     free(times);
+    free(first_hash);
     free(pics);
     return status;
 }

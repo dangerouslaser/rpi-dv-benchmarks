@@ -10,3 +10,4 @@ endif()
 string(REGEX REPLACE "([0-9a-f][0-9a-f])([0-9a-f][0-9a-f])([0-9a-f][0-9a-f])([0-9a-f][0-9a-f])" "0x\\4\\3\\2\\1," words "${hex}")
 string(REGEX REPLACE "((0x[0-9a-f]+,){8})" "\\1\n" words "${words}")
 file(WRITE ${OUT} "{\n${words}\n}\n")
+# SPDX-License-Identifier: GPL-2.0-or-later

@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-3.0-or-later
+/* SPDX-License-Identifier: GPL-2.0-or-later
  *
  * Optional "CM2.9 to CM4.0" metadata and L2 trim removal for the film's DM
  * payload (dvvk_plan_in.dm_options, include/dvvk_plan.h), as CroqueMr's CB1

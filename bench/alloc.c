@@ -1,5 +1,5 @@
 /* See alloc.h.
- * SPDX-License-Identifier: GPL-3.0-or-later */
+ * SPDX-License-Identifier: GPL-2.0-or-later */
 #define _GNU_SOURCE
 #include "alloc.h"
 #include <fcntl.h>

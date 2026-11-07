@@ -1,5 +1,5 @@
 /* See source.h.
- * SPDX-License-Identifier: GPL-3.0-or-later */
+ * SPDX-License-Identifier: GPL-2.0-or-later */
 #define _GNU_SOURCE
 #include "source.h"
 #include "alloc.h"
@@ -34,6 +34,8 @@ struct dv_source {
     AVPacket *pending[2];   /* a packet the decoder couldn't take yet (its output queue full) */
     AVFrame *queue[2][QUEUE];
     int queued[2];
+    int el_out, drop_el;   /* EL pictures output; test: discard the drop_el-th (DVBENCH_DROP_EL) */
+    int el_timed;   /* EL pictures at the queue's front whose pts is their display time */
     int profile, el_present, el_seen, eof, nal_size, warned;
     struct pooled pool[POOL];
     double copy_ms;
@@ -204,6 +206,8 @@ struct dv_source *dv_source_open(const char *path, const struct dv_source_option
         return NULL;
     s->o = *o;
     s->nal_size = 4;
+    if (getenv("DVBENCH_DROP_EL"))
+        s->drop_el = atoi(getenv("DVBENCH_DROP_EL"));
     if (avformat_open_input(&s->fmt, path, NULL, NULL) < 0 || avformat_find_stream_info(s->fmt, NULL) < 0)
         goto fail;
     s->stream = av_find_best_stream(s->fmt, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
@@ -300,6 +304,31 @@ AVRational dv_source_rate(const struct dv_source *s)
     return s->fmt->streams[s->stream]->avg_frame_rate;
 }
 
+/* The EL pictures' display times. An EL picture's pts is its packet's, which
+ * isn't its display time where the EL's coding order differs from the
+ * packets' (the "All Layers" test clip). But the decoder outputs in display
+ * order, and the output pictures' packet times, within the EL's reorder
+ * depth, are their display times in another order: the earliest of those not
+ * yet given out is the next picture's. Pictures the decoder discarded
+ * (leading pictures after a seek) never come out, so they take no time. At
+ * the end (flush) every picture is given one. */
+static void el_display_times(struct dv_source *s, int flush)
+{
+    int depth = s->dec[1] ? s->dec[1]->has_b_frames + 2 : 1;
+    if (depth > QUEUE / 2)
+        depth = QUEUE / 2;
+    while (s->el_timed < s->queued[1] && (flush || s->queued[1] - s->el_timed > depth)) {
+        AVFrame **q = s->queue[1];
+        int m = s->el_timed;
+        for (int i = s->el_timed + 1; i < s->queued[1]; i++)
+            if (q[i]->pts != AV_NOPTS_VALUE && (q[m]->pts == AV_NOPTS_VALUE || q[i]->pts < q[m]->pts))
+                m = i;
+        int64_t t = q[m]->pts;   /* the earliest: this picture's; it gives its own to the one it came from */
+        q[m]->pts = q[s->el_timed]->pts;
+        q[s->el_timed++]->pts = t;
+    }
+}
+
 /* Decoded pictures into the layer's queue, until it is full or the decoder
  * has none ready. */
 static int drain_decoder(struct dv_source *s, int layer)
@@ -320,9 +349,16 @@ static int drain_decoder(struct dv_source *s, int layer)
                 return AVERROR(EINVAL);
             f = d;
         }
-        if (layer)
+        if (layer) {
             s->el_seen = 1;
+            if (++s->el_out == s->drop_el) {   /* a decoder losing a picture, for the pairing's test */
+                av_frame_free(&f);
+                continue;
+            }
+        }
         s->queue[layer][s->queued[layer]++] = f;
+        if (layer)
+            el_display_times(s, 0);
     }
     return 0;
 }
@@ -372,30 +408,47 @@ static AVPacket *layer_packet(struct dv_source *s, int layer, const AVPacket *in
 static AVFrame *pop(struct dv_source *s, int layer)
 {
     AVFrame *f = s->queue[layer][0];
+    if (layer && s->el_timed)
+        s->el_timed--;
     memmove(s->queue[layer], s->queue[layer] + 1, sizeof(s->queue[0][0]) * (size_t)--s->queued[layer]);
     return f;
 }
 
 /* The next picture from the queues; 0 if none can be made yet. The layers
- * pair in output order: each decoder outputs in display order, so the k-th
- * BL and EL pictures share a POC. Not by timestamp: an EL picture's is its
- * packet's, and where the EL's coding order differs from the packets' (the
- * "All Layers" test clip) EL timestamps don't follow display order. */
+ * pair by display time: the BL picture's timestamp, and the EL picture's as
+ * el_display_times assigns it. A picture without its partner (a decoder lost
+ * one) is dropped (EL) or shown alone (BL). Without timestamps: in output
+ * order, as both decoders output in display order. */
 static int take(struct dv_source *s, struct dv_picture *p, int layers)
 {
-    if (!s->queued[0])
-        return 0;
-    if (layers == 2 && !s->queued[1] && s->queued[0] < QUEUE && s->eof < 2)
-        return 0;   /* wait for its EL */
-    p->bl = pop(s, 0);
-    if (layers == 2 && s->queued[1])
-        p->el = pop(s, 1);
-    else if (layers == 2 && !s->warned++)
-        fprintf(stderr, "source: a base-layer picture without its enhancement layer\n");
-    p->dovi = av_frame_get_side_data(p->bl, AV_FRAME_DATA_DOVI_METADATA);
-    if (!p->dovi && p->el)
-        p->dovi = av_frame_get_side_data(p->el, AV_FRAME_DATA_DOVI_METADATA);
-    return 1;
+    while (s->queued[0]) {
+        if (layers == 2 && s->eof == 2)
+            el_display_times(s, 1);
+        if (layers == 2 && !s->el_timed && s->queued[0] < QUEUE && s->eof < 2)
+            return 0;   /* wait for its EL */
+        if (layers == 2 && s->el_timed) {
+            int64_t a = s->queue[0][0]->pts, b = s->queue[1][0]->pts;
+            int timed = a != AV_NOPTS_VALUE && b != AV_NOPTS_VALUE;
+            if (timed && b < a) {   /* an EL picture whose BL was lost */
+                AVFrame *f = pop(s, 1);
+                av_frame_free(&f);
+                if (!s->warned++)
+                    fprintf(stderr, "source: an enhancement-layer picture without its base layer\n");
+                continue;
+            }
+            p->bl = pop(s, 0);
+            if (!timed || a == b)
+                p->el = pop(s, 1);
+        } else
+            p->bl = pop(s, 0);
+        if (layers == 2 && !p->el && !s->warned++)
+            fprintf(stderr, "source: a base-layer picture without its enhancement layer\n");
+        p->dovi = av_frame_get_side_data(p->bl, AV_FRAME_DATA_DOVI_METADATA);
+        if (!p->dovi && p->el)
+            p->dovi = av_frame_get_side_data(p->el, AV_FRAME_DATA_DOVI_METADATA);
+        return 1;
+    }
+    return 0;
 }
 
 int dv_source_next(struct dv_source *s, struct dv_picture *p)

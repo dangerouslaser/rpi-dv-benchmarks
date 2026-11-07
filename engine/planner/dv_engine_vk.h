@@ -1,6 +1,6 @@
 /* big-fella's Dolby Vision source-tunnel engine on Vulkan compute
  * (docs/vulkan-engine.md).
- * SPDX-License-Identifier: GPL-3.0-or-later */
+ * SPDX-License-Identifier: GPL-2.0-or-later */
 #pragma once
 #include <stddef.h>
 #include <stdint.h>

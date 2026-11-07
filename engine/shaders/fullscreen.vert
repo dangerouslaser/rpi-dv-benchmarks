@@ -1,4 +1,5 @@
 #version 450
+// SPDX-License-Identifier: GPL-2.0-or-later
 // One triangle covering the render area.
 void main()
 {

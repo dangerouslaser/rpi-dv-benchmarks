@@ -1,7 +1,7 @@
 /* The tunnel's pixel packing, one copy for the C and the GLSL side
  * (pi_engine.c's cleared bars, p2_pack.frag's finish()): 12-bit luma yy and
  * chroma c as the BGRA bytes of the HDMI tunnel frame. Valid C and GLSL.
- * SPDX-License-Identifier: GPL-3.0-or-later */
+ * SPDX-License-Identifier: GPL-2.0-or-later */
 #ifndef PI_PACK_H
 #define PI_PACK_H
 /* The pixels one metadata packet spans: its 1024 bits three times over, a

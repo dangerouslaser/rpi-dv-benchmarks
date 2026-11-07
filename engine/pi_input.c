@@ -1,6 +1,6 @@
 /* The input glue a player needs around the engine (pi_engine.h): chroma
  * siting, the decoder's buffer layout and the single-track Profile 7 split.
- * SPDX-License-Identifier: GPL-3.0-or-later */
+ * SPDX-License-Identifier: GPL-2.0-or-later */
 #include "pi_engine.h"
 #include "pi_internal.h"
 

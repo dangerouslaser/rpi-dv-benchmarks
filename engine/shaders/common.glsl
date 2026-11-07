@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 // The Pi engine (pi_engine.c): shared declarations of its two fragment
 // passes. Every value is an integer code, computed as yblod's FEL route with
 // the bilinear EL upscale computes it; only the chroma MMR has a float mode

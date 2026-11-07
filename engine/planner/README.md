@@ -24,7 +24,10 @@ output was verified identical to it, sample for sample. `tests/golden/` keeps
 those results as the regression reference.
 
 **Licences:** see `LICENSE` and `LICENSES/`.
-- The C sources are GPL-3.0-or-later.
+- The C sources are GPL-2.0-or-later (yblod's GPL-3.0-or-later, relicensed
+  by their author for this repository).
+- `dm_cm4.c` is adapted from CroqueMr's `cb1_cmv40.c` and Kodi
+  (GPL-2.0-or-later); `cb1_overlay.c` from libplacebo (LGPL-2.1-or-later).
 - `dm_cm4.c` and `dv_cm4.c` carry code from quietvoid's dovi_tool (MIT,
   `LICENSES/MIT-dovi-tool*.txt`).
 - Explicit per-file notices take precedence.

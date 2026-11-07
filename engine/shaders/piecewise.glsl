@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 // The single-layer general mapping (the planner's route 3), exactly as
 // yblod's piecewise.comp (single_reshape.cl) computes it, 64-bit integers
 // emulated (DV_NO_INT64): per channel, pivots and up to 8 pieces, each a

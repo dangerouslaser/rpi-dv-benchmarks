@@ -5,9 +5,9 @@
  *     (alloc.h) in the Pi decoder's exact SAND128 P030 layout, so the
  *     engine's input path runs on any Linux box.
  * Profile 7's BL and EL are decoded separately (single-track: split by
- * pi_p7_split) and paired in output order (source.c take()). This is the
+ * pi_p7_split) and paired by display time (source.c take()). This is the
  * template for a player's input glue (docs/REVIEW.md P1 #8).
- * SPDX-License-Identifier: GPL-3.0-or-later */
+ * SPDX-License-Identifier: GPL-2.0-or-later */
 #pragma once
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>

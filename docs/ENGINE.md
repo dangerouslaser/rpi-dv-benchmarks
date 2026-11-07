@@ -65,22 +65,38 @@ P2  w/2 × h/2   one fragment per 2×2 output block: 4:2:2 vertical filter,
   guard), so a scene change doesn't wait for a compile.
 - **Queue ownership** of the decoder buffers and the output moves to and
   from `VK_QUEUE_FAMILY_FOREIGN_EXT` around each render.
-- **An acquire fence already signalled isn't imported:** waiting on a
-  semaphore stops v3dv overlapping a frame's work with the last one's, which
-  made 1917 drop frames.
+- **The release sync_file is the render's fence, exported** (where the
+  device has `VK_KHR_external_fence_fd`; the engine then tracks the render
+  by its own copy, since exporting resets the fence). A semaphore signalled
+  by the submission costs v3dv the overlap of consecutive frames: 1917
+  dropped 0–5 frames in 120 s with one, none with the fence.
+- **An acquire fence already signalled isn't imported,** for the same reason
+  on the waiting side.
+- **Give KMS the sync_file (`IN_FENCE_FD`).** v3d does put an implicit fence
+  on the output dmabuf, and KMS waits on it. But it appears only once v3dv
+  has passed the job to the kernel, after `vkQueueSubmit` returns
+  (`dvbench --implicit-sync`, kernel 6.18.60: no fence right after submit
+  in 12 of 12 pictures, a fence 2 ms later in all 12). A commit inside that
+  window would show an unfinished frame. The sync_file has no such window.
+  `dvbench --kms-writeback` checks the whole path without a display: the
+  output on a KMS plane with `IN_FENCE_FD`, captured by a writeback
+  connector, is the finished frame (12 of 12, 1080p, a 46 ms render
+  committed while still drawing).
 - **Input glue** for a player (`engine/pi_input.c`): `pi_chroma_top_left()`,
   `pi_is_sand128()` and `pi_p7_split()`, the single-track Profile 7 BL / EL
   split. `bench/source.c` is the reference for decoding and pairing the
-  layers: in output order, because an EL picture's timestamp is its
-  packet's.
+  layers, by display time (`el_display_times()`: an EL picture's own
+  timestamp is its packet's, not its display time, where the EL's coding
+  order differs).
 - **Build:** `libpi_engine.a` and `libdv_planner.a`, with `pi_engine.h`,
   install with CMake. glslc is optional: without it the committed SPIR-V
   (`engine/shaders/spirv/`, built with `-O`, which V3D needs: 7–9% faster)
   is used; `cmake --build . --target update-spirv` refreshes it. dvbench
   builds with `-DPI_BUILD_BENCH=ON`.
-- **Licence:** GPL-3.0-or-later (`LICENSE`), the planner's terms. A Kodi
-  linking the engine is GPLv3 as a whole, which Kodi's GPL-2.0-or-later
-  allows. Kodi's FFmpeg must carry `patches/ffmpeg` (the Dolby Vision RPU
+- **Licence:** GPL-2.0-or-later (`LICENSE`), as Kodi; third-party notices
+  in `engine/planner/LICENSE`. The bench's FFmpeg is built
+  `--enable-version3`, so binaries linking it are GPLv3 as a whole, which
+  "or later" allows. Kodi's FFmpeg must carry `patches/ffmpeg` (the Dolby Vision RPU
   extensions the planner reads, `DV_FFMPEG_RAW_EXTENSIONS`).
 
 ## Routes
@@ -148,7 +164,7 @@ read over SMB:
 
 | Film | Route | Per picture | 24p real time |
 |---|---|---|---|
-| 1917 (UHD BD, P7.6 FEL, MMR, 2.39:1) | dual, `exact` | 33.0 ms (30.3 fps; 35.2 before the review) | 3 × 120 s, **0 late**, 73 °C, no throttling (5 min, 0 late with the 35.2 ms build). With sync_file fences: 0, 5 and 1 late (worst 21 ms): see "Open" |
+| 1917 (UHD BD, P7.6 FEL, MMR, 2.39:1) | dual, `exact` | 33.0 ms (30.3 fps; 35.2 before the review) | with sync_file fences, 4 × 120 s: 0, 0, 0 and 1 late (≤ 0.8 ms); without, 0, 1 and 0; 73 °C, no throttling |
 | Dune (2021) (UHD BD, P7.6 MEL) | single | 16.1 ms (65 fps) | 60 s, 0 late |
 | Profile 8.1 MMR cuts (1917, test clips) | piecewise | 26.1–27.9 ms | 8 s, 0 late |
 | DV FEL test clips (polynomial chroma) | dual | 29.0 ms (35 fps) | — |
@@ -240,6 +256,15 @@ reads no environment. `--measure` takes the same names, comma-separated.
 
 `dvbench --probe` checks the allocator, the device and an output import.
 `--no-fences` makes `--play` wait on the engine instead of the sync_files.
+`--implicit-sync` reports whether the output dmabuf carries an implicit
+fence right after each submit and 2 ms later. `--kms-writeback` shows each
+output on a KMS plane with its sync_file as `IN_FENCE_FD`, captured by a
+writeback connector, against the finished frame, then the same without the
+fence (`DVBENCH_KMS_DEBUG=1`: commit timings). The Pi's writeback offers no
+3840×2160 mode, so it needs a 1080p stream. `--reopen` closes and reopens
+the stream in the same engine and requires identical output (the planner
+reset; without it no picture matches). `DVBENCH_DROP_EL=N` discards the Nth EL picture
+(the BL / EL pairing's test).
 
 On the Pi itself, `V3D_DEBUG=shaderdb` prints the compiler's statistics,
 `V3D_DEBUG=fs` the QPU code, and `V3D_DEBUG=nir` the NIR.
@@ -264,14 +289,5 @@ On the Pi itself, `V3D_DEBUG=shaderdb` prints the compiler's statistics,
   - Profile 8.4 is real time with the default `cb1` filters only.
   - 1080p (Profiles 5, 8.1, 8.4) is checked as above; Profile 7 at 1080p
     has no test clip.
-  - Whether v3d's implicit `dma_resv` fences alone would order the output
-    against KMS is untested: the engine's sync_files do.
-  - **Exporting the release sync_file sometimes stalls.** 1917 with
-    `--play` drops 0–5 frames in 120 s (worst 21 ms late) with fences, and
-    none in three runs without (`--no-fences`). The acquire side is ruled
-    out: an already-signalled acquire fence isn't imported. A first guess is
-    that `vkGetSemaphoreFdKHR` waits for v3dv's submission to reach the
-    kernel. Try exporting from another thread, or a syncobj's sync_file
-    taken after submit.
   - The Annex B EL upscale and resized output (the planner's
     `PACK_RESIZED`) aren't implemented.

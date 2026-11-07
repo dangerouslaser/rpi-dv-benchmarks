@@ -1,4 +1,5 @@
 #version 450
+// SPDX-License-Identifier: GPL-2.0-or-later
 #extension GL_GOOGLE_include_directive : require
 // Pass 2 (the 4:2:2 filter and the pack, fused): one fragment per 4:2:0
 // chroma sample (px, k), cw x ch, writing the 2 x 2 block of output pixels

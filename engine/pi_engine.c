@@ -9,12 +9,13 @@
  * Per frame: plan (CPU), the tables (only when the planner's generation
  * changed), the pipelines (cached; the scene's family built ahead on a
  * worker thread), then record and submit.
- * SPDX-License-Identifier: GPL-3.0-or-later */
+ * SPDX-License-Identifier: GPL-2.0-or-later */
 #define _GNU_SOURCE
 #include "pi_engine.h"
 #include "pi_internal.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <libavutil/hwcontext_drm.h>
 #include <math.h>
 #include <poll.h>
@@ -156,6 +157,7 @@ struct ctx {
     VkCommandBuffer cmd;
     VkFence fence;
     VkSemaphore acquire, release;   /* sync_file import / export, where supported */
+    int sync_fd;                    /* the render's fence, exported: its completion (-1 none) */
     VkQueryPool qp;
     int busy;
     uint64_t serial;
@@ -198,7 +200,8 @@ struct pi_engine {
     PFN_vkGetMemoryFdPropertiesKHR get_fd_props;
     PFN_vkImportSemaphoreFdKHR import_sem_fd;
     PFN_vkGetSemaphoreFdKHR get_sem_fd;
-    int modifiers, foreign, sem_fd, profile;
+    PFN_vkGetFenceFdKHR get_fence_fd;
+    int modifiers, foreign, sem_fd, fence_fd, profile;
     double ts_period;
     VkSampler sampler;
     VkDescriptorSetLayout dsl;
@@ -863,6 +866,10 @@ static int create_device(struct pi_engine *e)
         exts[next++] = "VK_KHR_external_semaphore_fd";
         e->sem_fd = 1;
     }
+    if (has_ext(e->phys, "VK_KHR_external_fence_fd")) {
+        exts[next++] = "VK_KHR_external_fence_fd";
+        e->fence_fd = 1;
+    }
     uint32_t nq = 0;
     vkGetPhysicalDeviceQueueFamilyProperties(e->phys, &nq, NULL);
     VkQueueFamilyProperties *qf = calloc(nq ? nq : 1, sizeof(*qf));
@@ -892,6 +899,10 @@ static int create_device(struct pi_engine *e)
         e->import_sem_fd = (PFN_vkImportSemaphoreFdKHR)vkGetDeviceProcAddr(e->dev, "vkImportSemaphoreFdKHR");
         e->get_sem_fd = (PFN_vkGetSemaphoreFdKHR)vkGetDeviceProcAddr(e->dev, "vkGetSemaphoreFdKHR");
         e->sem_fd = e->import_sem_fd && e->get_sem_fd;
+    }
+    if (e->fence_fd) {
+        e->get_fence_fd = (PFN_vkGetFenceFdKHR)vkGetDeviceProcAddr(e->dev, "vkGetFenceFdKHR");
+        e->fence_fd = e->get_fence_fd != NULL;
     }
     if (!e->get_fd_props)
         return PI_E_VULKAN;
@@ -940,8 +951,11 @@ static int create_ctx(struct pi_engine *e, struct ctx *c)
                                        .commandPool = e->pool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
                                        .commandBufferCount = 1};
     VKC(e, vkAllocateCommandBuffers(e->dev, &cai, &c->cmd));
-    VkFenceCreateInfo fci = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    VkExportFenceCreateInfo fex = {.sType = VK_STRUCTURE_TYPE_EXPORT_FENCE_CREATE_INFO,
+                                   .handleTypes = VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT};
+    VkFenceCreateInfo fci = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, .pNext = e->fence_fd ? &fex : NULL};
     VKC(e, vkCreateFence(e->dev, &fci, NULL, &c->fence));
+    c->sync_fd = -1;
     if (e->sem_fd) {
         VkExportSemaphoreCreateInfo ex = {.sType = VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO,
                                           .handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT};
@@ -1041,14 +1055,25 @@ const char *pi_engine_describe(const struct pi_engine *e) { return e->name; }
 
 /* ---- renders in flight ----------------------------------------------------------- */
 
+static int fd_signalled(int fd, int timeout);
+
 /* Context c's render is done: its timings, frames and imports released. */
 static int ctx_retire(struct pi_engine *e, struct ctx *c, int block)
 {
     if (!c->busy)
         return 0;
-    VkResult r = block ? vkWaitForFences(e->dev, 1, &c->fence, VK_TRUE, UINT64_MAX) : vkGetFenceStatus(e->dev, c->fence);
-    if (r == VK_NOT_READY || r == VK_TIMEOUT)
-        return 1;
+    VkResult r;
+    if (c->sync_fd >= 0) {   /* the fence was exported (which resets it): its sync_file */
+        if (!fd_signalled(c->sync_fd, block ? -1 : 0))
+            return 1;
+        close(c->sync_fd);
+        c->sync_fd = -1;
+        r = VK_SUCCESS;
+    } else {
+        r = block ? vkWaitForFences(e->dev, 1, &c->fence, VK_TRUE, UINT64_MAX) : vkGetFenceStatus(e->dev, c->fence);
+        if (r == VK_NOT_READY || r == VK_TIMEOUT)
+            return 1;
+    }
     if (r != VK_SUCCESS) {
         logf_(e, PI_LOG_ERROR, "render failed: %d", (int)r);
         /* the device is lost: nothing will run; release anyway */
@@ -1122,7 +1147,10 @@ void pi_stream_close(struct pi_engine *e)
     if (!e || !e->dev)
         return;
     retire_all(e);
+    int n = e->nimports;
     imports_release(e);
+    if (e->open)
+        logf_(e, PI_LOG_DEBUG, "stream closed: %d imports released", n);
     e->open = 0;
 }
 
@@ -1324,6 +1352,8 @@ void pi_engine_destroy(struct pi_engine *e)
         stream_images_destroy(e);
         for (int k = 0; k < PI_FRAMES_IN_FLIGHT; k++) {
             struct ctx *c = &e->c[k];
+            if (c->sync_fd >= 0)
+                close(c->sync_fd);
             vkDestroyQueryPool(e->dev, c->qp, NULL);
             vkDestroySemaphore(e->dev, c->acquire, NULL);
             vkDestroySemaphore(e->dev, c->release, NULL);
@@ -1943,26 +1973,31 @@ static int submit(struct pi_engine *e, struct ctx *c, int acquire_fd, int *relea
             close(acquire_fd);
         }
     }
-    int export = release_fd && e->sem_fd;
+    /* The release sync_file: the submission's fence exported, where the device
+     * can (no semaphore in the submission: a semaphore signal costs v3dv the
+     * overlap of consecutive frames, which dropped frames); else a semaphore. */
+    int export_fence = release_fd && e->fence_fd, export = release_fd && !export_fence && e->sem_fd;
     if (export) {
         si.signalSemaphoreCount = 1;
         si.pSignalSemaphores = &c->release;
     }
-    double s0 = now_ms();
     VKC(e, vkQueueSubmit(e->queue, 1, &si, c->fence));
-    if (now_ms() - s0 > 1.0)
-        fprintf(stderr, "XP submit took %.1f ms (export %d)\n", now_ms() - s0, export);
     if (release_fd)
         *release_fd = -1;
+    if (export_fence) {
+        VkFenceGetFdInfoKHR gi = {.sType = VK_STRUCTURE_TYPE_FENCE_GET_FD_INFO_KHR, .fence = c->fence,
+                                  .handleType = VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT};
+        int fd = -1;
+        if (e->get_fence_fd(e->dev, &gi, &fd) == VK_SUCCESS && fd >= 0) {
+            c->sync_fd = fd;   /* the engine's own copy; the fence itself is now reset */
+            *release_fd = fcntl(fd, F_DUPFD_CLOEXEC, 0);
+        }
+    }
     if (export) {
         VkSemaphoreGetFdInfoKHR gi = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR, .semaphore = c->release,
                                       .handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT};
-        double x0 = now_ms();
         if (e->get_sem_fd(e->dev, &gi, release_fd) != VK_SUCCESS)
             *release_fd = -1;
-        double x1 = now_ms() - x0;
-        if (x1 > 1.0)
-            fprintf(stderr, "XP export took %.1f ms\n", x1);
     }
     return 0;
 }

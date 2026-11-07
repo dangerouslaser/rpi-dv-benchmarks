@@ -15,7 +15,7 @@
  *   pi_output_release, pi_engine_destroy
  * One thread drives an engine. Up to PI_FRAMES_IN_FLIGHT renders are in
  * flight; pi_render waits for the oldest beyond that.
- * SPDX-License-Identifier: GPL-3.0-or-later */
+ * SPDX-License-Identifier: GPL-2.0-or-later */
 #pragma once
 #include <libavutil/frame.h>
 #include <stdint.h>

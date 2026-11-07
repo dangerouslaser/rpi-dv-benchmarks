@@ -13,7 +13,7 @@ player.
 
 | Film, Pi 5 at stock clocks | Per picture | Real time at 23.976 fps |
 |---|---|---|
-| 1917: UHD Blu-ray, Profile 7.6 FEL, MMR, exact | 33.0 ms | 3 × 120 s, 0 late frames |
+| 1917: UHD Blu-ray, Profile 7.6 FEL, MMR, exact | 33.0 ms | 4 × 120 s with display fences: 1 late frame (0.8 ms) |
 | Dune (2021): Profile 7.6 MEL | 16.1 ms | 60 s, 0 late |
 | Profile 8.1 with MMR chroma | 26–28 ms | 8 s, 0 late |
 | Sol Levante (Dolby's samples): Profiles 5, 8.1 | 18.3 ms; 1080p 4.7 ms | 90 s, 0 late |
@@ -25,14 +25,16 @@ The design, its routes, MMR modes and measurements are in
 [docs/HISTORY.md](docs/HISTORY.md). The integration review and what was done
 about each finding are in [docs/REVIEW.md](docs/REVIEW.md).
 
-Licence: GPL-3.0-or-later ([LICENSE](LICENSE)), the vendored planner's
-terms. A Kodi linking the engine is GPLv3 as a whole.
+Licence: GPL-2.0-or-later ([LICENSE](LICENSE)), as Kodi. Third-party pieces
+keep their notices: `engine/planner/LICENSE` (dovi_tool's MIT parts,
+libplacebo's LGPL-2.1 overlay coefficients) and `patches/ffmpeg/` (FFmpeg's
+terms).
 
 ## Layout
 
 | Path | What |
 |---|---|
-| `engine/` | The engine: `pi_engine.h` (the API), `pi_engine.c`, `pi_input.c` (a player's input glue), its shaders (`shaders/`: two fragment passes; `spirv/`: their committed SPIR-V), the planner (`planner/`: the CPU half, vendored from yblod, GPL-3.0-or-later) |
+| `engine/` | The engine: `pi_engine.h` (the API), `pi_engine.c`, `pi_input.c` (a player's input glue), its shaders (`shaders/`: two fragment passes; `spirv/`: their committed SPIR-V), the planner (`planner/`: the CPU half, vendored from yblod) |
 | `bench/` | `dvbench`: decode (the Pi's V4L2 decoder, or software into the same SAND128 layout) + the engine, timed, with playback, sync_file fences and output hashes; `--probe` checks a machine |
 | `patches/ffmpeg/` | FFmpeg 9.0 as LibreELEC builds it for the Pi 5, plus the Dolby Vision metadata patches (`patches/ffmpeg/README.md`) |
 | `tests/` | `check.sh`: the engine must reproduce `golden/hashes.txt` (verified identical to yblod); `make-test-clips.sh`: profile 8.1 / MEL / MMR clips from Profile 7 sources |

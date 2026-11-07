@@ -1,6 +1,7 @@
 The native renderer C/OpenCL implementation and its synthetic contract tests
-are distributed under GPL-3.0-or-later, consistent with the project's shared
-engine. Build wiring and documentation are MIT. Explicit per-file notices
+are distributed under GPL-2.0-or-later. (yblod distributed them under
+GPL-3.0-or-later; their author relicensed this copy, 2026-11-07, to match
+Kodi.) Build wiring and documentation are MIT. Explicit per-file notices
 take precedence; tests/ffmpeg_metadata_fields.c retains its MIT notice.
 
 License texts are in LICENSES/. The dovi_tool notice is retained alongside

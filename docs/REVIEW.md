@@ -68,22 +68,35 @@ what was done. The changes were checked as follows:
      `docs/ENGINE.md` "Using the engine" summarises it.
 2. ~~**Sync with the display plane.**~~
    - **Done:** `pi_render` returns a sync_file signalled when the output is
-     complete. It is a semaphore exported as `SYNC_FD`, not the fence:
-     exporting a fence resets it.
+     complete: the submission's fence, exported as `SYNC_FD`. Exporting
+     resets the fence, so the engine tracks that render by its own copy of
+     the sync_file. (A first version signalled an exportable semaphore
+     instead. On v3dv that cost the overlap of consecutive frames: 1917
+     dropped 0, 5 and 1 frames in three 120 s runs, against none without
+     fences. With the fence, 0, 0, 0 and 1 (0.8 ms) in four.) Without
+     `VK_KHR_external_fence_fd`, the semaphore is the fallback.
    - It takes an acquire sync_file, imported as a semaphore. One already
-     signalled is closed instead: on v3dv a semaphore wait stops a frame's
-     work overlapping the last one's, which made 1917 drop frames.
+     signalled (the usual case) is closed instead, for the same reason.
    - Queue-family ownership moves to and from `VK_QUEUE_FAMILY_FOREIGN_EXT`
      for the decoder buffers and the output. The barriers cost nothing
      measurable.
    - `dvbench --play` drives all of it as a display would. Without
      `VK_KHR_external_semaphore_fd` (lavapipe) it waits on the CPU.
-   - Still untested: whether v3d's implicit `dma_resv` fences would be
-     enough without the sync_files.
-   - **Open, found while testing this:** exporting the release sync_file
-     sometimes stalls the render thread. 1917 drops 0, 5 and 1 frames in
-     three 120 s runs (worst 21 ms) with fences, and none in three without.
-     `docs/ENGINE.md` "Open" has the next steps.
+   - Implicit fences alone are not enough, though they exist. v3d fences
+     the output dmabuf, and KMS waits on that fence: a commit without a
+     sync_file, made while a 46 ms render was still drawing, took 48 ms and
+     captured the finished frame. But the fence appears only once v3dv has
+     handed the job to the kernel, after `vkQueueSubmit` returns.
+     `dvbench --implicit-sync` found no fence right after submit (12 of 12)
+     and one 2 ms later (12 of 12). A commit in that window would show an
+     unfinished frame. So Kodi gives KMS the release sync_file as
+     `IN_FENCE_FD`.
+   - Tested directly: `dvbench --kms-writeback` puts the output on a KMS
+     plane with the sync_file as `IN_FENCE_FD`, captures it with the vc4
+     writeback connector, and compares the capture with the finished frame.
+     The output was pre-filled with a marker. Result: 12 of 12 captures are
+     the finished frame, with no marker, both with a 4.7 ms render and with
+     a 46 ms one committed while still rendering.
 3. ~~**Sizes other than 3840×2160.**~~
    - **Done:** the size is the stream's (`pi_stream_open`), and outputs are
      validated against it. Dolby's 1080p Profile 5, 8.1 and 8.4 samples
@@ -100,7 +113,10 @@ what was done. The changes were checked as follows:
    - The pipeline cache file (P0 #2) makes later runs fast.
 5. ~~**K5: planner state across streams.**~~
    - **Done:** `pi_stream_open` calls `dvvk_plan_state_reset`, and marks
-     every context's tables stale.
+     every context's tables stale. `dvbench --reopen` renders a stream,
+     closes it, opens it again in the same engine and renders it again: all
+     pictures identical (Power Rangers, Sol 8.4, an 8.1 MMR cut). Without
+     the reset none are, the metadata packet ids running on.
 6. ~~**Logging and options.**~~
    - **Done:** `struct pi_options` at create. It has a log callback with
      levels (stderr without one) and one flag per warning, so each warns
@@ -116,8 +132,11 @@ what was done. The changes were checked as follows:
      committed files are built with `-O`.
    - `option(PI_BUILD_BENCH OFF)`; bench/ alone needs libdrm.
    - `install()` rules for the libraries and `pi_engine.h`.
-   - `LICENSE` (GPL-3.0). README.md and ENGINE.md state the GPLv3
-     consequence for Kodi, and that Kodi's FFmpeg needs `patches/ffmpeg`.
+   - `LICENSE`: GPL-2.0-or-later, as Kodi. The planner was yblod's
+     GPL-3.0-or-later; its author relicensed it here. Its third-party parts
+     (dovi_tool's MIT, libplacebo's LGPL-2.1, CroqueMr's and Kodi's
+     GPL-2.0-or-later in `dm_cm4.c`) all allow that. README.md and ENGINE.md
+     say so, and that Kodi's FFmpeg needs `patches/ffmpeg`.
 8. ~~**Input glue to move next to the engine.**~~
    - **Done:** `engine/pi_input.c` has `pi_p7_split` (the single-track
      Profile 7 split), `pi_chroma_top_left` and `pi_is_sand128` (used by the
@@ -163,11 +182,24 @@ what was done. The changes were checked as follows:
      - The EL is given up only if no EL picture has ever arrived.
      - Contexts are freed on every `open_decoder` failure, and allocations
        are checked.
-   - **Pairing BL and EL by timestamp was tried and is wrong.** On the "All
-     Layers" test clip the EL's coding order differs from the packets', so
-     EL timestamps (each its packet's) don't follow display order. Both
-     decoders output in display order, so the k-th pictures pair, as before.
-     A BL picture with no EL left is shown without one, with a warning.
+     - BL and EL pair by display time. An EL picture's own timestamp is
+       its packet's. Where the EL's coding order differs from the packets'
+       (the "All Layers" test clip), that isn't its display time, and plain
+       timestamp pairing lost pictures 1 and 4 of its first six. So
+       `el_display_times()` sorts the output EL pictures' packet times
+       within the EL's reorder depth (the decoder's `has_b_frames`), and
+       gives each picture, in output order, the earliest one left. Pictures
+       the decoder discards (leading pictures after a seek, Power Rangers)
+       never come out, so they take no time.
+     - Pairing then recovers from a lost picture. An EL picture whose BL is
+       missing is dropped; a BL picture without its EL is shown alone.
+       `DVBENCH_DROP_EL=N` discards the Nth EL picture as a test. On "All
+       Layers" and Power Rangers only that picture is missing, and every
+       later one has the same pixels (Power Rangers' metadata packet ids
+       renumber). Output-order pairing would have mispaired every picture
+       after the loss.
+     - Identical to before on every golden case, and on the Pi with hardware
+       decode (1917, "All Layers", Power Rangers).
 7. ~~**Smaller issues.**~~
    - **Done:**
      - A device with no graphics queue is an error.
