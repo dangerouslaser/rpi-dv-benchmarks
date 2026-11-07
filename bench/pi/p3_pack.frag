@@ -4,7 +4,9 @@
 // chroma sample (px, k), cw x ch, writing the 2 x 2 block of output pixels
 // x = 2px, 2px+1 by rows 2k, 2k+1 into the linear scanout buffer itself: two
 // colour attachments over the same dmabuf, its even and its odd rows, each
-// RG32UI (a pixel pair, the BGRA bytes) at half width and half height.
+// RG32UI (a pixel pair, the BGRA bytes). (A 2 x 4 block per fragment, four
+// attachments, fewer fetches per pixel, measured slower: 32 bytes a pixel of
+// tile buffer shrinks the tiles.)
 //
 // Per pixel, exactly yblod's pack.comp (PACK 0, SOURCE 2, bilinear):
 //   - luma from the BL (SAND) and the EL luma (pass 1's copy, upsampled
@@ -31,6 +33,9 @@ layout(constant_id = 3) const uint ABLATE = 0;
 layout(constant_id = 4) const uint BARS = 0;
 // The single-layer polynomial route: luma is the BL through a 12-bit table.
 layout(constant_id = 5) const uint SINGLE = 0;
+// Route 3's full-height layout (yblod's PACK 422): pass 1 packed both rows'
+// chroma, 4 x 12 bits, into its two targets; no vertical filter.
+layout(constant_id = 6) const uint FULL422 = 0;
 
 uint packet_byte(uint i) { return (P.packets[i >> 4][(i >> 2) & 3u] >> (8u * (i & 3u))) & 255u; }
 
@@ -87,6 +92,61 @@ vec2 crow(uint cx, int k, int i, int last)
     return vec2(texelFetch(chroma420, ivec2(cx, clamp(k + i - 3, 0, last)), 0).rg);
 }
 
+// The 4:2:2 phases (rows 2k: e, 2k+1: d) of one chroma column from its rows
+// r0 .. r7 = k-3 .. k+4 (r7: the top-left eight-tap only).
+void phases(vec2 r0, vec2 r1, vec2 r2, vec2 r3, vec2 r4, vec2 r5, vec2 r6, vec2 r7, out uvec2 e, out uvec2 d)
+{
+    vec2 fe, fd;
+    if (ANNEXB != 0u && TOP_LEFT != 0u) {
+        ivec2 s = 22 * (ivec2(r0) + ivec2(r7)) + 94 * (ivec2(r1) + ivec2(r6)) - 524 * (ivec2(r2) + ivec2(r5)) +
+                  2456 * (ivec2(r3) + ivec2(r4));
+        fe = r3;
+        fd = vec2(clamp((s + 2048) >> 12, ivec2(0), ivec2(4095)));
+    } else if (ANNEXB != 0u && (ABLATE & 64u) != 0u) {
+        fe = r3;
+        fd = r4;
+    } else if (ANNEXB != 0u) {
+        // exact in float: codes < 4096, the taps' absolute sum 330 (< 2^24)
+        vec2 se = 2.0 * r0 - 12.0 * r1 + 65.0 * r2 + 222.0 * r3 - 25.0 * r4 + 4.0 * r5;
+        vec2 so = 4.0 * r1 - 25.0 * r2 + 222.0 * r3 + 65.0 * r4 - 12.0 * r5 + 2.0 * r6;
+        fe = clamp(floor((se + 128.0) * (1.0 / 256.0)), 0.0, 4095.0);
+        fd = clamp(floor((so + 128.0) * (1.0 / 256.0)), 0.0, 4095.0);
+    } else if (TOP_LEFT != 0u) {   // the 2-tap blend over rows k-1, k, k+1
+        fe = r3;
+        fd = floor((2.0 * r3 + 2.0 * r4 + 2.0) * 0.25);
+    } else {
+        fe = floor((r2 + 3.0 * r3 + 2.0) * 0.25);
+        fd = floor((3.0 * r3 + r4 + 2.0) * 0.25);
+    }
+    e = uvec2(fe);
+    d = uvec2(fd);
+}
+
+// The EL luma of a 2 x 2 block's rows 2k (from gather gu: rows k-1, k) and
+// 2k+1 (gd: rows k, k+1), columns px, px+1: (row 2k x, x+1, row 2k+1 x, x+1).
+// gather: x (c0, b), y (c1, b), z (c1, a), w (c0, a); rows a, b = a, a+1
+uvec4 el_block(uvec4 gu, uvec4 gd)
+{
+    uvec2 ve = (3u * gu.xy + gu.wz + 2u) >> 2, vd = (3u * gd.wz + gd.xy + 2u) >> 2;
+    return min(uvec4(ve.x, (ve.x + ve.y + 1u) >> 1, vd.x, (vd.x + vd.y + 1u) >> 1), uvec4(1023u));
+}
+
+// A 2 x 2 block at (x, y): its luma from BL samples b and EL e, chroma c
+// (Cb, Cr, Cb, Cr), the letterbox's black outside the active area, packed.
+void block(uint x, uint y, uvec4 b, uvec4 e, uvec4 c, out uvec2 top, out uvec2 bottom)
+{
+    uvec4 yy = uvec4(luma(b.x, e.x), luma(b.y, e.y), luma(b.z, e.z), luma(b.w, e.w));
+    if (x < P.area.x || y < P.area.y || x + 1u >= P.area.z || y + 1u >= P.area.w) {
+        bool ox0 = x < P.area.x || x >= P.area.z, ox1 = x + 1u < P.area.x || x + 1u >= P.area.z;
+        bool oy0 = y < P.area.y || y >= P.area.w, oy1 = y + 1u < P.area.y || y + 1u >= P.area.w;
+        bvec4 black = bvec4(ox0 || oy0, ox1 || oy0, ox0 || oy1, ox1 || oy1);
+        yy = mix(yy, uvec4(P.black.x), black);
+        c = mix(c, uvec4(P.black.y, P.black.z, P.black.y, P.black.z), black);
+    }
+    top = uvec2(finish(x, y, yy.x, c.x), finish(x + 1u, y, yy.y, c.y));
+    bottom = uvec2(finish(x, y + 1u, yy.z, c.z), finish(x + 1u, y + 1u, yy.w, c.w));
+}
+
 void main()
 {
     uint px = uint(gl_FragCoord.x), k = uint(gl_FragCoord.y), x = 2u * px, y0 = 2u * k;
@@ -107,74 +167,33 @@ void main()
         return;
     }
 
-    // 4:2:2 chroma of rows 2k (e) and 2k+1 (d), (Cb, Cr) of column px
+    // 4:2:2 chroma of rows 2k (e) and 2k+1 (d), (Cb, Cr) of column px. (No
+    // local arrays: V3D's compiler puts arrays written in a loop in scratch.)
     int kk = int(k), last = int(P.size.w) - 1;
-    // (no local arrays: V3D's compiler puts arrays written in a loop in
-    // scratch memory before it unrolls the loop, a TMU store and load each)
-    vec2 e, d;
-    if (ANNEXB != 0u) {
+    uvec2 e, d;
+    if (FULL422 != 0u) {
+        uvec2 a = texelFetch(chroma420, ivec2(px, k), 0).rg;
+        uint b = texelFetch(el_luma, ivec2(px, k), 0).r;
+        e = uvec2(a.x & 4095u, (a.x >> 12) | ((a.y & 255u) << 4));
+        d = uvec2((a.y >> 8) | ((b & 15u) << 8), b >> 4);
+    } else if (ANNEXB != 0u) {
         vec2 r0 = crow(px, kk, 0, last), r1 = crow(px, kk, 1, last), r2 = crow(px, kk, 2, last),
              r3 = crow(px, kk, 3, last), r4 = crow(px, kk, 4, last), r5 = crow(px, kk, 5, last),
              r6 = crow(px, kk, 6, last);
-        if (TOP_LEFT != 0u) {
-            ivec2 r7 = ivec2(crow(px, kk, 7, last));
-            ivec2 s = 22 * (ivec2(r0) + r7) + 94 * (ivec2(r1) + ivec2(r6)) - 524 * (ivec2(r2) + ivec2(r5)) +
-                      2456 * (ivec2(r3) + ivec2(r4));
-            e = r3;
-            d = vec2(clamp((s + 2048) >> 12, ivec2(0), ivec2(4095)));
-        } else if ((ABLATE & 64u) != 0u) {
-            e = r3;
-            d = r4;
-        } else {
-            // exact in float: codes < 4096, the taps' absolute sum 330 (< 2^24)
-            vec2 se = 2.0 * r0 - 12.0 * r1 + 65.0 * r2 + 222.0 * r3 - 25.0 * r4 + 4.0 * r5;
-            vec2 so = 4.0 * r1 - 25.0 * r2 + 222.0 * r3 + 65.0 * r4 - 12.0 * r5 + 2.0 * r6;
-            e = clamp(floor((se + 128.0) * (1.0 / 256.0)), 0.0, 4095.0);
-            d = clamp(floor((so + 128.0) * (1.0 / 256.0)), 0.0, 4095.0);
-        }
+        vec2 r7 = TOP_LEFT != 0u ? crow(px, kk, 7, last) : vec2(0.0);
+        phases(r0, r1, r2, r3, r4, r5, r6, r7, e, d);
     } else {
-        // the 2-tap blend over rows k-1, k, k+1
-        vec2 a = crow(px, kk, 2, last), b = crow(px, kk, 3, last), c = crow(px, kk, 4, last);
-        if (TOP_LEFT != 0u) {
-            e = b;
-            d = floor((2.0 * b + 2.0 * c + 2.0) * 0.25);
-        } else {
-            e = floor((a + 3.0 * b + 2.0) * 0.25);
-            d = floor((3.0 * b + c + 2.0) * 0.25);
-        }
+        vec2 z = vec2(0.0);
+        phases(z, z, crow(px, kk, 2, last), crow(px, kk, 3, last), crow(px, kk, 4, last), z, z, z, e, d);
     }
-    uvec2 ce = uvec2(e), cd = uvec2(d);
 
-    // EL luma rows k-1, k, k+1 at columns px, px + 1: row 2k mixes 3:1 rows
-    // k and k-1, row 2k+1 rows k and k+1; odd pixels average the two columns.
-    // gather: x (c0, b), y (c1, b), z (c1, a), w (c0, a); rows a, b = a, a+1
-    uvec4 gu, gd;
+    // EL luma rows k-1, k, k+1 at columns px, px + 1: two gathers
+    uvec4 el;
     if (SINGLE != 0u || (ABLATE & 2u) != 0u)
-        gu = gd = uvec4(px, k, px + 1u, k) & 1023u;
+        el = uvec4(px, k, px + 1u, k) & 1023u;
     else {
         vec2 at = vec2(float(px + 1u), float(k)) * P.inv.xy;   // rows k-1, k
-        gu = textureGather(el_luma, at, 0);
-        gd = textureGather(el_luma, at + vec2(0.0, P.inv.y), 0);   // rows k, k+1
+        el = el_block(textureGather(el_luma, at, 0), textureGather(el_luma, at + vec2(0.0, P.inv.y), 0));
     }
-    uvec2 ve = (3u * gu.xy + gu.wz + 2u) >> 2, vd = (3u * gd.wz + gd.xy + 2u) >> 2;
-    uvec2 ee = min(uvec2(ve.x, (ve.x + ve.y + 1u) >> 1), uvec2(1023u));
-    uvec2 ed = min(uvec2(vd.x, (vd.x + vd.y + 1u) >> 1), uvec2(1023u));
-
-    // BL luma: samples x, x + 1 of both rows
-    uvec4 bb = bl_block(x, y0);
-    uvec2 be = bb.xy, bd = bb.zw;
-    uvec2 ye = uvec2(luma(be.x, ee.x), luma(be.y, ee.y)), yd = uvec2(luma(bd.x, ed.x), luma(bd.y, ed.y));
-
-    // x: Cb, x + 1: Cr; the letterbox's black outside the active area
-    uvec4 yy = uvec4(ye, yd), c = uvec4(ce, cd);
-    if (x < P.area.x || y0 < P.area.y || x + 1u >= P.area.z || y0 + 1u >= P.area.w) {
-        bool ox0 = x < P.area.x || x >= P.area.z, ox1 = x + 1u < P.area.x || x + 1u >= P.area.z;
-        bvec4 out_x = bvec4(ox0, ox1, ox0, ox1);
-        bvec2 out_y = bvec2(y0 < P.area.y || y0 >= P.area.w, y0 + 1u < P.area.y || y0 + 1u >= P.area.w);
-        bvec4 black = bvec4(out_x.x || out_y.x, out_x.y || out_y.x, out_x.z || out_y.y, out_x.w || out_y.y);
-        yy = mix(yy, uvec4(P.black.x), black);
-        c = mix(c, uvec4(P.black.y, P.black.z, P.black.y, P.black.z), black);
-    }
-    o_even = uvec2(finish(x, y0, yy.x, c.x), finish(x + 1u, y0, yy.y, c.y));
-    o_odd = uvec2(finish(x, y0 + 1u, yy.z, c.z), finish(x + 1u, y0 + 1u, yy.w, c.w));
+    block(x, y0, bl_block(x, y0), el, uvec4(e, d), o_even, o_odd);
 }

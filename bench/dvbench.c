@@ -862,7 +862,7 @@ int main(int argc, char **argv)
             i++;
         } else if (!strcmp(a, "--pi-mmr") && v) {
             const char *m = argv[++i];
-            g_pi_mode = !strcmp(m, "float") ? PI_MMR_FLOAT : !strcmp(m, "exact32") ? PI_MMR_EXACT32 : !strcmp(m, "exact64") ? PI_MMR_EXACT64 : PI_MMR_HYBRID;
+            g_pi_mode = !strcmp(m, "float") ? PI_MMR_FLOAT : !strcmp(m, "exact32") ? PI_MMR_EXACT32 : !strcmp(m, "exact64") ? PI_MMR_EXACT64 : !strcmp(m, "bounded") ? PI_MMR_BOUNDED : PI_MMR_HYBRID;
         } else if (!strcmp(a, "--compare")) {
             compare = 1;
         } else if (!strcmp(a, "--frames") && v)

@@ -26,7 +26,11 @@ layout(std140, binding = 0) uniform Params {
     vec4 cf[6];        // the coefficient / 2^(shift + 4) (mode 0)
     vec4 cconst;       // the constant / 2^(shift + 4), Cb and Cr (mode 0)
     vec4 inv;          // 1 / cw, 1 / ch (pass 1's texture sizes)
-    vec4 err;          // the float MMR's error bound: relative factor; per channel, the feature powers' share
+    vec4 cs[6];        // mode 3: the coefficients / 2^32 (as c32)
+    vec4 cy;           // mode 3: the constant / 2^32, Cb and Cr
+    uvec4 narrow;      // route 3: the planner's narrow mask per channel
+    uvec4 pw;          // route 3: chroma policy (1 top-left: rows k, k+1 at 4/4, 2/4)
+    vec4 err;          // mode 4: the float MMR's relative error factor
     uvec4 packets[40]; // 640 bytes of metadata packets
 } P;
 

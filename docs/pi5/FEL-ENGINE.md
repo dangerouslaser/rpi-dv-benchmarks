@@ -118,6 +118,65 @@ What it took:
   planner's route 3, e.g. some P8.1 web streams). The engine refuses those
   frames for now.
 
+## Exact MMR at near float cost, route 3, trims (2026-11-06)
+
+**Exact MMR, mode 3 (`--pi-mmr exact`, the default).**
+- The exact 64-bit MMR sum S has its low 32 bits computed by wrapping 32-bit
+  integer multiply-adds (no high multiplies).
+- Its high 32 bits come from a float sum y ≈ S / 2³²: `H = round(y − L / 2³²)`.
+- The CPU checks each frame that float's worst-case error (64 × 2⁻²⁴ × the
+  terms' largest magnitudes) stays under 0.25. On 1917 it is 0.02. If the
+  check fails, that frame uses exact64.
+- The result is exact (0 differences against yblod on every clip and film
+  point tested).
+- On 1917 it costs 37.6 ms per picture, against 31.7 ms for float and 45.8 ms
+  for exact64.
+- Real-time 1917 in exact mode: 1,438 frames in 60 s, 5–10 late by ≤ 6 ms.
+
+A first attempt, float with an error bound and an exact fallback per sample,
+fell back on 37% of samples: per-sample float error is too coarse against
+12-bit steps. The 11 loops V3D's compiler left rolled in the split's first
+version also cost 12 ms; it is now written without loops.
+
+**Single-layer MMR route** (the planner's route 3, yblod's `piecewise`).
+- Both layouts are handled: 4:2:0 in CB1 contract mode, full-height 4:2:2 in
+  yblod mode.
+- **General path:** an exact port of yblod's `reshape_tuple`, at 378 ms per
+  picture (yblod: 452 ms).
+- **Fast path:** one piece per chroma channel within 64-bit sums, which covers
+  profile 8.1 MMR streams. The CPU rewrites it as the FEL MMR's parameters
+  and exact 64-bit tables, and it runs through the split path.
+- On a profile 8.1 cut of 1917 (`dovi_tool -m 5`, MMR kept): exact, 38.8 ms,
+  26.4 fps.
+- yblod's planner refuses single-layer MMR in CB1 contract mode; it is
+  handled in yblod mode (`--yblod`).
+
+**Pack trims.**
+- **Kept:** the letterbox bars are cleared to the black pixel pair at tile
+  load, and only the packet rows are drawn. That saves 0.7–0.8 ms on scope
+  films.
+- **Measured and dropped:**
+  - 2×4 blocks per fragment (four attachments): slower, 14.3 → 16.0 ms.
+    32 bytes a pixel of tile buffer shrinks the tiles.
+  - SAND word-pair views: not possible with v3dv's 64-byte texel buffer
+    offset alignment.
+
+**Overclock: tested, not to be relied on.**
+- Measured with `v3d_freq=1300`:
+  - 1917 exact: 34.0 ms (30.0 fps)
+  - Dune: 14.6 ms
+  - route 3: 34.5 ms
+  - 3 minutes of real-time 1917 exact: 0 late, 76 °C, no throttling
+  - all output bit-exact
+- This Pi has no cooler, so the overclock is off and the config is restored.
+  All figures below are at the stock 1150 MHz.
+
+| At stock clocks | exact | float |
+|---|---|---|
+| 1917 (FEL, MMR) | 37.6 ms, 27.1 fps | 31.7 ms, 32.2 fps |
+| Dune (MEL, single layer) | 16.1 ms, 65.0 fps | — |
+| 1917 as P8.1 MMR (route 3, `--yblod`) | 38.8 ms, 26.4 fps | — |
+
 ## Vulkan against GLES (`vk-micro`, the same 4K per-pixel shader)
 
 | | Vulkan fragment | GLES fragment | Vulkan compute | GLES compute |

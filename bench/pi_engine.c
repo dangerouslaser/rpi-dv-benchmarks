@@ -42,13 +42,15 @@ static const uint32_t spv_p3[] =
     } while (0)
 
 enum { T_MAP = 0, T_RES = 1024, T_CMAP = 4096, T_LUTF = 6144, T_LUT64 = 12288, T_SINGLE = 24576, T_WORDS = 27648 };
-enum { NB = 11 };   /* descriptor bindings */
+enum { NB = 12 };   /* descriptor bindings */
 
 struct params {   /* common.glsl Params, std140 */
     uint32_t size[4], bl[4], el[4], el_size[4], sel[4], sel2[4], active[4], black[4], pk[4];
     uint32_t lo[2][4], hi[2][4], const64[2][4];
     int32_t c_lo[6][4], c_hi[6][4], c32[6][4];
-    float cf[6][4], cconst[4], inv[4], err[4];
+    float cf[6][4], cconst[4], inv[4], cs[6][4], cy[4];
+    uint32_t narrow[4], pw[4];
+    float err[4];
     uint32_t packets[160];
 };
 
@@ -73,9 +75,11 @@ struct slot {
     VkDeviceMemory out_mem;
     uint32_t stride;
     VkFramebuffer fb[3];
-    VkBuffer tables, ubo;
+    VkBuffer tables, ubo, reshape;
     VkDeviceMemory tables_mem, ubo_mem;
     uint32_t *tmap;
+    void *rmap;               /* route 3: the planner's dv_single_reshape (4544 bytes) */
+    VkDeviceMemory reshape_mem;
     struct params *pmap;
     VkBufferView tview, tview64, tview128;
     VkDescriptorSet ds;
@@ -103,7 +107,7 @@ struct pi_engine {
     VkDescriptorPool dpool;
     VkRenderPass rp[3];
     struct variant {
-        uint32_t key[9];
+        uint32_t key[12];
         VkPipeline p;
     } v1[16], v2[8];
     int n1, n2;
@@ -114,7 +118,6 @@ struct pi_engine {
     enum pi_mmr_mode mode;
     int contract, warned;
     uint32_t ablate;   /* PI_ABLATE: measurement only */
-    uint32_t mark;     /* PI_MARK: measurement only, mode 3's fallbacks written as 4095 / 0 */
     uint32_t w, h;
 };
 
@@ -244,13 +247,14 @@ fail:
     return NULL;
 }
 
-static int render_pass(struct pi_engine *e, int n, const VkFormat *formats, VkImageLayout final, VkRenderPass *rp)
+static int render_pass(struct pi_engine *e, int n, const VkFormat *formats, VkImageLayout final, int clear,
+                       VkRenderPass *rp)
 {
     VkAttachmentDescription a[2];
     VkAttachmentReference ref[2];
     for (int i = 0; i < n; i++) {
         a[i] = (VkAttachmentDescription){.format = formats[i], .samples = VK_SAMPLE_COUNT_1_BIT,
-                                         .loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+                                         .loadOp = clear ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_DONT_CARE,
                                          .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
                                          .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
                                          .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
@@ -289,7 +293,7 @@ static int pipeline(struct pi_engine *e, const uint32_t *spv, size_t bytes, VkRe
     mi.codeSize = sizeof(spv_vert);
     mi.pCode = spv_vert;
     VKC(vkCreateShaderModule(e->dev, &mi, NULL, &vs));
-    VkSpecializationMapEntry me[8];
+    VkSpecializationMapEntry me[16];
     for (uint32_t i = 0; i < nspec; i++)
         me[i] = (VkSpecializationMapEntry){i, 4 * i, 4};
     VkSpecializationInfo si = {nspec, me, 4 * nspec, spec};
@@ -308,7 +312,8 @@ static int pipeline(struct pi_engine *e, const uint32_t *spv, size_t bytes, VkRe
                                                  .lineWidth = 1};
     VkPipelineMultisampleStateCreateInfo ms = {.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
                                                .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT};
-    VkPipelineColorBlendAttachmentState cba[2] = {{.colorWriteMask = 0xf}, {.colorWriteMask = 0xf}};
+    VkPipelineColorBlendAttachmentState cba[4] = {
+        {.colorWriteMask = 0xf}, {.colorWriteMask = 0xf}, {.colorWriteMask = 0xf}, {.colorWriteMask = 0xf}};
     VkPipelineColorBlendStateCreateInfo cbs = {.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
                                                .attachmentCount = (uint32_t)targets, .pAttachments = cba};
     VkDynamicState dyn[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
@@ -392,7 +397,7 @@ static int create(struct pi_engine *e, const char *want)
                                    .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, .queueFamilyIndex = qfam};
     VKC(vkCreateCommandPool(e->dev, &pci, NULL, &e->pool));
     snprintf(e->name, sizeof(e->name), "%s, MMR %s, output %s", props.deviceName,
-             e->mode == PI_MMR_FLOAT ? "float" : e->mode == PI_MMR_HYBRID ? "exact (float + bound, 64-bit fallback)" : e->mode == PI_MMR_EXACT32 ? "exact (32-bit pieces)"
+             e->mode == PI_MMR_FLOAT ? "float" : e->mode == PI_MMR_HYBRID ? "exact (integer low word + float high word)" : e->mode == PI_MMR_BOUNDED ? "exact (float + error bound, split where it straddles)" : e->mode == PI_MMR_EXACT32 ? "exact (32-bit pieces)"
                                                                              : "exact (emulated 64-bit)",
              e->modifiers ? "rendered in place" : "copied");
 
@@ -407,7 +412,7 @@ static int create(struct pi_engine *e, const char *want)
         VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER,
         VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
         VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
-        VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER};
+        VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER};
     VkDescriptorSetLayoutBinding b[NB];
     VkDescriptorPoolSize sizes[NB];
     for (int i = 0; i < NB; i++) {
@@ -426,12 +431,11 @@ static int create(struct pi_engine *e, const char *want)
 
     const VkFormat f1[2] = {VK_FORMAT_R16G16_UINT, VK_FORMAT_R16_UINT},
                    f2[2] = {VK_FORMAT_R32G32_UINT, VK_FORMAT_R32G32_UINT};
-    if (render_pass(e, 2, f1, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, &e->rp[0]) ||
-        render_pass(e, 2, f2, e->modifiers ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+    if (render_pass(e, 2, f1, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 0, &e->rp[0]) ||
+        render_pass(e, 2, f2, e->modifiers ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, 1,
                     &e->rp[1]))
         return -1;
     e->ablate = getenv("PI_ABLATE") ? (uint32_t)atoi(getenv("PI_ABLATE")) : 0;
-    e->mark = getenv("PI_MARK") != NULL;
 
     e->w = 3840;
     e->h = 2160;
@@ -451,6 +455,9 @@ static int create(struct pi_engine *e, const char *want)
         if (host_buffer(e, T_WORDS * 4, VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT, &s->tables, &s->tables_mem, &map))
             return -1;
         s->tmap = map;
+        if (host_buffer(e, sizeof(((dvvk_plan *)0)->reshape), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &s->reshape,
+                        &s->reshape_mem, &s->rmap))
+            return -1;
         if (host_buffer(e, sizeof(struct params), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, &s->ubo, &s->ubo_mem, &map))
             return -1;
         s->pmap = map;
@@ -468,7 +475,10 @@ static int create(struct pi_engine *e, const char *want)
         VkDescriptorImageInfo ii[3] = {{e->sampler, s->c420.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
                                        {e->sampler, s->ely.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
                                        {e->sampler, s->c420.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}};
-        VkWriteDescriptorSet wr[7] = {
+        VkDescriptorBufferInfo rb = {s->reshape, 0, VK_WHOLE_SIZE};
+        VkWriteDescriptorSet wr[8] = {
+            {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = s->ds, .dstBinding = 11, .descriptorCount = 1,
+             .descriptorType = types[11], .pBufferInfo = &rb},
             {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = s->ds, .dstBinding = 10, .descriptorCount = 1,
              .descriptorType = types[10], .pTexelBufferView = &s->tview128},
             {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = s->ds, .dstBinding = 0, .descriptorCount = 1,
@@ -483,7 +493,7 @@ static int create(struct pi_engine *e, const char *want)
              .descriptorType = types[8], .pImageInfo = &ii[1]},
             {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = s->ds, .dstBinding = 9, .descriptorCount = 1,
              .descriptorType = types[9], .pImageInfo = &ii[2]}};
-        vkUpdateDescriptorSets(e->dev, 7, wr, 0, NULL);
+        vkUpdateDescriptorSets(e->dev, 8, wr, 0, NULL);
         VkCommandBufferAllocateInfo cai = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
                                            .commandPool = e->pool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
                                            .commandBufferCount = 1};
@@ -516,7 +526,9 @@ struct pi_engine *pi_create(const char *device, enum pi_mmr_mode mode, int cb1_c
 /* Output row parity `half` (0 even rows, 1 odd rows) of the dmabuf: a linear
  * RG32UI image of w/2 x h/2 pixel pairs, rows 2 * stride apart, from byte
  * half * stride. The pack pass renders both as its two colour attachments:
- * one fragment, a 2 x 2 block of pixels. */
+ * one fragment, a 2 x 2 block of pixels. (Four images and 2 x 4 blocks,
+ * fewer fetches per pixel, measured slower: 32 bytes a pixel of tile buffer
+ * shrinks the tiles.) */
 static int output_half(struct pi_engine *e, struct slot *s, int fd, uint32_t stride, int half)
 {
     struct image *o = &s->out[half];
@@ -558,8 +570,9 @@ int pi_set_output(struct pi_engine *e, unsigned slot, int fd, uint32_t stride)
 {
     struct slot *s = &e->s[slot];
     s->stride = stride;
-    if (output_half(e, s, fd, stride, 0) || output_half(e, s, fd, stride, 1))
-        return -1;
+    for (int half = 0; half < 2; half++)
+        if (output_half(e, s, fd, stride, half))
+            return -1;
     if (!e->modifiers) {
         /* Copy mode: our own images, copied into the dmabuf. */
         VkExternalMemoryBufferCreateInfo bext = {.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
@@ -698,10 +711,13 @@ struct band {
 };
 
 /* Pass i as bands of rows, each with its pipeline, in one render pass. */
-static void pass_bands(struct pi_engine *e, struct slot *s, int i, uint32_t w, uint32_t h, const struct band *b, int n)
+static void pass_bands(struct pi_engine *e, struct slot *s, int i, uint32_t w, uint32_t h, const struct band *b, int n,
+                       const VkClearValue *clear)
 {
+    VkClearValue cv[2] = {*clear, *clear};
     VkRenderPassBeginInfo rbi = {.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, .renderPass = e->rp[i],
-                                 .framebuffer = s->fb[i], .renderArea = {{0, 0}, {w, h}}};
+                                 .framebuffer = s->fb[i], .renderArea = {{0, 0}, {w, h}}, .clearValueCount = 2,
+                                 .pClearValues = cv};
     vkCmdBeginRenderPass(s->cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
     vkCmdBindDescriptorSets(s->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, e->pl, 0, 1, &s->ds, 0, NULL);
     VkViewport vp = {0, 0, (float)w, (float)h, 0, 1};
@@ -738,6 +754,110 @@ static void pass(struct pi_engine *e, struct slot *s, int i, VkPipeline p, uint3
         vkCmdWriteTimestamp(s->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s->qp, (uint32_t)i + 1);
 }
 
+/* yblod's dv_single_reshape (single_reshape.h), as the planner fills
+ * dvvk_plan.reshape. */
+struct reshape_piece {
+    uint32_t method, order;
+    int64_t constant, coefficient[3][7];
+};
+struct reshape_curve {
+    uint32_t pivot_count, pivots[9];
+    struct reshape_piece piece[8];
+};
+struct reshape {
+    uint32_t base_depth, denominator;
+    struct reshape_curve curve[3];
+};
+_Static_assert(sizeof(struct reshape) == sizeof(((dvvk_plan *)0)->reshape), "dv_single_reshape layout");
+
+/* Route 3 with one piece per chroma channel, its sums within 64 bits (the
+ * planner's narrow mask), 10-bit: the same sum as the FEL MMR's, so pass 1's
+ * split MMR (mode 3) computes it exactly. Fills the MMR parameters and the
+ * univariate tables (exact 64-bit) from the pieces; 0 if this mapping is
+ * outside that. */
+static int piece_fast(const dvvk_plan *p, struct params *q, uint32_t *t, uint32_t order[2])
+{
+    struct reshape r;
+    memcpy(&r, p->reshape, sizeof(r));
+    if (r.base_depth != 10)
+        return 0;
+    for (int c = 0; c < 3; c++)
+        if (r.curve[c].pivot_count < 2 || r.curve[c].pivot_count > 9)
+            return 0;
+    for (int c = 1; c < 3; c++) {
+        const struct reshape_curve *cv = &r.curve[c];
+        const struct reshape_piece *pc = &cv->piece[0];
+        if (cv->pivot_count != 2 || !(p->narrow_mask[c] & 1u) || pc->order < 1 || pc->order > 3 ||
+            (pc->method == 0 && pc->order > 2) || (p->order2 && !(pc->method != 0 && pc->order == 2)))
+            return 0;
+    }
+    for (int k = 0; k < 3; k++) {   /* the input clamps: each component by its own curve */
+        q->lo[0][k] = r.curve[k].pivots[0];
+        q->hi[0][k] = r.curve[k].pivots[r.curve[k].pivot_count - 1];
+    }
+    for (int c = 1; c < 3; c++) {
+        const struct reshape_piece *pc = &r.curve[c].piece[0];
+        int ch = c - 1, mmr = pc->method != 0;
+        order[ch] = mmr ? pc->order : 1;
+        int64_t constant = (int64_t)((uint64_t)pc->constant << 20);
+        q->const64[ch][0] = (uint32_t)(uint64_t)constant;
+        q->const64[ch][1] = (uint32_t)((uint64_t)constant >> 32);
+        q->cy[ch] = (float)((double)constant / 4294967296.0);
+        q->pk[1 + ch] = r.denominator;   /* the shader adds 4: denominator + q - 16 */
+        for (int o = 0; o < 3; o++)
+            for (int k = 0; k < 4; k++) {
+                int64_t v = mmr && o < (int)pc->order ? pc->coefficient[o][k + 3] : 0;
+                q->c32[ch * 3 + o][k] = (int32_t)(uint32_t)(uint64_t)v;   /* the low word: it wraps */
+                q->cs[ch * 3 + o][k] = (float)((double)v / 4294967296.0);
+            }
+        for (int k = 0; k < 3; k++)
+            for (int i = 0; i < 1024; i++) {
+                __int128 v = 0;
+                int64_t f1 = (int64_t)i << 10, f2 = (int64_t)i * i, f3 = (f1 * f2) >> 20;
+                if (mmr) {
+                    v += (__int128)pc->coefficient[0][k] * f1;
+                    if (pc->order > 1)
+                        v += (__int128)pc->coefficient[1][k] * f2;
+                    if (pc->order > 2)
+                        v += (__int128)pc->coefficient[2][k] * f3;
+                } else if (k == c) {   /* a polynomial of the channel's own value */
+                    v += (__int128)pc->coefficient[0][0] * f1;
+                    if (pc->order == 2)
+                        v += (__int128)pc->coefficient[0][1] * f2;
+                }
+                if (v > INT64_MAX || v < INT64_MIN)
+                    return 0;
+                uint64_t u = (uint64_t)(int64_t)v;
+                t[T_LUT64 + (k * 1024 + i) * 4 + ch * 2] = (uint32_t)u;
+                t[T_LUT64 + (k * 1024 + i) * 4 + ch * 2 + 1] = (uint32_t)(u >> 32);
+            }
+    }
+    return 1;
+}
+
+/* The split MMR's float bound for channel c of the parameters as filled
+ * (see mmr_split): 0 if it may not be used. */
+static int split_ok(const struct params *q, const uint32_t *t, unsigned c, int debug)
+{
+    double m = fabs((double)(int64_t)((uint64_t)q->const64[c][1] << 32 | q->const64[c][0]));
+    for (int k = 0; k < 3; k++) {
+        double lm = 0;
+        for (int i = 0; i < 1024; i++) {
+            const uint32_t *w = t + T_LUT64 + (k * 1024 + i) * 4 + c * 2;
+            lm = fmax(lm, fabs((double)(int64_t)((uint64_t)w[1] << 32 | w[0])));
+        }
+        m += lm;
+    }
+    for (int o = 0; o < 3; o++)
+        for (int k = 0; k < 4; k++)
+            m += fabs((double)q->cs[c * 3 + o][k]) * 4294967296.0 * 1048576.0;   /* features < 2^20 */
+    m /= 4294967296.0;
+    double bound = 64.0 / 16777216.0 * m;
+    if (debug)
+        fprintf(stderr, "pi: MMR channel %u split: largest |S| / 2^32 %.1f, float bound %.3g (< 0.25)\n", c, m, bound);
+    return bound < 0.25 && m < 1048576.0;
+}
+
 /* The pipeline for specialization `key` (constant ids first .. first + n - 1),
  * made the first time a stream needs it. */
 static VkPipeline variant(struct pi_engine *e, struct variant *v, int *count, int max, const uint32_t *spv, size_t bytes,
@@ -748,7 +868,7 @@ static VkPipeline variant(struct pi_engine *e, struct variant *v, int *count, in
             return v[i].p;
     if (*count == max)
         return VK_NULL_HANDLE;
-    uint32_t spec[8] = {0};
+    uint32_t spec[16] = {0};
     memcpy(spec + first, key, n * 4);   /* ids 0 .. first - 1: their defaults' values */
     if (first)
         spec[0] = PI_MMR_FLOAT;         /* p2 has no constant 0; any value */
@@ -779,8 +899,12 @@ int pi_submit(struct pi_engine *e, const AVFrame *bl, const AVFrame *el, const v
     int st = dvvk_plan_frame_state(&in, NULL, e->state, rpu, rpu_size, p);
     if (st)
         return st < 0 ? -st : st;
-    int single = p->route == DVVK_ROUTE_SINGLE;
-    if ((!single && (p->route != DVVK_ROUTE_DUAL || !el || p->equal || p->nearest != 2)) || p->pack != DVVK_PACK_SITED ||
+    int single = p->route == DVVK_ROUTE_SINGLE, piece = 0;
+    if (p->route == DVVK_ROUTE_PIECEWISE && p->depth == 10 && p->layout <= 1 &&
+        p->pack == (p->layout ? DVVK_PACK_422 : DVVK_PACK_SITED))
+        piece = 1 + (int)p->layout;
+    if ((!single && !piece && (p->route != DVVK_ROUTE_DUAL || !el || p->equal || p->nearest != 2)) ||
+        (!piece && p->pack != DVVK_PACK_SITED) ||
         p->placement[0] || p->placement[1] || p->placement[2] != w || p->placement[3] != h) {
         if (!e->warned++)
             fprintf(stderr, "pi: plan outside this engine (route %u equal %u el filter %u pack %u)\n", p->route,
@@ -788,7 +912,7 @@ int pi_submit(struct pi_engine *e, const AVFrame *bl, const AVFrame *el, const v
         return 2;
     }
     if (getenv("PI_DEBUG") && first)
-        fprintf(stderr, "pi: active area x %u..%u, y %u..%u; row window %u..%u; chroma kinds %u %u, dual %u, orders %u %u\n",
+        fprintf(stderr, "pi: route %u; active area x %u..%u, y %u..%u; row window %u..%u; chroma kinds %u %u, dual %u, orders %u %u\n", p->route,
                 p->active[0], p->active[2], p->active[1], p->active[3], p->row_first, p->row_last, p->chroma_kind[0],
                 p->chroma_kind[1], p->dual, p->mmr_params[0][0], p->mmr_params[1][0]);
     struct params *q = s->pmap;
@@ -828,7 +952,12 @@ int pi_submit(struct pi_engine *e, const AVFrame *bl, const AVFrame *el, const v
     memcpy(t + T_RES, p->residual, sizeof(p->residual));
     for (int c = 0; c < 3; c++)
         for (int i = 0; i < 1024; i++)
-            t[T_SINGLE + c * 1024 + i] = p->single_table[c][i];
+            t[T_SINGLE + c * 1024 + i] = piece ? (c == 0 ? p->luma_table[i] : 0u) : p->single_table[c][i];
+    if (piece) {
+        memcpy(s->rmap, p->reshape, sizeof(p->reshape));
+        memcpy(q->narrow, p->narrow_mask, sizeof(q->narrow));
+        q->pw[0] = p->sampling;
+    }
     int exact = e->mode != PI_MMR_FLOAT;
     for (unsigned c = 0; c < 2; c++) {
         const uint32_t *pw = p->mmr_params[c];
@@ -862,19 +991,36 @@ int pi_submit(struct pi_engine *e, const AVFrame *bl, const AVFrame *el, const v
                     t[T_LUT64 + (k * 1024 + i) * 4 + c * 2 + 1] = (uint32_t)(v >> 32);
                 }
     }
-    /* The float MMR's error bound (mode 3, p1_chroma.frag mmr_float): at most
-     * 15 additions and 1 multiplication per term, each within 2^-24 of its
-     * result, the coefficients' and tables' own rounding to float as much
-     * again: 32 x 2^-24 would cover it; 256 x 2^-24 leaves room for a GPU
-     * whose rounding is a few units off IEEE's. The feature powers b, c
-     * (floors of float products) are within 1 and 2 of the exact ones. */
-    q->err[0] = 256.0f / 16777216.0f;
-    for (int c = 0; c < 2; c++) {
-        double f = 0;
-        for (int k = 0; k < 4; k++)
-            f += fabs(q->cf[c * 3 + 1][k]) + 2.0 * fabs(q->cf[c * 3 + 2][k]);
-        q->err[1 + c] = (float)(f * 1.01 + 1e-3);
+    /* Mode 3 (p1_chroma.frag mmr_split): the high word from a float sum y of
+     * S / 2^32 is exact when y is within 0.25 of it (round(), with the low
+     * word's own rounding far below). Every float operation rounds within
+     * 2^-24 of its result (Vulkan: add and multiply correctly rounded): about
+     * 20 per channel, the inputs' conversions as many again; 64 x 2^-24 x the
+     * sum of the terms' largest magnitudes bounds the error with room. Too
+     * big a bound (or a y whose ulp could matter): emulated 64-bit instead. */
+    int split = e->mode == PI_MMR_HYBRID || e->mode == PI_MMR_BOUNDED;
+    q->err[0] = 32.0f / 16777216.0f;   /* mode 4 */
+    for (unsigned c = 0; c < 2 && split; c++) {
+        if (p->chroma_kind[c] != DVVK_CHROMA_MMR64_LUT)
+            continue;
+        const uint32_t *pw = p->mmr_params[c];
+        int64_t constant = (int64_t)((uint64_t)pw[9] << 32 | pw[8]);
+        q->cy[c] = (float)((double)constant / 4294967296.0);
+        for (int o = 0; o < 3; o++)
+            for (int k = 0; k < 4; k++)
+                q->cs[c * 3 + o][k] = (float)(q->c32[c * 3 + o][k] / 4294967296.0);
+        if (!split_ok(q, t, c, getenv("PI_DEBUG") && first)) {
+            split = 0;
+            if (!e->warned++)
+                fprintf(stderr, "pi: MMR magnitudes too large for the split: emulated 64-bit\n");
+        }
     }
+    /* Route 3, one piece per chroma channel: pass 1's split MMR. */
+    uint32_t piece_order[2] = {0, 0};
+    int fast = piece && e->mode != PI_MMR_FLOAT && !getenv("PI_PIECE_GENERAL") && piece_fast(p, q, t, piece_order) &&
+               split_ok(q, t, 0, getenv("PI_DEBUG") && first) && split_ok(q, t, 1, getenv("PI_DEBUG") && first);
+    if (getenv("PI_DEBUG") && first && piece)
+        fprintf(stderr, "pi: route 3 %s\n", fast ? "fast (one piece per channel: split MMR)" : "general (yblod's piecewise, emulated)");
     s->plan_ms = now_ms() - t0;
 
     VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -885,15 +1031,20 @@ int pi_submit(struct pi_engine *e, const AVFrame *bl, const AVFrame *el, const v
         vkCmdResetQueryPool(s->cmd, s->qp, 0, 4);
         vkCmdWriteTimestamp(s->cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, s->qp, 0);
     }
-    uint32_t k1[9] = {exact ? (uint32_t)e->mode : PI_MMR_FLOAT, p->chroma_phase, p->dual, p->chroma_kind[0],
-                      p->chroma_kind[1], p->mmr_params[0][0], p->mmr_params[1][0], (uint32_t)single, e->mark};
-    if (single)   /* none of the FEL selectors matter */
+    uint32_t k1[12] = {exact ? (uint32_t)((e->mode == PI_MMR_HYBRID || e->mode == PI_MMR_BOUNDED) && !split ? PI_MMR_EXACT64 : e->mode) : PI_MMR_FLOAT, p->chroma_phase, p->dual, p->chroma_kind[0],
+                      p->chroma_kind[1], p->mmr_params[0][0], p->mmr_params[1][0], (uint32_t)single, (uint32_t)piece,
+                      piece == 2 ? p->order2 : 0u, (uint32_t)fast, getenv("PI_MARK") != NULL};
+    if (single || piece)   /* none of the FEL selectors matter */
         memset(k1, 0, 7 * sizeof(k1[0]));
-    uint32_t k2[5] = {p->chroma_filter != 0, p->top_left != 0, e->ablate, 0, (uint32_t)single},
-             kb[5] = {0, 0, 0, 1, 0};
-    VkPipeline p1 = variant(e, e->v1, &e->n1, 16, spv_p1, sizeof(spv_p1), e->rp[0], 2, k1, 9, 0);
-    VkPipeline p2 = variant(e, e->v2, &e->n2, 8, spv_p3, sizeof(spv_p3), e->rp[1], 2, k2, 5, 1);
-    VkPipeline pb = variant(e, e->v2, &e->n2, 8, spv_p3, sizeof(spv_p3), e->rp[1], 2, kb, 5, 1);
+    if (fast) {   /* the split MMR's orders */
+        k1[5] = piece_order[0];
+        k1[6] = piece_order[1];
+    }
+    uint32_t k2[6] = {p->chroma_filter != 0, p->top_left != 0, e->ablate, 0, (uint32_t)(single || piece), piece == 2},
+             kb[6] = {0, 0, 0, 1, 0, 0};
+    VkPipeline p1 = variant(e, e->v1, &e->n1, 16, spv_p1, sizeof(spv_p1), e->rp[0], 2, k1, 12, 0);
+    VkPipeline p2 = variant(e, e->v2, &e->n2, 8, spv_p3, sizeof(spv_p3), e->rp[1], 2, k2, 6, 1);
+    VkPipeline pb = variant(e, e->v2, &e->n2, 8, spv_p3, sizeof(spv_p3), e->rp[1], 2, kb, 6, 1);
     if (!p1 || !p2 || !pb)
         return -1;
     /* Pass 1 only over the letterbox's row window (yblod's, with the margin the
@@ -910,8 +1061,21 @@ int pi_submit(struct pi_engine *e, const AVFrame *bl, const AVFrame *el, const v
     uint32_t a0 = p->active[1] / 2, a1 = (p->active[3] + 1) / 2;
     if (getenv("PI_ALL_ROWS") || a1 <= a0 || a1 > h / 2)
         a0 = 0, a1 = h / 2;
-    struct band b[3] = {{pb, 0, a0}, {p2, a0, a1 - a0}, {pb, a1, h / 2 - a1}};
-    pass_bands(e, s, 1, w / 2, h / 2, b, 3);
+    /* The bars are the black pixel pair everywhere but in the rows carrying
+     * metadata packets: the tile buffer is cleared to it (free), and only
+     * the packet rows of the bars are drawn. */
+    uint32_t prow = (q->pk[3] + 1) / 2;   /* block rows the packets reach */
+    struct band b[3] = {{pb, 0, a0 < prow ? a0 : prow}, {p2, a0, a1 - a0},
+                        {pb, a1, prow > a1 ? (prow < h / 2 ? prow : h / 2) - a1 : 0}};
+    if (getenv("PI_DRAW_BARS"))
+        b[0].rows = a0, b[2].rows = h / 2 - a1;
+    VkClearValue black;
+    for (int l = 0; l < 2; l++) {
+        uint32_t yy = p->black[0], c = l ? p->black[2] : p->black[1];
+        black.color.uint32[l] = (((c & 15u) << 4) | (yy & 15u)) | ((yy >> 4) << 8) | ((c >> 4) << 16) | 0xff000000u;
+    }
+    black.color.uint32[2] = black.color.uint32[3] = 0;
+    pass_bands(e, s, 1, w / 2, h / 2, b, 3, &black);
     if (!e->modifiers)
         for (int half = 0; half < 2; half++) {
             VkBufferImageCopy c = {.bufferOffset = (VkDeviceSize)half * s->stride, .bufferRowLength = s->stride / 4,
