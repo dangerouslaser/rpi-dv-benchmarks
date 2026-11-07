@@ -11,7 +11,12 @@ bit-exact against yblod's Vulkan engine (bilinear FEL) and fast enough for
 real-time 24p 4K FEL on a stock Pi 5. `engine/pi_engine.h` is its API for a
 player.
 
-| Film, Pi 5 at stock clocks | Per picture | Real time at 23.976 fps |
+Kodi on LibreELEC 13 plays Dolby Vision through it with the patches here:
+the kernel's `Dolby Vision` connector property (`patches/linux/`), Kodi's
+renderer, EL decoder and Dolby Vision settings (`patches/kodi/`), and the
+LibreELEC package and options (`patches/libreelec/`).
+
+| Film, Pi 5 at stock clocks (dvbench) | Per picture | Real time at 23.976 fps |
 |---|---|---|
 | 1917: UHD Blu-ray, Profile 7.6 FEL, MMR, exact | 33.0 ms | 4 × 120 s with display fences: 1 late frame (0.8 ms) |
 | Dune (2021): Profile 7.6 MEL | 16.1 ms | 60 s, 0 late |
@@ -36,9 +41,11 @@ terms).
 | `bench/` | `dvbench`: decode (the Pi's V4L2 decoder, or software into the same SAND128 layout) + the engine, timed, with playback, sync_file fences and output hashes; `--probe` checks a machine |
 | `patches/ffmpeg/` | FFmpeg 9.0 as LibreELEC builds it for the Pi 5, plus Dolby Vision stream patches for the bench (`patches/ffmpeg/README.md`) |
 | `patches/linux/` | The Raspberry Pi kernel: the HDMI connector property `Dolby Vision`, attached by `vc4` (`patches/linux/README.md`) |
+| `patches/kodi/` | Kodi: Dolby Vision output through the engine on GBM / DRM PRIME, and its settings (`patches/kodi/README.md`) |
+| `patches/libreelec/` | LibreELEC.tv: the engine's package, Kodi's build switch and the RPi5 options (`patches/libreelec/README.md`) |
 | `tests/` | `check.sh`: the engine must reproduce `golden/hashes.txt` (verified identical to yblod); `make-test-clips.sh`: profile 8.1 / MEL / MMR clips from Profile 7 sources |
 | `bundle/` | What goes onto the Pi: `run-bench.sh` (correctness, speed, MMR modes, real-time playback, shader statistics), `summarize.py` |
-| `image/`, `scripts/make-image.sh` | A flashable Raspberry Pi OS image with the bundle and clips |
+| `image/`, `scripts/make-image.sh` | A flashable Raspberry Pi OS image with the bench bundle and clips |
 | `vm/`, `scripts/vm*.sh` | A Debian arm64 VM (Lima) on Mesa's software Vulkan, for building and checking without a Pi |
 | `docker/`, `scripts/build-*.sh` | The aarch64 build container and builds |
 | `scripts/make-release.sh` | The engine's source release, for a distribution's package |
@@ -53,9 +60,13 @@ scripts/vm.sh tests/check.sh         # the engine against the golden hashes (nee
 scripts/vm.sh dvbench --hash clips/X.mkv
 ```
 
-On the Pi: flash `out/dvbench-rpi5-sd.img.xz` (`scripts/make-image.sh`) or
-copy `out/dvbench-rpi5-*.tar.gz` to an existing install, then run
-`./run-bench.sh clips/*`. See [bundle/README.md](bundle/README.md).
+On the Pi, two ways:
+- **LibreELEC with Kodi:** build LibreELEC.tv with `patches/libreelec/`
+  (its README), flash the image, and play Dolby Vision files in Kodi.
+- **The bench alone:** flash `out/dvbench-rpi5-sd.img.xz`
+  (`scripts/make-image.sh`, Raspberry Pi OS) or copy
+  `out/dvbench-rpi5-*.tar.gz` to an existing install, then run
+  `./run-bench.sh clips/*`. See [bundle/README.md](bundle/README.md).
 
 More in [docs/SETUP.md](docs/SETUP.md). `sources.lock` pins FFmpeg;
 `scripts/fetch-sources.sh` fetches it into `third_party/`. Media lives in

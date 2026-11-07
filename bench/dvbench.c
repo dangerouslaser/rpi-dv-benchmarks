@@ -1,6 +1,6 @@
 /* dvbench: Dolby Vision decode and frame generation on the Raspberry Pi 5,
- * the Pi engine (engine/pi_engine.h) on decoded pictures. Headless: no
- * display, no audio.
+ * the Pi engine (engine/pi_engine.h) on decoded pictures. Headless (no
+ * display, no audio) unless --kms-play or --kms-writeback.
  *
  *   dvbench [options] FILE
  *     --source sw|v4l2   decoder: FFmpeg software into SAND128 dmabufs laid

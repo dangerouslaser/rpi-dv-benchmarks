@@ -25,30 +25,31 @@ are the only public ground truth.
 ## 0. Target platform: LibreELEC 13
 
 The target is LibreELEC 13, built from LibreELEC.tv master (checked at commit
-a0fa50bc6e, 2026-11-06), not Raspberry Pi OS. For the Pi 5 it ships:
+a0fa50bc6e, 2026-11-06). For the Pi 5 it ships, against the Raspberry Pi OS
+install the device dumps and the bench figures come from:
 
-| Component | LibreELEC 13 | Our test image (RPi OS) |
+| Component | LibreELEC 13 | Raspberry Pi OS trixie |
 |---|---|---|
 | Kernel | raspberrypi/linux 0b41724 = **6.18.60** | 6.18.60 (same) |
 | Mesa | **26.2.5** | 26.2.6 |
-| FFmpeg | 9.0.2 + `rpi`, `postproc` and `libreelec` patches | 9.0 + the same patch sets + CB1's DV patches |
+| FFmpeg | 9.0.2 + `rpi`, `postproc` and `libreelec` patches | the bench's: 9.0 + the same sets (`patches/ffmpeg/`) |
 | Kodi | master, GBM + GLES, video by DRM PRIME, 11 RPi patches (e.g. max bpc for high-bit-depth video) | — |
-| Boot config | `dtoverlay=vc4-kms-v3d,cma-512` already set | we set the same |
+| Boot config | `dtoverlay=vc4-kms-v3d,cma-512` already set | the bench's image sets the same |
 
 What this means:
-- **Measurements on our test image transfer directly**: same kernel, same Mesa branch.
-- **Vulkan is not built for RPi today**:
-  - `projects/RPi/options` sets `VULKAN="no"`.
-  - `config/graphic` already maps `vc4` to Mesa's `broadcom` Vulkan driver, so
-    enabling it is an option change (`VULKAN="vulkan-loader"`) in our LE branch.
+- **Measurements transfer directly**: same kernel, same Mesa branch. The
+  engine's times on LibreELEC match those on Raspberry Pi OS.
+- **Vulkan isn't built for RPi by default:** `projects/RPi/options` sets
+  `VULKAN="no"`. `config/graphic` maps `vc4` to Mesa's `broadcom` Vulkan
+  driver, so `VULKAN="vulkan-loader"` in `projects/RPi/devices/RPi5/options`
+  builds v3dv, the loader and `vulkaninfo` (`patches/libreelec/`).
 - **Kernel config:**
   - `CONFIG_TRANSPARENT_HUGEPAGE` is off, so v3d "super pages" are off (Igalia
     measured +1–4% with them). This is a one-line config change.
-  - `CONFIG_UDMABUF` is off. Our harness falls back to the CMA heap.
+  - `CONFIG_UDMABUF` is off: the bench allocates its outputs from the system
+    DMA heap there (CMA is the decoder's).
   - `PERF_EVENTS`, `FTRACE` and `DEBUG_FS` are on, so v3d tracepoints and
     perf counters are usable.
-- **Kernel and Mesa are ours to patch** in our LE branch, e.g. by backporting
-  Mesa main features (tile-buffer input attachments, the TFU SAND detile for GL).
 - **The kernel's job model (§2) is a design property, not a version limitation.**
   The cache clean after every compute job and one job at a time per queue are
   the same in rpi 6.18 and mainline 7.3. The engine avoids them rather than
@@ -268,11 +269,15 @@ Each kind of access takes a different hardware path:
 - **Kernel tracepoints** `v3d_submit_csd`, `v3d_csd_irq`, `v3d_cache_clean_begin/end`
   separate job overhead from shader time. [S] K/v3d_trace.h
 
-## 7. The video path today
+## 7. The video path
 
-- **Decoder → display (Kodi/LibreELEC, today):** DRM PRIME "direct to plane". The
-  HVS scans the decoder's SAND buffers out directly, with zero GPU work. HDR works
-  only on this path.
+- **Decoder → display (stock Kodi on LibreELEC):** DRM PRIME "direct to plane".
+  The HVS scans the decoder's SAND buffers out directly, with zero GPU work. HDR
+  works only on this path.
+- **Decoder → engine → display (`patches/kodi/`):** Kodi's DRM PRIME renderer
+  hands each Dolby Vision picture's SAND buffers to the engine, which renders
+  the tunnel frame into a linear XRGB8888 buffer; that goes on the same plane
+  1:1, behind the render's sync_file.
   [P] https://forum.libreelec.tv/thread/28629-raspberry-pi-5-hdr-not-working
 - **Decoder → GPU:**
   - **GL**: imports SAND and detiles it to UIF.
@@ -282,8 +287,11 @@ Each kind of access takes a different hardware path:
   - **Vulkan**: no SAND import. The only routes are importing the dma-buf as a
     buffer and de-SANDing in the shader (the engine reads it as an `R32UI`
     texel buffer), or a copy.
-- **HDMI output:** to be confirmed on the device: whether `HDR_OUTPUT_METADATA`
-  and Colorspace are exposed, and whether a plane takes 4K60 linear P010.
+- **HDMI output:** vc4's HDMI connector has `Broadcast RGB`, `max bpc`,
+  `Colorspace` and `HDR_OUTPUT_METADATA`. For standard Dolby Vision the
+  engine's tunnel frame goes out as 8-bit full-range RGB with a Dolby Vision
+  vendor infoframe, which the stock kernel can't send: `patches/linux/` adds
+  the `Dolby Vision` connector property (`../ENGINE.md`, "Display output").
 
 ## 8. Cheap and expensive on v3dv
 

@@ -14,16 +14,16 @@ It is TV-led, as in Kodi's DV engines for other platforms:
 ## Pipeline
 
 ```
-HEVC decoder (V4L2 request) ── BL, EL: SAND128 P030 dmabufs ──┐
-RPU (AVDOVIMetadata) ── planner (CPU, ~0.5 ms) ── tables, packets ─┤
-                                                                  ▼
-P1  w/2 × h/2   chroma: BL chroma phase, luma guide, EL chroma upsample,
-                MMR / polynomial / piecewise chroma mapping + NLQ residual
-                → RG16UI chroma (12-bit), R16UI EL luma
+HEVC decoder (V4L2 request) ── BL, EL: SAND128 P030 dmabufs ──────┐
+RPU (the frames' side data) ── planner (CPU, ~0.5 ms) ── tables, packets ─┤
+                                                                         ▼
+P1  w/2 × h/2   chroma: BL chroma phase, luma guide, the EL chroma
+                upscaled, MMR / polynomial / piecewise chroma mapping + NLQ
+                residual → RG16UI chroma (12-bit), R16UI EL luma
 P2  w/2 × h/2   one fragment per 2×2 output block: 4:2:2 vertical filter,
-                luma (mapping + bilinear EL + NLQ), metadata bits, tunnel
-                packing → the output dmabuf itself (two RG32UI images: its
-                even and its odd rows)
+                luma (mapping + the EL upscaled + NLQ), metadata bits,
+                tunnel packing → the output dmabuf itself (two RG32UI
+                images: its even and its odd rows)
 ```
 
 - **One render job per pass.** Each pass is a single render pass, which v3dv
@@ -36,6 +36,10 @@ P2  w/2 × h/2   one fragment per 2×2 output block: 4:2:2 vertical filter,
 - **Letterbox rows cost almost nothing.** P1 renders only the planner's row
   window. P2 clears the bars in the tile buffer and draws only their
   metadata-packet rows.
+- **The BL is never resized:** its grid is the output's. Only the FEL's EL,
+  coded at half size, is upscaled 2× to it (`--el-upscale`), and the
+  reconstructed 4:2:0 chroma is filtered vertically to the tunnel's 4:2:2
+  (`--filters`). The TV upsamples the chroma further itself.
 
 ## Using the engine
 
@@ -51,6 +55,12 @@ P2  w/2 × h/2   one fragment per 2×2 output block: 4:2:2 vertical filter,
 | `pi_render(e, &frame, out, &release_fd)` | per picture: its BL and EL frames. Returns a sync_file signalled when `out` is complete; `frame.acquire_fd` is one the output is busy until (KMS's). |
 | `pi_output_done` / `pi_output_wait` | without sync_files |
 | `pi_stream_close`, `pi_output_release`, `pi_engine_destroy` | release everything, in reverse |
+
+Kodi on LibreELEC drives it through `patches/kodi/` (a renderer component
+and an EL decoder in its DRM PRIME path, and a Dolby Vision group in the
+video settings) and `patches/libreelec/` (the package and the build
+options); their READMEs describe them. `bench/dvbench.c` is the minimal
+player.
 
 - **The RPU is the frames' side data,** as FFmpeg's HEVC decoder attaches
   it: `AV_FRAME_DATA_DOVI_METADATA`, and `AV_FRAME_DATA_DOVI_RPU_BUFFER`,
@@ -161,7 +171,7 @@ built the first time a stream needs it.
 
 | Route | Streams | P1 chroma | Luma |
 |---|---|---|---|
-| dual | Profile 7 FEL | MMR (or polynomial) + EL residual | mapping table + bilinear EL + NLQ |
+| dual | Profile 7 FEL | MMR (or polynomial) + EL residual | mapping table + the upscaled EL + NLQ |
 | single | Profile 7 MEL, 8.1 with polynomial chroma | 12-bit tables | 12-bit table |
 | piecewise | Profile 8.1 with MMR chroma (`--filters phase`), Profile 8.4 | one MMR piece per channel: the MMR in the `--mmr` mode (exact unless `float`); otherwise yblod's general reshape (exact, slow) | 12-bit table |
 
@@ -194,7 +204,8 @@ sample positions in every option:
 ## Exactness
 
 The output is bit-exact against yblod's Vulkan engine with the bilinear EL
-upscale: every sample of the tunnel frame, metadata included.
+upscale (its `rpi5` branch's `el_scaler 2`; YBLOD 0.3.2's `el_scaler 0` is
+nearest-neighbour): every sample of the tunnel frame, metadata included.
 - **How it was proven:** sample by sample against yblod's engine, on every
   clip and film point tested.
 - **What keeps it:** `tests/golden/hashes.txt` carries those results.
@@ -235,8 +246,9 @@ inside that bound of a 12-bit step and take the exact path.
 
 ## Performance
 
-Raspberry Pi 5, stock 1150 MHz GPU, no cooler, Mesa 26.2.6, hardware decode,
-read over SMB:
+Raspberry Pi 5, stock 1150 MHz GPU, no cooler, Raspberry Pi OS trixie
+(kernel 6.18.60, Mesa 26.2.6), hardware decode, read over SMB, bilinear EL
+upscale:
 
 | Film | Route | Per picture | 24p real time |
 |---|---|---|---|
@@ -248,6 +260,22 @@ read over SMB:
 | Sol Levante, Profile 8.1 | single | 18.3 ms (55 fps) | 90 s, 0 late |
 | Sol Levante, Profile 8.4 (HLG base) | piecewise, `exact` | 30.8 ms (32 fps); 43.5–53.4 ms with `--filters phase` | whole film (263 s, 6,314 pictures), 1 late (1.9 ms), 68 °C, no throttling |
 | Sol Levante 1080p, Profiles 5 and 8.1 | single | 4.7 ms (212 fps) | 60 s, 0 late |
+
+LibreELEC 13 (the same kernel, Mesa 26.2.5) measures the same: 4K FEL
+31–34 ms on the letterboxed test clips.
+
+**The EL upscale's cost** (4K FEL, GPU time per picture, P1 + P2, LibreELEC
+13; 24p allows 41.7 ms). Only bilinear is real time:
+
+| Clip | `bilinear` | `bicubic` | `annexb` | `lanczos` |
+|---|---|---|---|---|
+| Power Rangers credits (2.40:1) | 34.3 ms | 63.0 ms | 63.3 ms | 84.5 ms |
+| the same, every row (`PI_ALL_ROWS=1`, as a 16:9 film) | 42.8 ms | 82.6 ms | 81.7 ms | 111.8 ms |
+| DV FEL CMV4.0 test (dual track) | 25.3 ms | 56.1 ms | 56.7 ms | 85.2 ms |
+
+Most of the difference is P1 (18.6 ms bilinear, 66.5 ms Lanczos on the
+first clip): each chroma sample computes its EL neighbourhood's vertical
+filter afresh, for every column the horizontal filter takes.
 
 Notes:
 - The HEVC decoder alone does 44–79 fps for BL and EL, over SMB.
@@ -343,12 +371,15 @@ behaviour on the decoded pictures: error codes, input and output
 validation, the engine's references to the frames, the pipeline cache's
 growth, imports released at stream close, teardown with renders in flight.
 `tests/check.sh` runs it (under the validation layer with `--validate`);
-`tests/check.sh --gpuav` adds Vulkan's GPU-assisted validation, which reports
-out-of-bounds buffer reads in the shaders, on every route and filter set. `--reopen` closes and reopens
-the stream in the same engine and requires identical output (the planner
-reset; without it no picture matches). `DVBENCH_DROP_EL=N` discards the Nth EL picture
-(the BL / EL pairing's test: a FEL clip loses that BL and every other
-picture matches the run without it).
+`tests/check.sh --gpuav` adds Vulkan's GPU-assisted validation, which
+reports out-of-bounds buffer reads in the shaders, on every route, filter
+set and EL upscale. `--reopen` closes and reopens the stream in the same
+engine and requires identical output (the planner reset; without it no
+picture matches). `DVBENCH_DROP_EL=N` discards the Nth EL picture (the BL /
+EL pairing's test: a FEL clip loses that BL and every other picture matches
+the run without it). `--kms-play S` plays S seconds on the HDMI output with
+everything "Display output" lists set (stop any other DRM master, e.g.
+Kodi, first).
 
 On the Pi itself, `V3D_DEBUG=shaderdb` prints the compiler's statistics,
 `V3D_DEBUG=fs` the QPU code, and `V3D_DEBUG=nir` the NIR.
@@ -357,7 +388,11 @@ On the Pi itself, `V3D_DEBUG=shaderdb` prints the compiler's statistics,
 ## Limitations
 
 - **Not implemented:** resized output (the planner's `PACK_RESIZED`: the
-  tunnel frame is the stream's size).
+  tunnel frame is the stream's size), and a FEL picture without its EL: the
+  planner refuses it (`PI_E_UNSUPPORTED_PLAN`), so a player can't show a
+  FEL stream's base layer alone through the engine.
+- **The sharper EL upscales** (`bicubic`, `annexb`, `lanczos`) aren't real
+  time for 4K FEL on the Pi 5 (Performance).
 - **`--filters phase` on single-layer MMR** isn't real time at 24p: it
   reshapes both output rows' chroma, twice pass 1's MMR. Profile 8.4 takes
   43–53 ms per picture, an 8.1 MMR cut of 1917 66 ms. With the default

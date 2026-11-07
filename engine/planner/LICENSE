@@ -1,13 +1,11 @@
-The native renderer C/OpenCL implementation and its synthetic contract tests
-are distributed under GPL-2.0-or-later. (yblod distributed them under
-GPL-3.0-or-later; their author relicensed this copy, 2026-11-07, to match
-Kodi.) Build wiring and documentation are MIT. Explicit per-file notices
-take precedence; tests/ffmpeg_metadata_fields.c retains its MIT notice.
+The planner's C sources (this directory) are distributed under
+GPL-2.0-or-later. (yblod distributed them under GPL-3.0-or-later; their
+author relicensed this copy, 2026-11-07, to match Kodi.) Explicit per-file
+notices take precedence.
 
 License texts are in LICENSES/. The dovi_tool notice is retained alongside
-the extension-metadata grammar attribution. FFmpeg headers, OpenCL headers,
-drivers and compiler binaries are separate dependencies, not relicensed by
-this notice. See SOURCES.md and the complete product's upstream notices.
+the extension-metadata grammar attribution. FFmpeg headers, drivers and
+compiler binaries are separate dependencies, not relicensed by this notice.
 
 No Dolby certification, patent license or independent legal clearance is
 implied by this source distribution.

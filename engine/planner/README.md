@@ -16,7 +16,9 @@ at `00d9aa1a7241f2af00255a759ae02a9a34db699c`:
 
 **Our changes,** all from the Pi port:
 - `plan.c` and `dvvk_plan.h`: the EL upscale is Annex B or bilinear; the old
-  nearest option is planned as bilinear.
+  nearest option is planned as bilinear. The engine's bicubic and Lanczos
+  upscales are planned as bilinear too: the tables are the same, only the
+  passes' filters differ.
 - `dv_engine_vk.h`: the declarations the port added.
 - `dv_rpu_ext.c` (new): reads the extension blocks' original bytes from the
   raw RPU FFmpeg attaches to each frame (`AV_FRAME_DATA_DOVI_RPU_BUFFER`);
@@ -31,8 +33,9 @@ at `00d9aa1a7241f2af00255a759ae02a9a34db699c`:
   `dm_compression`).
 
 Taking this code over keeps the GPU output defined by yblod's arithmetic. The
-Pi engine's output was verified identical to yblod's Vulkan engine, sample for
-sample; `tests/golden/` keeps those results as the regression reference.
+Pi engine's output was verified identical to yblod's Vulkan engine (bilinear
+and Annex B EL upscales), sample for sample; `tests/golden/` keeps those
+results as the regression reference.
 
 **Licences:** see `LICENSE` and `LICENSES/`.
 - The C sources are GPL-2.0-or-later (yblod's GPL-3.0-or-later, relicensed

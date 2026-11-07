@@ -55,12 +55,17 @@ udmabuf. Debian's cloud kernel does.
 
 ## On the Pi
 
-Two ways to get there:
-- **Flash an image:** `scripts/make-image.sh` builds `out/dvbench-rpi5-sd.img.xz`.
-  It is Raspberry Pi OS Lite with the bundle and `clips/`, first-boot user
-  `dv` / `dvbench`, SSH on, and `cma-512` set.
-- **Use an existing install:** copy `out/dvbench-rpi5-*.tar.gz` across. See
-  `bundle/README.md`.
+- **LibreELEC with Kodi:** build LibreELEC.tv with `patches/libreelec/` (see
+  its README; the engine goes in as a source tarball). The image's `.tar` is
+  also an update: copy it to `/storage/.update/` and reboot, which keeps
+  `/storage`. SSH is turned on with `ssh` in `cmdline.txt`, as `root` /
+  `libreelec`.
+- **The bench on Raspberry Pi OS:** `scripts/make-image.sh` builds
+  `out/dvbench-rpi5-sd.img.xz`, Raspberry Pi OS Lite with the bundle and
+  `clips/`, first-boot user `dv` / `dvbench`, SSH on, and `cma-512` set. Or
+  copy `out/dvbench-rpi5-*.tar.gz` to an existing install (`bundle/README.md`).
+- **The bench on LibreELEC:** the same bundle runs from `/storage`
+  (`bundle/README.md`).
 
 To build on the Pi itself: `scripts/install-native-deps.sh`, then
 `scripts/build-all.sh`.

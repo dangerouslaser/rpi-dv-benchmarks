@@ -14,6 +14,11 @@ playback: CRendererDRMPRIME reopens the engine's stream with changed
 options, restages the connector for another infoframe, or switches
 between the tunnel and the decoder's own frames.
 
+The dialog now follows the settings level chosen in Kodi's settings, as
+add-on settings do, so the expert settings (the enhancement layer
+upscale: bilinear by default, bicubic, Lanczos3 or Annex B; the chroma
+MMR; the filters) show only at the Expert level.
+
 Signed-off-by: Bryan Hoban <bryan.hoban@gmail.com>
 ---
  .../resources/strings.po                      |  98 ++++++++++++++-
@@ -23,8 +28,9 @@ Signed-off-by: Bryan Hoban <bryan.hoban@gmail.com>
  xbmc/cores/VideoSettings.cpp                  |  12 ++
  xbmc/cores/VideoSettings.h                    |  42 +++++++
  xbmc/settings/MediaSettings.cpp               |  24 ++++
- xbmc/video/dialogs/GUIDialogVideoSettings.cpp |  83 +++++++++++++
- 8 files changed, 368 insertions(+), 13 deletions(-)
+ xbmc/video/dialogs/GUIDialogVideoSettings.cpp |  90 ++++++++++++++
+ xbmc/video/dialogs/GUIDialogVideoSettings.h   |   3 +
+ 9 files changed, 378 insertions(+), 13 deletions(-)
 
 diff --git a/addons/resource.language.en_gb/resources/strings.po b/addons/resource.language.en_gb/resources/strings.po
 index 58ddc85..6b0e8e2 100644
@@ -463,10 +469,18 @@ index 25fe6f5..c6768e8 100644
    // default audio settings for dsp addons
    TiXmlElement audioSettingsNode("defaultaudiosettings");
 diff --git a/xbmc/video/dialogs/GUIDialogVideoSettings.cpp b/xbmc/video/dialogs/GUIDialogVideoSettings.cpp
-index 4f42759..7e5afd8 100644
+index 4f42759..d635a79 100644
 --- a/xbmc/video/dialogs/GUIDialogVideoSettings.cpp
 +++ b/xbmc/video/dialogs/GUIDialogVideoSettings.cpp
-@@ -54,6 +54,13 @@
+@@ -31,6 +31,7 @@
+ #include "video/VideoDatabase.h"
+ #include "video/VideoStreamSelect.h"
+ #include "video/ViewModeSettings.h"
++#include "view/ViewStateSettings.h"
+ #include "windowing/WinSystem.h"
+ 
+ #include <utility>
+@@ -54,6 +55,13 @@
  #define SETTING_VIDEO_INTERLACEMETHOD     "video.interlacemethod"
  #define SETTING_VIDEO_SCALINGMETHOD       "video.scalingmethod"
  
@@ -480,7 +494,7 @@ index 4f42759..7e5afd8 100644
  #define SETTING_VIDEO_STEREOSCOPICMODE    "video.stereoscopicmode"
  #define SETTING_VIDEO_STEREOSCOPICINVERT  "video.stereoscopicinvert"
  
-@@ -194,6 +201,32 @@ void CGUIDialogVideoSettings::OnSettingChanged(const std::shared_ptr<const CSett
+@@ -194,6 +202,32 @@ void CGUIDialogVideoSettings::OnSettingChanged(const std::shared_ptr<const CSett
      vs.m_Orientation = std::static_pointer_cast<const CSettingInt>(setting)->GetValue();
      appPlayer->SetVideoSettings(vs);
    }
@@ -513,7 +527,19 @@ index 4f42759..7e5afd8 100644
    else if (settingId == SETTING_VIDEO_STEREOSCOPICMODE)
    {
      CVideoSettings vs = appPlayer->GetVideoSettings();
-@@ -311,6 +344,12 @@ void CGUIDialogVideoSettings::InitializeSettings()
+@@ -287,6 +321,11 @@ void CGUIDialogVideoSettings::SetupView()
+   SET_CONTROL_LABEL(CONTROL_SETTINGS_CANCEL_BUTTON, 15067);
+ }
+ 
++int CGUIDialogVideoSettings::GetSettingLevel() const
++{
++  return static_cast<int>(CViewStateSettings::GetInstance().GetSettingLevel());
++}
++
+ void CGUIDialogVideoSettings::InitializeSettings()
+ {
+   CGUIDialogSettingsManualBase::InitializeSettings();
+@@ -311,6 +350,12 @@ void CGUIDialogVideoSettings::InitializeSettings()
      CLog::Log(LOGERROR, "CGUIDialogVideoSettings: unable to setup settings");
      return;
    }
@@ -526,7 +552,7 @@ index 4f42759..7e5afd8 100644
    const std::shared_ptr<CSettingGroup> groupStereoscopic = AddGroup(category);
    if (groupStereoscopic == NULL)
    {
-@@ -455,6 +494,50 @@ void CGUIDialogVideoSettings::InitializeSettings()
+@@ -455,6 +500,51 @@ void CGUIDialogVideoSettings::InitializeSettings()
                visible);
    }
  
@@ -543,8 +569,9 @@ index 4f42759..7e5afd8 100644
 +               videoSettings.m_DolbyVisionEL, entries);
 +
 +    entries.clear();
-+    // the enhancement layer's upscale: an expert's choice. Bilinear is the
-+    // default; the others are sharper but too slow for 4K24 FEL on a Pi 5.
++    // the enhancement layer's upscale, the chroma MMR and the filters are an
++    // expert's choice. Bilinear is the default upscale; the others are
++    // sharper but too slow for 4K24 FEL on a Pi 5.
 +    entries.emplace_back(16302, VS_DOLBYVISION_UPSCALE_BILINEAR);
 +    entries.emplace_back(16321, VS_DOLBYVISION_UPSCALE_BICUBIC);
 +    entries.emplace_back(16305, VS_DOLBYVISION_UPSCALE_LANCZOS);
@@ -557,13 +584,13 @@ index 4f42759..7e5afd8 100644
 +    entries.emplace_back(36650, VS_DOLBYVISION_MMR_SPLIT);
 +    entries.emplace_back(36651, VS_DOLBYVISION_MMR_EXACT64);
 +    entries.emplace_back(36652, VS_DOLBYVISION_MMR_FLOAT);
-+    AddSpinner(groupDolbyVision, SETTING_VIDEO_DOLBYVISION_MMR, 36648, SettingLevel::Basic,
++    AddSpinner(groupDolbyVision, SETTING_VIDEO_DOLBYVISION_MMR, 36648, SettingLevel::Expert,
 +               videoSettings.m_DolbyVisionMMR, entries);
 +
 +    entries.clear();
 +    entries.emplace_back(36654, VS_DOLBYVISION_FILTERS_CB1);
 +    entries.emplace_back(36655, VS_DOLBYVISION_FILTERS_PHASE);
-+    AddSpinner(groupDolbyVision, SETTING_VIDEO_DOLBYVISION_FILTERS, 36653, SettingLevel::Basic,
++    AddSpinner(groupDolbyVision, SETTING_VIDEO_DOLBYVISION_FILTERS, 36653, SettingLevel::Expert,
 +               videoSettings.m_DolbyVisionFilters, entries);
 +
 +    entries.clear();
@@ -577,6 +604,20 @@ index 4f42759..7e5afd8 100644
    // stereoscopic settings
    entries.clear();
    entries.emplace_back(16316, static_cast<int>(RenderStereoMode::OFF));
+diff --git a/xbmc/video/dialogs/GUIDialogVideoSettings.h b/xbmc/video/dialogs/GUIDialogVideoSettings.h
+index 2689815..4dd25bb 100644
+--- a/xbmc/video/dialogs/GUIDialogVideoSettings.h
++++ b/xbmc/video/dialogs/GUIDialogVideoSettings.h
+@@ -41,6 +41,9 @@ protected:
+ 
+   // specialization of CGUIDialogSettingsBase
+   bool AllowResettingSettings() const override { return false; }
++  // the settings level chosen in Kodi's settings, so expert settings (the
++  // Dolby Vision enhancement layer upscale) show only at that level
++  int GetSettingLevel() const override;
+   bool Save() override;
+   void SetupView() override;
+ 
 -- 
 2.43.0
 

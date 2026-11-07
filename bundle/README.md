@@ -2,8 +2,9 @@
 
 Measures the Pi Dolby Vision engine on the Pi's own hardware decoder. It
 reconstructs each picture (BL, the FEL enhancement layer, the RPU) and packs
-it, with its metadata, into the TV-led HDMI tunnel frame. There's no Kodi,
-no display and no audio.
+it, with its metadata, into the TV-led HDMI tunnel frame. There's no Kodi
+and no audio; `bin/dvbench --kms-play` also shows the frames on the HDMI
+output.
 
 ## Setup (Raspberry Pi OS trixie, 64-bit)
 
@@ -21,6 +22,15 @@ sudo apt install mesa-vulkan-drivers libvulkan1 vulkan-tools v4l-utils python3
 tar xzf dvbench-rpi5-*.tar.gz && cd dvbench-rpi5-*
 sudo usermod -aG video,render $USER   # then log in again
 ```
+
+## Setup (LibreELEC 13)
+
+LibreELEC already sets `cma-512`, and its image has the Vulkan driver when
+built with `patches/libreelec/`. Unpack the bundle in `/storage` and run
+`bin/dvbench` with `LD_LIBRARY_PATH=$PWD/lib`. `run-bench.sh` runs too,
+without setting the CPU governor (LibreELEC has no `sudo`). Stop Kodi
+(`systemctl stop kodi`) before `--kms-play`, which needs the display, and
+start it again after.
 
 ## Run
 
@@ -78,6 +88,10 @@ bin/dvbench --help    # the option list
   profile 8.1 streams with MMR chroma, which CB1's contract (the default)
   doesn't take.
 - `--mmr exact|split|exact64|float` selects the MMR mode.
+- `--el-upscale bilinear|bicubic|annexb|lanczos` selects the FEL's EL
+  upscale (bilinear is the default and the only one real time at 4K).
+- `--kms-play S` plays S seconds on the HDMI output as Dolby Vision (the
+  kernel's `Dolby Vision` property, `patches/linux/`).
 - `--probe` checks the dmabuf allocator, the Vulkan device and an output
   import, and nothing else.
 - Without `--source v4l2`, dvbench decodes in software (`--source sw`).

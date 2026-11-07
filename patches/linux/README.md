@@ -2,7 +2,9 @@
 
 Against the Raspberry Pi kernel, `raspberrypi/linux` `rpi-6.18.y`
 (`a4985478de14`, the source of Raspberry Pi OS's 6.18.60 kernel). Apply them
-in order with `git am`.
+in order with `git am`. LibreELEC 13's kernel (`0b41724`, also 6.18.60) takes
+them unchanged as `projects/RPi/patches/linux/` (`../libreelec/`), and its
+image then has the property.
 
 | Patch | What |
 |---|---|
@@ -95,7 +97,7 @@ existing bpc tests in `drmm_connector_hdmi_init` and the HDMI state helper
 suites fail with or without the patches: the tree's HDMI connector reset
 requests 8 bpc, where those tests expect the connector's maximum.
 
-## Installing on a Raspberry Pi 5
+## Installing on Raspberry Pi OS
 
 The drivers needed to boot (RP1, USB storage, SD, ext4) are built in, so the
 kernel boots without an initramfs and with the stock device trees and
