@@ -18,7 +18,8 @@ engine (bilinear FEL) and fast enough for real-time 24p 4K FEL on a stock Pi 5.
 The design, its routes, MMR modes and measurements are in
 [docs/ENGINE.md](docs/ENGINE.md). The Pi 5 GPU and its Vulkan driver are in
 [docs/pi5/V3DV.md](docs/pi5/V3DV.md). How we got here is in
-[docs/HISTORY.md](docs/HISTORY.md).
+[docs/HISTORY.md](docs/HISTORY.md). The open review findings are in
+[docs/REVIEW.md](docs/REVIEW.md).
 
 ## Layout
 
@@ -32,7 +33,7 @@ The design, its routes, MMR modes and measurements are in
 | `image/`, `scripts/make-image.sh` | A flashable Raspberry Pi OS image with the bundle and clips |
 | `vm/`, `scripts/vm*.sh` | A Debian arm64 VM (Lima) on Mesa's software Vulkan, for building and checking without a Pi |
 | `docker/`, `scripts/build-*.sh` | The aarch64 build container and builds |
-| `docs/` | `ENGINE.md`, `pi5/V3DV.md` (+ `pi5/device/`: the Pi's own Vulkan / system dumps), `SETUP.md`, `HISTORY.md` |
+| `docs/` | `ENGINE.md`, `pi5/V3DV.md` (+ `pi5/device/`: the Pi's own Vulkan / system dumps), `SETUP.md`, `HISTORY.md`, `REVIEW.md` (open review findings) |
 
 ## Quick start (Apple Silicon Mac: Docker and `brew install lima`)
 
@@ -43,26 +44,18 @@ scripts/vm.sh tests/check.sh         # the engine against the golden hashes (nee
 scripts/vm.sh dvbench --hash clips/X.mkv
 ```
 
-On the Pi:
-1. Get the software onto it, either way:
-   - flash `out/dvbench-rpi5-sd.img.xz` (`scripts/make-image.sh`: Raspberry
-     Pi OS Lite with the bundle and clips, user `dv` / `dvbench`, SSH,
-     `cma-512`), or
-   - copy `out/dvbench-rpi5-*.tar.gz` to an existing install.
-2. Run `./run-bench.sh clips/*`. See [bundle/README.md](bundle/README.md).
+On the Pi: flash `out/dvbench-rpi5-sd.img.xz` (`scripts/make-image.sh`) or
+copy `out/dvbench-rpi5-*.tar.gz` to an existing install, then run
+`./run-bench.sh clips/*`. See [bundle/README.md](bundle/README.md).
 
-More in [docs/SETUP.md](docs/SETUP.md). `sources.lock` pins the inputs
-(FFmpeg); `scripts/fetch-sources.sh` fetches them into `third_party/`. Media
-lives in `clips/`, which isn't in git.
+More in [docs/SETUP.md](docs/SETUP.md). `sources.lock` pins FFmpeg;
+`scripts/fetch-sources.sh` fetches it into `third_party/`. Media lives in
+`clips/`, which isn't in git.
 
 ## Status
 
 - **Done:** the engine and its routes, exactness, and real-time performance
   on hardware (above).
-- **Next:** LibreELEC 13 integration:
-  - Vulkan enabled for RPi in our LE branch
-  - the output on a DRM PRIME plane
-  - DV signalling on the Pi's HDMI
-  - Kodi wiring
-
-  Details in [docs/ENGINE.md](docs/ENGINE.md) "Open".
+- **Next:** LibreELEC 13 integration: Vulkan in our LE branch, the output on
+  a DRM PRIME plane, DV signalling on the Pi's HDMI, Kodi. Details in
+  [docs/ENGINE.md](docs/ENGINE.md) "Open".

@@ -257,6 +257,8 @@ static int split_packet(const struct dv_source *s, const AVPacket *in, AVPacket 
     return 0;
 }
 
+static void prime_parameter_sets(struct dv_source *s, const AVCodecParameters *par);
+
 struct dv_source *dv_source_open(const char *path, const struct dv_source_options *o)
 {
     struct dv_source *s = calloc(1, sizeof(*s));
@@ -300,12 +302,51 @@ struct dv_source *dv_source_open(const char *path, const struct dv_source_option
         if (!s->dec[1])
             goto fail;
     }
-    if (o->start > 0)
+    if (o->start > 0) {
+        prime_parameter_sets(s, par);
         av_seek_frame(s->fmt, s->stream, (int64_t)(o->start / av_q2d(s->time_base)), AVSEEK_FLAG_BACKWARD);
+    }
     return s;
 fail:
     dv_source_close(s);
     return NULL;
+}
+
+/* Some hev1 files (Dolby's own Sol Levante samples among them) carry their
+ * VPS/SPS/PPS only in the first access unit, not in the hvcC record. A decoder
+ * that starts at a later keyframe then has no parameter sets. A player decodes
+ * from the start and keeps them across seeks; do the same before --start:
+ * give the base-layer decoder the first packet's parameter sets alone. */
+static void prime_parameter_sets(struct dv_source *s, const AVCodecParameters *par)
+{
+    if (par->extradata_size < 23 || par->extradata[0] != 1 || par->extradata[22] != 0)
+        return; /* not hvcC, or hvcC with its own parameter sets */
+    int len = (par->extradata[21] & 3) + 1;
+    AVPacket *pkt = av_packet_alloc(), *ps = av_packet_alloc();
+    while (pkt && av_read_frame(s->fmt, pkt) >= 0 && pkt->stream_index != s->stream)
+        av_packet_unref(pkt);
+    if (pkt && ps && pkt->size && av_new_packet(ps, pkt->size) >= 0) {
+        int n = 0;
+        for (int i = 0; i + len <= pkt->size;) {
+            uint32_t size = 0;
+            for (int k = 0; k < len; k++)
+                size = size << 8 | pkt->data[i + k];
+            if (size == 0 || size > (uint32_t)(pkt->size - i - len))
+                break;
+            int type = pkt->data[i + len] >> 1 & 0x3f;
+            if (type >= 32 && type <= 34) { /* VPS, SPS, PPS */
+                memcpy(ps->data + n, pkt->data + i, len + size);
+                n += len + (int)size;
+            }
+            i += len + (int)size;
+        }
+        if (n) {
+            ps->size = n;
+            avcodec_send_packet(s->dec[0], ps);
+        }
+    }
+    av_packet_free(&ps);
+    av_packet_free(&pkt);
 }
 
 int dv_source_profile(const struct dv_source *s) { return s->profile; }

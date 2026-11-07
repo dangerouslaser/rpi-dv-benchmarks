@@ -80,6 +80,12 @@ Media isn't in git (`clips/` is ignored). `tests/check.sh` runs the cases in
   - The `p81mmr-al`, `-pr`, `-cmv` and `-dune2` cuts: the first 4 s of each
     test clip, and 6 s of Dune Part Two from 50:00.
 
+  `START` and `SECONDS_` set the cut. The script names its output
+  `PREFIX-NAME.mkv` from the source's file name; `tests/check.sh` looks for
+  the exact names in `tests/golden/hashes.txt`, so rename to match (several
+  there, e.g. `p81-All_Layers_Te.mkv` and `p81mmr-al.mkv`, were renamed by
+  hand).
+
 Full films (1917, Dune) were measured from the NAS over SMB. See
 `docs/ENGINE.md`.
 
@@ -95,4 +101,5 @@ reason in the commit.
 
 Follow the shader rules in `docs/ENGINE.md` ("What V3D taught us"). After any
 shader change, check the V3D compiler's view on the Pi:
-`V3D_DEBUG=shaderdb dvbench --frames 1 …` gives threads, loops and spills.
+`V3D_DEBUG=shaderdb dvbench --frames 1 …` gives threads, loops and spills
+(`run-bench.sh` records it per clip). The VM's lavapipe can't show this.

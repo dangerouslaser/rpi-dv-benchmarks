@@ -47,7 +47,7 @@ built the first time a stream needs it.
 |---|---|---|---|
 | dual | Profile 7 FEL | MMR (or polynomial) + EL residual | mapping table + bilinear EL + NLQ |
 | single | Profile 7 MEL, 8.1 with polynomial chroma | 12-bit tables | 12-bit table |
-| piecewise | Profile 8.1 with MMR chroma (`--filters yblod`) | one MMR piece per channel: the exact split MMR; otherwise yblod's general reshape (exact, slow) | 12-bit table |
+| piecewise | Profile 8.1 with MMR chroma (`--filters yblod`), Profile 8.4 | one MMR piece per channel: the MMR in the `--mmr` mode (exact unless `float`); otherwise yblod's general reshape (exact, slow) | 12-bit table |
 
 **Spatial filters** (`--filters`):
 - **`cb1`, the default:** CB1 Master Reference's contract. Reshaping at 4:2:0,
@@ -67,6 +67,9 @@ upscale: every sample of the tunnel frame, metadata included.
   tested, before yblod was removed from this repository.
 - **What keeps it:** `tests/golden/hashes.txt` carries those results.
   `tests/check.sh` must reproduce them.
+- **The exception:** MMR curves that don't fit the 64-bit LUT (the
+  planner's MMR96 / MMR128 kinds) render in `float`. No clip tested so far
+  has them (`docs/REVIEW.md` P2 #4).
 
 ## Chroma MMR modes (`--mmr`)
 
@@ -76,7 +79,7 @@ MMR is a 3-variable polynomial of up to 3rd order. Computed exactly it needs
 | Mode | How | Exact | 1917 |
 |---|---|---|---|
 | `exact`, the default | Float, with a per-sample error bound (see below). Samples whose bound straddles a 12-bit step take `split`. | yes | 35.2 ms |
-| `split` | The 64-bit sum's low 32 bits from wrapping 32-bit integer multiply-adds, its high 32 bits from a float sum: `H = round(y − L / 2³²)`. The CPU checks each frame that float's worst-case error is under 0.25 (1917: 0.02); otherwise the frame uses `exact64`. | yes | 33.1 ms |
+| `split` | The 64-bit sum's low 32 bits from wrapping 32-bit integer multiply-adds, its high 32 bits from a float sum: `H = round(y − L / 2³²)`. The CPU bounds float's error for the frame's largest magnitudes: 32 × 2⁻²⁴ × Σ max\|terms\| < 0.5 (1917: 0.01; Sol Levante 8.4: up to 0.46). A frame over it checks each sample's own magnitudes instead, and takes `exact64` where that fails too (the guard, about 2 ms). | yes | 33.1 ms |
 | `exact64` | yblod's emulated 64-bit (`umulExtended`) | yes | 45.8 ms |
 | `exact32` | 16 + 16-bit × 10 + 10-bit pieces, four accumulators | yes | slower than `exact64` |
 | `float` | 32-bit float | within 2 codes, about 0.001% of samples | 28.9 ms |
@@ -95,8 +98,11 @@ read over SMB:
 |---|---|---|---|
 | 1917 (UHD BD, P7.6 FEL, MMR, 2.39:1) | dual, `exact` | 35.2 ms (29.0 fps) | 5 min, 7,192 frames, **0 late**, 69 °C, no throttling |
 | Dune (2021) (UHD BD, P7.6 MEL) | single | 16.1 ms (65 fps) | 60 s, 0 late |
-| Profile 8.1 MMR cuts (1917, test clips) | piecewise | 37.0–37.1 ms | 8 s, 8 late (≤ 4 ms) |
+| Profile 8.1 MMR cuts (1917, test clips) | piecewise | 26.1–27.9 ms | 8 s, 0 late |
 | DV FEL test clips (polynomial chroma) | dual | 29.0 ms (35 fps) | — |
+| Sol Levante (Dolby's samples), Profile 5 | single | 18.4 ms (54 fps) | 90 s, 0 late |
+| Sol Levante, Profile 8.1 | single | 18.3 ms (55 fps) | 90 s, 0 late |
+| Sol Levante, Profile 8.4 (HLG base) | piecewise, `exact` | 30.5–35.5 ms (28–33 fps); 43.5–53.4 ms with `--filters yblod` | whole film (263 s, 6,314 pictures), 1 late (1.2 ms), 66 °C, no throttling |
 
 Notes:
 - The HEVC decoder alone does 44–79 fps for BL and EL, over SMB.
@@ -159,6 +165,19 @@ pass only, for measurement) stubs out its parts:
 | 32 | tunnel packing |
 | 64 | 4:2:2 filter |
 
+Other switches, for debugging and measurement:
+
+| Variable | Effect |
+|---|---|
+| `PI_DEBUG=1` | print the plan |
+| `PI_ALL_ROWS=1` | no letterbox skipping: both passes over every row |
+| `PI_DRAW_BARS=1` | draw the bars instead of clearing them |
+| `PI_PIECE_GENERAL=1` | piecewise route: always the general reshape |
+| `PI_MARK=1` | `exact` MMR: write 65535 / 0 where a sample took the fallback |
+| `PI_COPY_OUTPUT=1` | render to an image and copy it to the dmabuf, as without `VK_EXT_image_drm_format_modifier` |
+| `PI_DEVICE=NAME` | Vulkan device (as `dvbench --device`) |
+| `DVBENCH_ALLOC=udmabuf\|cma\|system` | the bench's dmabuf allocator (default: the first that works) |
+
 On the Pi itself, `V3D_DEBUG=shaderdb` prints the compiler's statistics,
 `V3D_DEBUG=fs` the QPU code, and `V3D_DEBUG=nir` the NIR.
 `bundle/run-bench.sh` does it all per clip.
@@ -171,5 +190,15 @@ On the Pi itself, `V3D_DEBUG=shaderdb` prints the compiler's statistics,
   - The output dmabuf on a KMS plane (DRM PRIME).
   - The DV VSIF / HDMI signalling for the Pi's `vc4_hdmi`.
   - Kodi wiring.
-- **Coverage:** Profile 5 (IPTPQc2) is untested. The Annex B EL upscale and
-  resized output (the planner's `PACK_RESIZED`) aren't implemented.
+- **Integration review:** `docs/REVIEW.md` lists what the engine needs
+  before it runs inside Kodi.
+- **Coverage:**
+  - Profiles 5, 8.1 and 8.4 were checked on Dolby's Sol Levante samples
+    (`DolbyLaboratories/dolby-vision-contents`). At 4 points through the film,
+    they are identical to yblod's engine, Profile 8.4 with `--filters yblod`.
+    yblod refuses 8.4 under `cb1`, so that output has no reference; there,
+    `exact`, `split` and `exact64` agree on V3D at the same 4 points.
+  - Profile 8.4 is real time with the default `cb1` filters only.
+  - **1080p is refused** for every profile (`docs/REVIEW.md` P1 #3).
+  - The Annex B EL upscale and resized output (the planner's
+    `PACK_RESIZED`) aren't implemented.

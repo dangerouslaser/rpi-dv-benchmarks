@@ -46,6 +46,8 @@ The redesign, in steps:
    loops:** 1917 plays exactly in real time at 33–35 ms.
 6. **The single-layer routes:** Dune (MEL) at 16 ms, and profile 8.1 MMR
    at 37 ms.
+7. **A tighter split bound, checked per sample where it fails:** Profile
+   8.4 from 184 ms to 31–35 ms, and the 8.1 MMR cuts to 26–28 ms.
 
 Tested on the NAS's real films over SMB: 1917 and Dune.
 
@@ -59,6 +61,9 @@ the repository:
   `patches/ffmpeg/`.
 - **The equivalence with yblod,** verified one last time on every test clip,
   lives on as `tests/golden/hashes.txt`.
+- **Their tooling went with them:** libplacebo, libva, the Rust toolchain
+  and the offline V3D compiler (Mesa on a drm-shim) that gave shader
+  statistics without a Pi. Shader statistics now come from the Pi itself.
 
 The reference engines are still public:
 - yblod: [dangerouslaser/libreelec-yblod](https://github.com/dangerouslaser/libreelec-yblod)

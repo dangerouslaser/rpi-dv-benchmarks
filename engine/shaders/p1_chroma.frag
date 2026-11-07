@@ -43,10 +43,15 @@ layout(constant_id = 7) const uint SINGLE = 0;
 layout(constant_id = 8) const uint PIECE = 0;
 layout(constant_id = 9) const uint ORDER2 = 0;
 // Route 3 with one piece per chroma channel: pi_engine.c piece_fast() has
-// written it as an MMR, computed by mmr_split (exact).
+// written it as an MMR, computed by mmr() in the stream's exact mode.
 layout(constant_id = 10) const uint PIECE_FAST = 0;
-// Measurement only (PI_MARK): mode 4 writes 4095 / 0 where it falls back.
+// Measurement only (PI_MARK): mode 4 writes 4095 / 0 where it falls back,
+// the split's guard 0 / 4095.
 layout(constant_id = 11) const uint MARK = 0;
+// The split's per-sample guard (modes 3, 4): pi_engine.c's bound for the
+// frame's largest magnitudes fails, so mmr_split checks each sample's own
+// and takes emulated 64-bit where that fails too.
+layout(constant_id = 12) const uint SPLIT_GUARD = 0;
 
 
 // ---- SAND reads ------------------------------------------------------------
@@ -221,54 +226,66 @@ vec2 mmr_float(uvec3 s0, uvec3 s1, bool both)
 
 // Mode 3, exact at near float cost: the exact 64-bit sum S's low 32 bits by
 // 32-bit integer arithmetic (it wraps: no high multiplies), its high 32 bits
-// from float: y, S / 2^32 summed in float, is within 0.25 of the exact value
-// (pi_engine.c checks that bound each frame, else this pipeline isn't used),
-// so H = round(y - L / 2^32) is exact. Features exact (fprod, 10-bit halves).
+// from float: y, S / 2^32 summed in float, is within 0.5 of the exact value
+// (pi_engine.c checks that bound each frame for the largest magnitudes;
+// where it fails, SPLIT_GUARD checks each sample's own: split_guarded), so
+// H = round(y - L / 2^32) is exact. Features exact (fprod, 10-bit halves).
 // Written without loops: V3D's compiler left the looped version's 11 loops
 // rolled (at 2 threads).
 const float SPLIT_W = 1.0 / 4294967296.0;
 
-// One table fetch (Cb's and Cr's entries) of mmr_split: low words, float sum.
-void split_lut(uvec4 q0, uvec4 q1, inout uvec2 lo, inout vec2 y)
+// One table fetch (Cb's and Cr's entries) of mmr_split: low words, float
+// sum, the terms' magnitudes (mag: unused, so removed, without the guard).
+void split_lut(uvec4 q0, uvec4 q1, inout uvec2 lo, inout vec2 y, inout vec2 mag)
 {
     const float W = 1.0 / 4294967296.0;
     lo += uvec2(q0.x, q1.z);
-    y += vec2(float(int(q0.y)) + float(q0.x) * W, float(int(q1.w)) + float(q1.z) * W);
+    vec2 t = vec2(float(int(q0.y)) + float(q0.x) * W, float(int(q1.w)) + float(q1.z) * W);
+    y += t;
+    mag += abs(t);
 }
 
 // One cross feature's powers to ORDER of mmr_split, coefficients c (the
 // low words, order 1..3) and cf (/ 2^32), channel 0 then 1: low words and
 // float sum. All indices literal at the call (no dynamic indexing).
 void split_term(uvec2 fa, bool both, ivec2 c1, ivec2 c2, ivec2 c3, vec2 f1, vec2 f2, vec2 f3, inout uvec2 lo,
-                inout vec2 y)
+                inout vec2 y, inout vec2 mag)
 {
     lo += uvec2(c1) * fa;
-    y += f1 * vec2(fa);
+    vec2 t = f1 * vec2(fa);
+    y += t;
+    mag += abs(t);
     if (ORDER > 1u) {
         uvec2 fb = both ? uvec2(fprod_split(fa.x, fa.x)) : uvec2(fprod_split(fa.x, fa.x), fprod_split(fa.y, fa.y));
         lo += uvec2(c2) * fb;
-        y += f2 * vec2(fb);
+        t = f2 * vec2(fb);
+        y += t;
+        mag += abs(t);
         if (ORDER > 2u) {
             uvec2 fc = both ? uvec2(fprod_split(fa.x, fb.x)) : uvec2(fprod_split(fa.x, fb.x), fprod_split(fa.y, fb.y));
             lo += uvec2(c3) * fc;
-            y += f3 * vec2(fc);
+            t = f3 * vec2(fc);
+            y += t;
+            mag += abs(t);
         }
     }
 }
 
 #define SPLIT_TERM(fa, K) split_term(fa, both, ivec2(P.c32[0][K], P.c32[3][K]), ivec2(P.c32[1][K], P.c32[4][K]), \
                                      ivec2(P.c32[2][K], P.c32[5][K]), vec2(P.cs[0][K], P.cs[3][K]), \
-                                     vec2(P.cs[1][K], P.cs[4][K]), vec2(P.cs[2][K], P.cs[5][K]), lo, y)
+                                     vec2(P.cs[1][K], P.cs[4][K]), vec2(P.cs[2][K], P.cs[5][K]), lo, y, mag)
 
-uvec2 mmr_split(uvec3 s0, uvec3 s1, bool both)
+// The split MMR; mag: the sum of its terms' magnitudes (/ 2^32).
+uvec2 mmr_split_mag(uvec3 s0, uvec3 s1, bool both, out vec2 mag)
 {
     uint xy0 = s0.x * s0.y, xy1 = s1.x * s1.y;
     uvec2 lo = uvec2(P.const64[0].x, P.const64[1].x);
     vec2 y = P.cy.xy;
+    mag = abs(y);
     uvec4 qx = lut64(0u, s0.x), qy = lut64(1u, s0.y), qz = lut64(2u, s0.z);
-    split_lut(qx, both ? qx : lut64(0u, s1.x), lo, y);
-    split_lut(qy, both ? qy : lut64(1u, s1.y), lo, y);
-    split_lut(qz, both ? qz : lut64(2u, s1.z), lo, y);
+    split_lut(qx, both ? qx : lut64(0u, s1.x), lo, y, mag);
+    split_lut(qy, both ? qy : lut64(1u, s1.y), lo, y, mag);
+    split_lut(qz, both ? qz : lut64(2u, s1.z), lo, y, mag);
     SPLIT_TERM(uvec2(xy0, xy1), 0);
     SPLIT_TERM(uvec2(s0.x * s0.z, s1.x * s1.z), 1);
     SPLIT_TERM(uvec2(s0.y * s0.z, s1.y * s1.z), 2);
@@ -340,6 +357,18 @@ uvec2 mmr_exact(uvec3 s0, uvec3 s1, bool both, uint mode)
     return uvec2(map16(v0, P.pk.y + 4u), map16(v1, P.pk.z + 4u));
 }
 
+// The split MMR, exact: with SPLIT_GUARD, each sample whose float sum may
+// be 0.5 off (32 x 2^-24 x its terms' magnitudes; see pi_engine.c split_ok)
+// in emulated 64-bit instead. One return (see map16).
+uvec2 split_guarded(uvec3 s0, uvec3 s1, bool both)
+{
+    vec2 mag;
+    uvec2 m = mmr_split_mag(s0, s1, both, mag);
+    if (SPLIT_GUARD != 0u && any(greaterThanEqual(mag * P.err.y, vec2(0.5))))
+        m = MARK != 0u ? uvec2(0u, 65535u) : mmr_exact(s0, s1, both, 2u);
+    return m;
+}
+
 // One row's [1 2 1] / 4 of the BL luma at pixels 2cx-1 .. 2cx+1 (the first clamped).
 uint guide_row(uint cx, uint y)
 {
@@ -371,7 +400,7 @@ uvec2 mmr(uvec3 s0, uvec3 s1, bool both, ivec2 r)
     // one path per specialised pipeline, one return (see map16)
     uvec2 m;
     if (MMR_MODE == 3u)
-        m = mmr_split(s0, s1, both);
+        m = split_guarded(s0, s1, both);
     else if (MMR_MODE == 0u)
         m = q16(mmr_float(s0, s1, both));
     else if (MMR_MODE == 4u) {
@@ -379,7 +408,7 @@ uvec2 mmr(uvec3 s0, uvec3 s1, bool both, ivec2 r)
         vec2 bound, v = mmr_float_bounded(s0, s1, both, bound);
         uvec2 lo = q16(v - bound), hi = q16(v + bound);
         bool sure = uvec2(recon(lo.x, r.x), recon(lo.y, r.y)) == uvec2(recon(hi.x, r.x), recon(hi.y, r.y));
-        m = sure ? lo : MARK != 0u ? uvec2(65535u, 0u) : mmr_split(s0, s1, both);
+        m = sure ? lo : MARK != 0u ? uvec2(65535u, 0u) : split_guarded(s0, s1, both);
     } else
         m = mmr_exact(s0, s1, both, MMR_MODE);
     return uvec2(recon(m.x, r.x), recon(m.y, r.y));
@@ -389,8 +418,7 @@ uvec3 reshape_chroma(uint guide, uvec2 chroma)
 {
     if (PIECE_FAST != 0u) {
         uvec3 s = clamp(uvec3(guide, chroma), P.lo[0].xyz, P.hi[0].xyz);
-        uvec2 m = mmr_split(s, s, true);
-        return uvec3(0u, recon(m.x, 0), recon(m.y, 0));
+        return uvec3(0u, mmr(s, s, true, ivec2(0)));
     }
     return ORDER2 != 0u ? reshape_order2_chroma(uvec3(guide, chroma)) : reshape_tuple(uvec3(guide, chroma));
 }

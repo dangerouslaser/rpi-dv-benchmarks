@@ -1,2 +1,0 @@
-== eglinfo
-== es2_info / glxinfo-ish

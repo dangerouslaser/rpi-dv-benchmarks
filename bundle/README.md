@@ -28,7 +28,11 @@ sudo usermod -aG video,render $USER   # then log in again
 ./run-bench.sh /path/to/clips/*.mkv              # everything (a few minutes a clip)
 ./run-bench.sh --quick /path/to/clips/*.mkv      # the correctness checks only
 ./run-bench.sh --start 600 --play 300 film.mkv   # 5 minutes of real time, 10 minutes in
+./run-bench.sh --filters yblod p81mmr-*.mkv      # profile 8.1 with MMR chroma
 ```
+
+Other options: `--frames`, `--throughput`, `--repeat`, `--out`. Run it with
+no clips for the list.
 
 Per clip, all from the Pi's hardware decoder (V4L2 request, SAND128):
 
@@ -64,12 +68,13 @@ log and JSON per run. Send that directory back.
 export LD_LIBRARY_PATH=$PWD/lib
 bin/dvbench --source v4l2 --frames 12 --warmup 2 --throughput 10 clip.mkv
 bin/dvbench --source v4l2 --start 600 --frames 4 --play 60 film.mkv
-bin/dvbench --help    # every option
+bin/dvbench --help    # the option list
 ```
 
 - `--filters yblod` selects YBLOD's spatial filters. Use it for profile 8.1
   streams with MMR chroma, which CB1's contract (the default) doesn't take.
-- `--mmr float|split|exact64` selects the MMR mode.
+- `--mmr exact|split|exact64|exact32|float` selects the MMR mode.
+- Without `--source v4l2`, dvbench decodes in software (`--source sw`).
 - `PI_PROFILE=1` adds per-pass GPU times.
 
 `bin/vk-micro` runs one synthetic 4K pass as Vulkan compute, Vulkan

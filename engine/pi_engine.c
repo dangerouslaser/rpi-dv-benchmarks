@@ -107,7 +107,7 @@ struct pi_engine {
     VkDescriptorPool dpool;
     VkRenderPass rp[3];
     struct variant {
-        uint32_t key[12];
+        uint32_t key[13];
         VkPipeline p;
     } v1[16], v2[8];
     int n1, n2;
@@ -772,10 +772,11 @@ _Static_assert(sizeof(struct reshape) == sizeof(((dvvk_plan *)0)->reshape), "dv_
 
 /* Route 3 with one piece per chroma channel, its sums within 64 bits (the
  * planner's narrow mask), 10-bit: the same sum as the FEL MMR's, so pass 1's
- * split MMR (mode 3) computes it exactly. Fills the MMR parameters and the
- * univariate tables (exact 64-bit) from the pieces; 0 if this mapping is
- * outside that. */
-static int piece_fast(const dvvk_plan *p, struct params *q, uint32_t *t, uint32_t order[2])
+ * MMR computes it exactly (any exact mode). Fills the MMR parameters, the
+ * univariate tables (exact 64-bit, and float) from the pieces; 0 if this
+ * mapping is outside that. *fits32: every cross coefficient fits 32 bits
+ * (emulated 64-bit, mode 2, multiplies 32-bit coefficients). */
+static int piece_fast(const dvvk_plan *p, struct params *q, uint32_t *t, uint32_t order[2], int *fits32)
 {
     struct reshape r;
     memcpy(&r, p->reshape, sizeof(r));
@@ -795,6 +796,9 @@ static int piece_fast(const dvvk_plan *p, struct params *q, uint32_t *t, uint32_
         q->lo[0][k] = r.curve[k].pivots[0];
         q->hi[0][k] = r.curve[k].pivots[r.curve[k].pivot_count - 1];
     }
+    float *lutf = (float *)(t + T_LUTF);
+    double scale = ldexp(1.0, -(int)(r.denominator + 4));   /* the float MMR's (mode 4): Q16 */
+    *fits32 = 1;
     for (int c = 1; c < 3; c++) {
         const struct reshape_piece *pc = &r.curve[c].piece[0];
         int ch = c - 1, mmr = pc->method != 0;
@@ -803,12 +807,18 @@ static int piece_fast(const dvvk_plan *p, struct params *q, uint32_t *t, uint32_
         q->const64[ch][0] = (uint32_t)(uint64_t)constant;
         q->const64[ch][1] = (uint32_t)((uint64_t)constant >> 32);
         q->cy[ch] = (float)((double)constant / 4294967296.0);
+        q->cconst[ch] = (float)((double)constant * scale);
         q->pk[1 + ch] = r.denominator;   /* the shader adds 4: denominator + q - 16 */
         for (int o = 0; o < 3; o++)
             for (int k = 0; k < 4; k++) {
                 int64_t v = mmr && o < (int)pc->order ? pc->coefficient[o][k + 3] : 0;
                 q->c32[ch * 3 + o][k] = (int32_t)(uint32_t)(uint64_t)v;   /* the low word: it wraps */
+                q->c_lo[ch * 3 + o][k] = (int32_t)v & 0xffff;   /* mode 1's halves (32-bit v only) */
+                q->c_hi[ch * 3 + o][k] = (int32_t)v >> 16;
                 q->cs[ch * 3 + o][k] = (float)((double)v / 4294967296.0);
+                q->cf[ch * 3 + o][k] = (float)((double)v * scale);
+                if (v != (int32_t)v)
+                    *fits32 = 0;
             }
         for (int k = 0; k < 3; k++)
             for (int i = 0; i < 1024; i++) {
@@ -830,6 +840,7 @@ static int piece_fast(const dvvk_plan *p, struct params *q, uint32_t *t, uint32_
                 uint64_t u = (uint64_t)(int64_t)v;
                 t[T_LUT64 + (k * 1024 + i) * 4 + ch * 2] = (uint32_t)u;
                 t[T_LUT64 + (k * 1024 + i) * 4 + ch * 2 + 1] = (uint32_t)(u >> 32);
+                lutf[(k * 1024 + i) * 2 + ch] = (float)((double)(int64_t)v * scale);
             }
     }
     return 1;
@@ -852,10 +863,10 @@ static int split_ok(const struct params *q, const uint32_t *t, unsigned c, int d
         for (int k = 0; k < 4; k++)
             m += fabs((double)q->cs[c * 3 + o][k]) * 4294967296.0 * 1048576.0;   /* features < 2^20 */
     m /= 4294967296.0;
-    double bound = 64.0 / 16777216.0 * m;
+    double bound = 32.0 / 16777216.0 * m;
     if (debug)
-        fprintf(stderr, "pi: MMR channel %u split: largest |S| / 2^32 %.1f, float bound %.3g (< 0.25)\n", c, m, bound);
-    return bound < 0.25 && m < 1048576.0;
+        fprintf(stderr, "pi: MMR channel %u split: largest |S| / 2^32 %.1f, float bound %.3g (< 0.5)\n", c, m, bound);
+    return bound < 0.5 && m < 1048576.0;
 }
 
 /* The pipeline for specialization `key` (constant ids first .. first + n - 1),
@@ -992,14 +1003,18 @@ int pi_submit(struct pi_engine *e, const AVFrame *bl, const AVFrame *el, const v
                 }
     }
     /* Mode 3 (p1_chroma.frag mmr_split): the high word from a float sum y of
-     * S / 2^32 is exact when y is within 0.25 of it (round(), with the low
-     * word's own rounding far below). Every float operation rounds within
-     * 2^-24 of its result (Vulkan: add and multiply correctly rounded): about
-     * 20 per channel, the inputs' conversions as many again; 64 x 2^-24 x the
-     * sum of the terms' largest magnitudes bounds the error with room. Too
-     * big a bound (or a y whose ulp could matter): emulated 64-bit instead. */
+     * S / 2^32 is exact when y is within 0.5 of it (round()). Every float
+     * operation rounds within u = 2^-24 of its result (Vulkan: add and
+     * multiply correctly rounded). Per channel, m the sum of the 16 terms'
+     * largest magnitudes (constant, 3 tables, 12 cross terms): each term's
+     * own roundings (its coefficient's or entry's conversion, the product or
+     * the entry's inner add) are within 2u of it, together 2um; its add into
+     * y within um, any order (every partial sum is within m); the final
+     * subtraction um. About 19um: 32um < 0.5 keeps 1.7x room. Too big a bound
+     * (or a y whose ulp could matter): emulated 64-bit instead. */
     int split = e->mode == PI_MMR_HYBRID || e->mode == PI_MMR_BOUNDED;
     q->err[0] = 20.0f / 16777216.0f;   /* mode 4: p1_chroma.frag mmr_float_bounded */
+    q->err[1] = 32.0f / 16777216.0f;   /* the split's guard: split_ok's bound per sample */
     for (unsigned c = 0; c < 2 && split; c++) {
         if (p->chroma_kind[c] != DVVK_CHROMA_MMR64_LUT)
             continue;
@@ -1012,15 +1027,23 @@ int pi_submit(struct pi_engine *e, const AVFrame *bl, const AVFrame *el, const v
         if (!split_ok(q, t, c, getenv("PI_DEBUG") && first)) {
             split = 0;
             if (!e->warned++)
-                fprintf(stderr, "pi: MMR magnitudes too large for the split: emulated 64-bit\n");
+                fprintf(stderr, "pi: MMR magnitudes too large for the split: checked per sample\n");
         }
     }
-    /* Route 3, one piece per chroma channel: pass 1's split MMR. */
-    uint32_t piece_order[2] = {0, 0};
-    int fast = piece && e->mode != PI_MMR_FLOAT && !getenv("PI_PIECE_GENERAL") && piece_fast(p, q, t, piece_order) &&
-               split_ok(q, t, 0, getenv("PI_DEBUG") && first) && split_ok(q, t, 1, getenv("PI_DEBUG") && first);
+    /* Route 3, one piece per chroma channel: pass 1's MMR, the stream's mode.
+     * Where the split's bound fails, its guard's fallback, emulated 64-bit,
+     * needs 32-bit coefficients. */
+    uint32_t piece_order[2] = {0, 0}, mode = e->mode;
+    int fits32 = 0, fast = piece && e->mode != PI_MMR_FLOAT && !getenv("PI_PIECE_GENERAL") &&
+                           piece_fast(p, q, t, piece_order, &fits32);
+    if (fast) {
+        split = split_ok(q, t, 0, getenv("PI_DEBUG") && first) && split_ok(q, t, 1, getenv("PI_DEBUG") && first);
+        if (!fits32 && (mode <= PI_MMR_EXACT64 || !split))
+            fast = 0;
+    }
     if (getenv("PI_DEBUG") && first && piece)
-        fprintf(stderr, "pi: route 3 %s\n", fast ? "fast (one piece per channel: split MMR)" : "general (yblod's piecewise, emulated)");
+        fprintf(stderr, "pi: route 3 %s (fallback %s)\n", fast ? "fast (one piece per channel: MMR)" : "general (yblod's piecewise, emulated)",
+                split ? "split" : "split, guarded per sample");
     s->plan_ms = now_ms() - t0;
 
     VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -1031,18 +1054,31 @@ int pi_submit(struct pi_engine *e, const AVFrame *bl, const AVFrame *el, const v
         vkCmdResetQueryPool(s->cmd, s->qp, 0, 4);
         vkCmdWriteTimestamp(s->cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, s->qp, 0);
     }
-    uint32_t k1[12] = {exact ? (uint32_t)((e->mode == PI_MMR_HYBRID || e->mode == PI_MMR_BOUNDED) && !split ? PI_MMR_EXACT64 : e->mode) : PI_MMR_FLOAT, p->chroma_phase, p->dual, p->chroma_kind[0],
+    /* Modes 3 and 4 use the split; where its bound for the frame fails, it
+     * is checked per sample (SPLIT_GUARD). */
+    uint32_t k1[13] = {exact ? (uint32_t)e->mode : PI_MMR_FLOAT, p->chroma_phase, p->dual, p->chroma_kind[0],
                       p->chroma_kind[1], p->mmr_params[0][0], p->mmr_params[1][0], (uint32_t)single, (uint32_t)piece,
-                      piece == 2 ? p->order2 : 0u, (uint32_t)fast, getenv("PI_MARK") != NULL};
+                      piece == 2 ? p->order2 : 0u, (uint32_t)fast, getenv("PI_MARK") != NULL, (uint32_t)!split};
     if (single || piece)   /* none of the FEL selectors matter */
         memset(k1, 0, 7 * sizeof(k1[0]));
-    if (fast) {   /* the split MMR's orders */
+    if (fast) {   /* the MMR's mode and orders */
+        k1[0] = mode;
         k1[5] = piece_order[0];
         k1[6] = piece_order[1];
     }
+    if (k1[0] != PI_MMR_HYBRID && k1[0] != PI_MMR_BOUNDED)
+        k1[12] = 0;
     uint32_t k2[6] = {p->chroma_filter != 0, p->top_left != 0, e->ablate, 0, (uint32_t)(single || piece), piece == 2},
              kb[6] = {0, 0, 0, 1, 0, 0};
-    VkPipeline p1 = variant(e, e->v1, &e->n1, 16, spv_p1, sizeof(spv_p1), e->rp[0], 2, k1, 12, 0);
+    VkPipeline p1 = variant(e, e->v1, &e->n1, 16, spv_p1, sizeof(spv_p1), e->rp[0], 2, k1, 13, 0);
+    if (k1[0] == PI_MMR_HYBRID || k1[0] == PI_MMR_BOUNDED) {
+        /* the split's other variant too, now: a frame needing it mid-stream
+         * then doesn't wait for a compile */
+        uint32_t other[13];
+        memcpy(other, k1, sizeof(other));
+        other[12] ^= 1u;
+        variant(e, e->v1, &e->n1, 16, spv_p1, sizeof(spv_p1), e->rp[0], 2, other, 13, 0);
+    }
     VkPipeline p2 = variant(e, e->v2, &e->n2, 8, spv_p3, sizeof(spv_p3), e->rp[1], 2, k2, 6, 1);
     VkPipeline pb = variant(e, e->v2, &e->n2, 8, spv_p3, sizeof(spv_p3), e->rp[1], 2, kb, 6, 1);
     if (!p1 || !p2 || !pb)

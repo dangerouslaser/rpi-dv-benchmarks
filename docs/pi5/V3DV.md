@@ -1,13 +1,19 @@
 # Raspberry Pi 5 GPU and the v3dv Vulkan driver: engineering reference
 
-What the hardware is, and how Mesa's v3dv maps Vulkan onto it. This is the basis
-for a Pi-native engine design. Compiled 2026-11-06 from three sources:
+What the hardware is, and how Mesa's v3dv maps Vulkan onto it. The engine's
+design (`../ENGINE.md`) rests on it. Compiled 2026-11-06 from three sources:
 
-- **Device**: the Pi 5 itself (`device/`: `v3dv-vulkaninfo.txt`, `v3d_ident.txt`, `system.txt`).
-- **Source**: Mesa 26.2.2 (`third_party/mesa`; the Pi runs 26.2.6), Mesa main
-  (`third_party/mesa-main`), and the v3d kernel driver (rpi-6.18.y and a 7.3 tree).
-  Paths below are relative to `src/broadcom/` unless marked `K/` (the kernel's
-  `drivers/gpu/drm/v3d/`).
+- **Device**: the Pi 5 itself, in `device/`:
+  - `v3dv-vulkaninfo.txt`: `vulkaninfo` for the V3D GPU alone
+  - `vulkaninfo.txt`: the full `vulkaninfo` (instance, layers, V3D and llvmpipe)
+  - `v3dv-profile.json`: the V3D device as a Vulkan profile
+  - `v3d_ident.txt`: the kernel's `v3d_ident` and the v3d debugfs listing
+  - `system.txt`: CPU, memory, kernel, firmware, clocks, config, DRM, V4L2,
+    DMA heaps, CMA, packages
+- **Source**: Mesa 26.2.2 (commit 3281a69a8b; the Pi runs 26.2.6), Mesa main
+  (09e600cd27), and the v3d kernel driver (rpi-6.18.y and a 7.3 tree). None of
+  these trees is kept in this repository. Paths below are relative to Mesa's
+  `src/broadcom/` unless marked `K/` (the kernel's `drivers/gpu/drm/v3d/`).
 - **Published material**: Igalia talks and blogs, Raspberry Pi documentation,
   and Mesa merge requests and commits. URLs are given inline.
 
@@ -45,8 +51,8 @@ What this means:
   Mesa main features (tile-buffer input attachments, the TFU SAND detile for GL).
 - **The kernel's job model (§2) is a design property, not a version limitation.**
   The cache clean after every compute job and one job at a time per queue are
-  the same in rpi 6.18 and mainline 7.3. The design should avoid them, not wait
-  for a fix.
+  the same in rpi 6.18 and mainline 7.3. The engine avoids them rather than
+  waiting for a fix.
 
 ## 1. The hardware
 
@@ -261,7 +267,6 @@ Each kind of access takes a different hardware path:
   [S] common/v3d_debug.c:43-108
 - **Kernel tracepoints** `v3d_submit_csd`, `v3d_csd_irq`, `v3d_cache_clean_begin/end`
   separate job overhead from shader time. [S] K/v3d_trace.h
-- On the Pi: `V3D_DEBUG=shaderdb dvbench ...` (threads, instructions, loops, spills per shader).
 
 ## 7. The video path today
 
@@ -274,35 +279,30 @@ Each kind of access takes a different hardware path:
     Igalia measured 4K 10-bit HEVC import plus a trivial render on Pi 5 at
     **~18 ms of GPU per frame, 57.7 fps, before any DV processing** (5.0 ms of it
     the detile). [P] mesa e2f05fca
-  - **Vulkan**: no SAND import. The only route is importing the dma-buf as a
-    `VkBuffer` and de-SANDing in the shader (what our engine does now), or a copy.
+  - **Vulkan**: no SAND import. The only routes are importing the dma-buf as a
+    buffer and de-SANDing in the shader (the engine reads it as an `R32UI`
+    texel buffer), or a copy.
 - **HDMI output:** to be confirmed on the device: whether `HDR_OUTPUT_METADATA`
   and Colorspace are exposed, and whether a plane takes 4K60 linear P010.
 
-## 8. What this means for an engine design
+## 8. Cheap and expensive on v3dv
 
-Cheap on v3dv:
-1. **Few jobs.** One render pass, or very few, per frame. Each dispatch costs a
-   full drain + IRQ + synchronous cache clean + cold cache (§2).
-2. **Fragment shaders writing render targets.** Output goes through the on-chip
-   TLB with no clean job. Keep all targets ≤ 16 B/px for 64×32 tiles, ≤ 4 B/px
-   for 64×64. Integer targets are bit-exact.
-3. **One fused pass** (de-SAND, BL+EL, reshape, display-management maths).
-   Every intermediate costs a full-frame store and reload out of ~11–17 GB/s, and
-   another job.
-4. **Reads**:
-   - UIF-tiled textures with `texelFetch` for 2D neighbourhoods
-   - `readonly` buffers or UBOs at uniform offsets for tables (`ldunifa`)
-   - 16-byte-aligned `uvec4` loads for linear buffers
-5. **Float maths, ≤ 32 live registers (4 threads), no spills.** Restructure
-   integer maths to avoid 32-bit `imul`, bitfield builtins and divides. Use
-   float or 24-bit-safe forms, and tables in textures.
-6. **Let the HVS do what it can**: YCbCr→RGB, scaling and SAND scanout. If
-   possible, output P010 or 10-bit RGB to a KMS plane rather than doing a final
-   colour conversion on the GPU.
+The engine's own rules, measured on the Pi, are in `../ENGINE.md` ("What V3D
+taught us"). From the facts above:
 
-Expensive on v3dv:
-- dispatch chains with intermediates (our engine today)
+Cheap:
+- **Few jobs.** One render pass, or very few, per frame. Each dispatch costs a
+  full drain + IRQ + synchronous cache clean + cold cache (§2).
+- **Fragment shaders writing render targets.** Output goes through the on-chip
+  TLB with no clean job. Keep all targets ≤ 16 B/px for 64×32 tiles, ≤ 4 B/px
+  for 64×64. Integer targets are bit-exact.
+- **Few intermediates.** Every one costs a full-frame store and reload out of
+  ~11–17 GB/s, and another job.
+- **Tables** in `readonly` buffers or UBOs at uniform offsets (`ldunifa`).
+- **Float maths, ≤ 32 live registers (4 threads), no spills.**
+
+Expensive:
+- dispatch chains with intermediates
 - shared memory, barriers
 - SSBO and image stores (clean job, write-combiner)
 - 32-bit integer multiplies, bitfield builtins, any 64-bit maths
@@ -310,33 +310,14 @@ Expensive on v3dv:
 - sampling linear images
 - VkEvents, timestamps inside passes, CPU readback
 
-How our engine's measurements fit [I]:
-- **515 ms per picture** on the first FEL clip.
-- **Many dispatches per frame**, each paying drain + clean + cold cache.
-- **Linear SSBO inputs and outputs** everywhere.
-- **Integer-heavy bit-exact maths**: 2-instruction `imul`, emulated 64-bit,
-  bitfield builtins.
-- **Shaders at 2 threads.**
+yblod's desktop-style compute engine hit most of the expensive list, at 515 ms
+per picture on the first FEL clip (`../HISTORY.md`).
 
-Each of these is individually on the expensive list.
+## 9. Still open
 
-## 9. Open questions to measure on the Pi
-
-1. Fixed cost of an empty dispatch versus an empty render pass (wall clock over
-   N; tracepoints for clean versus IRQ versus scheduling).
-2. Read bandwidth: linear SSBO versus texel buffer versus UIF texture. Write
-   bandwidth: SSBO versus storage image versus TLB, raster versus UIF (AXI byte
-   counters).
-3. ALU throughput: float, `imul`, int, fp16, `uvec4`. Does 4 threads beat 2 for
-   our access patterns?
-4. P030 SAND: shader-side de-SAND in Vulkan versus GL import + detile.
-5. TFU: present or not; is a linear→UIF `vkCmdCopyImage` fast?
-6. `V3D_DEBUG=db` effect on a full-screen pass.
-7. HDMI: HDR metadata and Colorspace properties; can a plane take 4K60 P010 or
-   10-bit RGB?
-8. Does kernel 6.18 match the cited submit/scheduler behaviour (clean after
-   every CSD, `credit_limit = 1`)?
-
-`bench/vk-micro.c` (built, not yet run on the Pi) already answers part of 2 and 3:
-compute versus fragment, buffers versus textures, float versus integer, for the
-same maths.
+1. **TFU:** present or not (§1); is a linear→UIF `vkCmdCopyImage` fast?
+2. **HDMI:** are `HDR_OUTPUT_METADATA` and Colorspace exposed; can a plane
+   take 4K60 linear P010 or 10-bit RGB (§7)?
+3. **Kernel 6.18:** does it match the cited submit and scheduler behaviour
+   (a clean after every CSD job, `credit_limit = 1`)? The engine uses no
+   compute, so this matters only for other work.
