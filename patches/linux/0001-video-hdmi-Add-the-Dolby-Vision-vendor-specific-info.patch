@@ -1,0 +1,308 @@
+From 0bd15a369deab80915c65bbff2cba4293c540472 Mon Sep 17 00:00:00 2001
+From: Bryan Hoban <bryan.hoban@gmail.com>
+Date: Sat, 7 Nov 2026 15:28:45 +0000
+Subject: [PATCH 1/5] video/hdmi: Add the Dolby Vision vendor-specific
+ infoframes
+
+A source signals standard (TV-led) Dolby Vision, whose frames carry the
+Dolby Vision signal tunnelled in 8-bit RGB, with one of two
+vendor-specific infoframes:
+
+- The HDMI one (OUI 00-0C-03) padded with zeros to 24 bytes, which a
+  Dolby Vision sink takes as the Dolby Vision signal. It keeps its
+  HDMI_VIC, so the HDMI 1.4b 4k modes stay signalled.
+- Dolby's own (OUI 00-D0-46), 27 bytes, with Dolby_Vision_Signal (PB4
+  bit 1) set. PB4 bit 0 is Low_Latency.
+
+Add a dolby_vision flag to struct hdmi_vendor_infoframe for the first,
+and struct hdmi_dolby_vision_infoframe, a member of union
+hdmi_vendor_any_infoframe, for the second, with their checking, packing
+and logging. Unpacking takes the padded HDMI one. The Dolby one's
+metadata fields (backlight control, auxiliary metadata) are not
+represented, so it is packed with them zero and not unpacked.
+
+The layouts are those Amlogic's HDMI transmitter driver sends
+(hdmitx_set_vsif_pkt()): the HDMI one to sinks with a version 0 or 1
+Dolby Vision VSVDB, the Dolby one to version 2 sinks.
+---
+ drivers/video/hdmi.c | 124 ++++++++++++++++++++++++++++++++++++++-----
+ include/linux/hdmi.h |  37 +++++++++++++
+ 2 files changed, 148 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/video/hdmi.c b/drivers/video/hdmi.c
+index 45b42f14a..eb6fbf175 100644
+--- a/drivers/video/hdmi.c
++++ b/drivers/video/hdmi.c
+@@ -551,8 +551,10 @@ EXPORT_SYMBOL(hdmi_vendor_infoframe_init);
+ 
+ static int hdmi_vendor_infoframe_length(const struct hdmi_vendor_infoframe *frame)
+ {
++	if (frame->dolby_vision)
++		return HDMI_VENDOR_INFOFRAME_DOLBY_VISION_SIZE;
+ 	/* for side by side (half) we also need to provide 3D_Ext_Data */
+-	if (frame->s3d_struct >= HDMI_3D_STRUCTURE_SIDE_BY_SIDE_HALF)
++	else if (frame->s3d_struct >= HDMI_3D_STRUCTURE_SIDE_BY_SIDE_HALF)
+ 		return 6;
+ 	else if (frame->vic != 0 || frame->s3d_struct != HDMI_3D_STRUCTURE_INVALID)
+ 		return 5;
+@@ -571,6 +573,9 @@ static int hdmi_vendor_infoframe_check_only(const struct hdmi_vendor_infoframe *
+ 	if (frame->vic != 0 && frame->s3d_struct != HDMI_3D_STRUCTURE_INVALID)
+ 		return -EINVAL;
+ 
++	if (frame->dolby_vision && frame->s3d_struct != HDMI_3D_STRUCTURE_INVALID)
++		return -EINVAL;
++
+ 	if (frame->length != hdmi_vendor_infoframe_length(frame))
+ 		return -EINVAL;
+ 
+@@ -684,6 +689,77 @@ ssize_t hdmi_vendor_infoframe_pack(struct hdmi_vendor_infoframe *frame,
+ }
+ EXPORT_SYMBOL(hdmi_vendor_infoframe_pack);
+ 
++/**
++ * hdmi_dolby_vision_infoframe_init() - initialize a Dolby Vision vendor
++ *                                      infoframe
++ * @frame: Dolby Vision vendor infoframe
++ *
++ * Return: 0 on success or a negative error code on failure.
++ */
++int hdmi_dolby_vision_infoframe_init(struct hdmi_dolby_vision_infoframe *frame)
++{
++	memset(frame, 0, sizeof(*frame));
++
++	frame->type = HDMI_INFOFRAME_TYPE_VENDOR;
++	frame->version = 1;
++	frame->length = HDMI_DOLBY_VISION_INFOFRAME_SIZE;
++	frame->oui = DOLBY_IEEE_OUI;
++
++	return 0;
++}
++EXPORT_SYMBOL(hdmi_dolby_vision_infoframe_init);
++
++static int
++hdmi_dolby_vision_infoframe_check_only(const struct hdmi_dolby_vision_infoframe *frame)
++{
++	if (frame->type != HDMI_INFOFRAME_TYPE_VENDOR ||
++	    frame->version != 1 ||
++	    frame->oui != DOLBY_IEEE_OUI ||
++	    frame->length != HDMI_DOLBY_VISION_INFOFRAME_SIZE)
++		return -EINVAL;
++
++	return 0;
++}
++
++static ssize_t
++hdmi_dolby_vision_infoframe_pack_only(const struct hdmi_dolby_vision_infoframe *frame,
++				      void *buffer, size_t size)
++{
++	u8 *ptr = buffer;
++	size_t length;
++	int ret;
++
++	ret = hdmi_dolby_vision_infoframe_check_only(frame);
++	if (ret)
++		return ret;
++
++	length = HDMI_INFOFRAME_HEADER_SIZE + frame->length;
++
++	if (size < length)
++		return -ENOSPC;
++
++	memset(buffer, 0, size);
++
++	ptr[0] = frame->type;
++	ptr[1] = frame->version;
++	ptr[2] = frame->length;
++	ptr[3] = 0; /* checksum */
++
++	/* Dolby OUI */
++	ptr[4] = 0x46;
++	ptr[5] = 0xd0;
++	ptr[6] = 0x00;
++
++	if (frame->low_latency)
++		ptr[7] |= BIT(0);
++	if (frame->dolby_vision_signal)
++		ptr[7] |= BIT(1);
++
++	hdmi_infoframe_set_checksum(buffer, length);
++
++	return length;
++}
++
+ static int
+ hdmi_vendor_any_infoframe_check_only(const union hdmi_vendor_any_infoframe *frame)
+ {
+@@ -850,11 +926,15 @@ hdmi_vendor_any_infoframe_check(union hdmi_vendor_any_infoframe *frame)
+ 	if (ret)
+ 		return ret;
+ 
+-	/* we only know about HDMI vendor infoframes */
+-	if (frame->any.oui != HDMI_IEEE_OUI)
++	/* we only know about HDMI and Dolby Vision vendor infoframes */
++	switch (frame->any.oui) {
++	case HDMI_IEEE_OUI:
++		return hdmi_vendor_infoframe_check(&frame->hdmi);
++	case DOLBY_IEEE_OUI:
++		return hdmi_dolby_vision_infoframe_check_only(&frame->dolby);
++	default:
+ 		return -EINVAL;
+-
+-	return hdmi_vendor_infoframe_check(&frame->hdmi);
++	}
+ }
+ 
+ /*
+@@ -870,11 +950,16 @@ hdmi_vendor_any_infoframe_pack_only(const union hdmi_vendor_any_infoframe *frame
+ 	if (ret)
+ 		return ret;
+ 
+-	/* we only know about HDMI vendor infoframes */
+-	if (frame->any.oui != HDMI_IEEE_OUI)
++	/* we only know about HDMI and Dolby Vision vendor infoframes */
++	switch (frame->any.oui) {
++	case HDMI_IEEE_OUI:
++		return hdmi_vendor_infoframe_pack_only(&frame->hdmi, buffer, size);
++	case DOLBY_IEEE_OUI:
++		return hdmi_dolby_vision_infoframe_pack_only(&frame->dolby,
++							     buffer, size);
++	default:
+ 		return -EINVAL;
+-
+-	return hdmi_vendor_infoframe_pack_only(&frame->hdmi, buffer, size);
++	}
+ }
+ 
+ /*
+@@ -1496,12 +1581,23 @@ hdmi_vendor_any_infoframe_log(const char *level,
+ 	hdmi_infoframe_log_header(level, dev,
+ 				  (const struct hdmi_any_infoframe *)frame);
+ 
++	if (frame->any.oui == DOLBY_IEEE_OUI) {
++		hdmi_log("    Dolby Vision vendor infoframe\n");
++		hdmi_log("    low latency: %s\n",
++			 frame->dolby.low_latency ? "Yes" : "No");
++		hdmi_log("    Dolby Vision signal: %s\n",
++			 frame->dolby.dolby_vision_signal ? "Yes" : "No");
++		return;
++	}
+ 	if (frame->any.oui != HDMI_IEEE_OUI) {
+ 		hdmi_log("    not a HDMI vendor infoframe\n");
+ 		return;
+ 	}
++	if (hvf->dolby_vision)
++		hdmi_log("    Dolby Vision\n");
+ 	if (hvf->vic == 0 && hvf->s3d_struct == HDMI_3D_STRUCTURE_INVALID) {
+-		hdmi_log("    empty frame\n");
++		if (!hvf->dolby_vision)
++			hdmi_log("    empty frame\n");
+ 		return;
+ 	}
+ 
+@@ -1730,7 +1826,8 @@ hdmi_vendor_any_infoframe_unpack(union hdmi_vendor_any_infoframe *frame,
+ 
+ 	if (ptr[0] != HDMI_INFOFRAME_TYPE_VENDOR ||
+ 	    ptr[1] != 1 ||
+-	    (ptr[2] != 4 && ptr[2] != 5 && ptr[2] != 6))
++	    (ptr[2] != 4 && ptr[2] != 5 && ptr[2] != 6 &&
++	     ptr[2] != HDMI_VENDOR_INFOFRAME_DOLBY_VISION_SIZE))
+ 		return -EINVAL;
+ 
+ 	length = ptr[2];
+@@ -1760,6 +1857,7 @@ hdmi_vendor_any_infoframe_unpack(union hdmi_vendor_any_infoframe *frame,
+ 		return ret;
+ 
+ 	hvf->length = length;
++	hvf->dolby_vision = length == HDMI_VENDOR_INFOFRAME_DOLBY_VISION_SIZE;
+ 
+ 	if (hdmi_video_format == 0x2) {
+ 		if (length != 5 && length != 6)
+@@ -1771,11 +1869,11 @@ hdmi_vendor_any_infoframe_unpack(union hdmi_vendor_any_infoframe *frame,
+ 			hvf->s3d_ext_data = ptr[5] >> 4;
+ 		}
+ 	} else if (hdmi_video_format == 0x1) {
+-		if (length != 5)
++		if (length != 5 && !hvf->dolby_vision)
+ 			return -EINVAL;
+ 		hvf->vic = ptr[4];
+ 	} else {
+-		if (length != 4)
++		if (length != 4 && !hvf->dolby_vision)
+ 			return -EINVAL;
+ 	}
+ 
+diff --git a/include/linux/hdmi.h b/include/linux/hdmi.h
+index 96bda41d9..c4c8be261 100644
+--- a/include/linux/hdmi.h
++++ b/include/linux/hdmi.h
+@@ -52,12 +52,16 @@ enum hdmi_infoframe_type {
+ 
+ #define HDMI_IEEE_OUI 0x000c03
+ #define HDMI_FORUM_IEEE_OUI 0xc45dd8
++#define DOLBY_IEEE_OUI 0x00d046
+ #define HDMI_INFOFRAME_HEADER_SIZE  4
+ #define HDMI_AVI_INFOFRAME_SIZE    13
+ #define HDMI_SPD_INFOFRAME_SIZE    25
+ #define HDMI_AUDIO_INFOFRAME_SIZE  10
+ #define HDMI_DRM_INFOFRAME_SIZE    26
+ #define HDMI_VENDOR_INFOFRAME_SIZE  4
++/* the length of an HDMI vendor infoframe signalling Dolby Vision */
++#define HDMI_VENDOR_INFOFRAME_DOLBY_VISION_SIZE 24
++#define HDMI_DOLBY_VISION_INFOFRAME_SIZE 27
+ 
+ /*
+  * HDMI 1.3a table 5-14 states that the largest InfoFrame_length is 27,
+@@ -373,6 +377,12 @@ struct hdmi_vendor_infoframe {
+ 	u8 vic;
+ 	enum hdmi_3d_structure s3d_struct;
+ 	unsigned int s3d_ext_data;
++	/*
++	 * Standard (TV-led) Dolby Vision: the payload is padded with zeros to
++	 * HDMI_VENDOR_INFOFRAME_DOLBY_VISION_SIZE bytes, which a Dolby Vision
++	 * sink takes as the Dolby Vision signal. Not with 3D.
++	 */
++	bool dolby_vision;
+ };
+ 
+ /* HDR Metadata as per 861.G spec */
+@@ -409,6 +419,32 @@ ssize_t hdmi_vendor_infoframe_pack_only(const struct hdmi_vendor_infoframe *fram
+ 					void *buffer, size_t size);
+ int hdmi_vendor_infoframe_check(struct hdmi_vendor_infoframe *frame);
+ 
++/**
++ * struct hdmi_dolby_vision_infoframe - Dolby Vision vendor-specific infoframe
++ * @type: HDMI_INFOFRAME_TYPE_VENDOR
++ * @version: 1
++ * @length: HDMI_DOLBY_VISION_INFOFRAME_SIZE
++ * @oui: DOLBY_IEEE_OUI
++ * @low_latency: PB4 bit 0, Low_Latency: the source has mapped the video to
++ *	the display (low-latency Dolby Vision)
++ * @dolby_vision_signal: PB4 bit 1, Dolby_Vision_Signal: the video is a Dolby
++ *	Vision signal
++ *
++ * The Dolby vendor-specific infoframe (OUI 00-D0-46). Its other fields
++ * (backlight control and auxiliary metadata) are not represented and are
++ * sent as zero.
++ */
++struct hdmi_dolby_vision_infoframe {
++	enum hdmi_infoframe_type type;
++	unsigned char version;
++	unsigned char length;
++	unsigned int oui;
++	bool low_latency;
++	bool dolby_vision_signal;
++};
++
++int hdmi_dolby_vision_infoframe_init(struct hdmi_dolby_vision_infoframe *frame);
++
+ union hdmi_vendor_any_infoframe {
+ 	struct {
+ 		enum hdmi_infoframe_type type;
+@@ -417,6 +453,7 @@ union hdmi_vendor_any_infoframe {
+ 		unsigned int oui;
+ 	} any;
+ 	struct hdmi_vendor_infoframe hdmi;
++	struct hdmi_dolby_vision_infoframe dolby;
+ };
+ 
+ /**

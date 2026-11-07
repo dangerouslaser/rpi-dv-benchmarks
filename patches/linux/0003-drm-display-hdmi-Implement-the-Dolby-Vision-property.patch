@@ -1,0 +1,207 @@
+From 30c717ef79066fbacf7863a8066e88ba93468701 Mon Sep 17 00:00:00 2001
+From: Bryan Hoban <bryan.hoban@gmail.com>
+Date: Sat, 7 Nov 2026 15:28:45 +0000
+Subject: [PATCH 3/5] drm/display: hdmi: Implement the "Dolby Vision" property
+
+Implement the HDMI connector's "Dolby Vision" property in the HDMI state
+helper:
+
+- When it isn't Off, the connector check rejects an output that would
+  change the frames' tunnelled signal: anything but RGB at 8 bpc in full
+  range, a Colorspace other than Default, HDR output metadata, interlaced
+  or 3D modes, and DVI sinks.
+- A change of the property is a mode change, like one of Broadcast RGB:
+  drivers write the infoframes when the connector is enabled.
+- "Standard (HDMI VSIF)" pads the HDMI vendor infoframe to 24 bytes. It
+  keeps its HDMI_VIC, so the HDMI 1.4b 4k modes stay signalled as
+  without Dolby Vision.
+- "Standard (Dolby VSIF)" sends the Dolby vendor infoframe in the vendor
+  slot instead. The HDMI_VIC goes with the HDMI one, so the AVI
+  infoframe carries those modes' VIC instead (93 for 3840x2160 at 24 Hz).
+
+A Dolby Vision sink takes the vendor infoframe whether or not its EDID
+sets HDMI_Video_present (has_hdmi_infoframe), so with Dolby Vision the
+vendor infoframe is generated regardless, and
+drm_atomic_helper_connector_hdmi_update_infoframes() no longer skips the
+vendor slot when has_hdmi_infoframe is false. Without Dolby Vision
+nothing changes: with has_hdmi_infoframe false, neither the old nor the
+new state has a vendor infoframe, so there is nothing to write or clear.
+---
+ .../gpu/drm/display/drm_hdmi_state_helper.c   | 123 ++++++++++++++++--
+ 1 file changed, 111 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/gpu/drm/display/drm_hdmi_state_helper.c b/drivers/gpu/drm/display/drm_hdmi_state_helper.c
+index 481f7ddab..13e832c93 100644
+--- a/drivers/gpu/drm/display/drm_hdmi_state_helper.c
++++ b/drivers/gpu/drm/display/drm_hdmi_state_helper.c
+@@ -323,6 +323,7 @@ void __drm_atomic_helper_connector_hdmi_reset(struct drm_connector *connector,
+ 	new_conn_state->max_bpc = max_bpc;
+ 	new_conn_state->max_requested_bpc = 8;
+ 	new_conn_state->hdmi.broadcast_rgb = DRM_HDMI_BROADCAST_RGB_AUTO;
++	new_conn_state->hdmi.dolby_vision = DRM_HDMI_DOLBY_VISION_OFF;
+ }
+ EXPORT_SYMBOL(__drm_atomic_helper_connector_hdmi_reset);
+ 
+@@ -685,6 +686,63 @@ hdmi_compute_config(const struct drm_connector *connector,
+ 	return ret;
+ }
+ 
++/*
++ * Standard Dolby Vision tunnels its signal in 8-bit RGB: the output must
++ * carry the frames unchanged.
++ */
++static int
++hdmi_dolby_vision_check(const struct drm_connector *connector,
++			const struct drm_connector_state *conn_state,
++			const struct drm_display_mode *mode)
++{
++	const struct drm_display_info *info = &connector->display_info;
++	struct drm_device *dev = connector->dev;
++
++	if (conn_state->hdmi.dolby_vision == DRM_HDMI_DOLBY_VISION_OFF)
++		return 0;
++
++	if (!info->is_hdmi) {
++		drm_dbg_kms(dev, "Dolby Vision needs an HDMI sink.\n");
++		return -EINVAL;
++	}
++
++	if (conn_state->hdmi.output_format != HDMI_COLORSPACE_RGB) {
++		enum hdmi_colorspace format = conn_state->hdmi.output_format;
++
++		drm_dbg_kms(dev, "Dolby Vision needs RGB output, not %s.\n",
++			    drm_hdmi_connector_get_output_format_name(format));
++		return -EINVAL;
++	}
++
++	if (conn_state->hdmi.output_bpc != 8) {
++		drm_dbg_kms(dev, "Dolby Vision needs 8 bpc, not %u.\n",
++			    conn_state->hdmi.output_bpc);
++		return -EINVAL;
++	}
++
++	if (conn_state->hdmi.is_limited_range) {
++		drm_dbg_kms(dev, "Dolby Vision needs full range RGB.\n");
++		return -EINVAL;
++	}
++
++	if (conn_state->colorspace != DRM_MODE_COLORIMETRY_DEFAULT) {
++		drm_dbg_kms(dev, "Dolby Vision needs the default colorspace.\n");
++		return -EINVAL;
++	}
++
++	if (conn_state->hdr_output_metadata) {
++		drm_dbg_kms(dev, "Dolby Vision excludes HDR output metadata.\n");
++		return -EINVAL;
++	}
++
++	if (mode->flags & (DRM_MODE_FLAG_INTERLACE | DRM_MODE_FLAG_3D_MASK)) {
++		drm_dbg_kms(dev, "Dolby Vision needs a progressive 2D mode.\n");
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
+ static int hdmi_generate_avi_infoframe(const struct drm_connector *connector,
+ 				       struct drm_connector_state *conn_state)
+ {
+@@ -705,6 +763,20 @@ static int hdmi_generate_avi_infoframe(const struct drm_connector *connector,
+ 	if (ret)
+ 		return ret;
+ 
++	/*
++	 * The Dolby vendor infoframe replaces the HDMI one, so the AVI
++	 * infoframe carries the VIC of the modes the HDMI one would have
++	 * signalled with an HDMI_VIC.
++	 */
++	if (conn_state->hdmi.dolby_vision == DRM_HDMI_DOLBY_VISION_STANDARD_DOLBY_VSIF &&
++	    !frame->video_code) {
++		struct hdmi_vendor_infoframe hdmi;
++
++		if (!drm_hdmi_vendor_infoframe_from_display_mode(&hdmi, connector, mode) &&
++		    hdmi.vic)
++			frame->video_code = drm_match_cea_mode(mode);
++	}
++
+ 	frame->colorspace = conn_state->hdmi.output_format;
+ 
+ 	/*
+@@ -785,12 +857,36 @@ static int hdmi_generate_hdmi_vendor_infoframe(const struct drm_connector *conne
+ 
+ 	infoframe->set = false;
+ 
+-	if (!info->has_hdmi_infoframe)
+-		return 0;
++	/*
++	 * A Dolby Vision sink takes the Dolby Vision vendor infoframes whether
++	 * it advertises HDMI 1.4 video formats (has_hdmi_infoframe) or not.
++	 */
++	if (conn_state->hdmi.dolby_vision == DRM_HDMI_DOLBY_VISION_STANDARD_DOLBY_VSIF) {
++		struct hdmi_dolby_vision_infoframe *dolby =
++			&infoframe->data.vendor.dolby;
+ 
+-	ret = drm_hdmi_vendor_infoframe_from_display_mode(frame, connector, mode);
+-	if (ret)
+-		return ret;
++		ret = hdmi_dolby_vision_infoframe_init(dolby);
++		if (ret)
++			return ret;
++
++		dolby->dolby_vision_signal = true;
++	} else if (info->has_hdmi_infoframe) {
++		ret = drm_hdmi_vendor_infoframe_from_display_mode(frame, connector, mode);
++		if (ret)
++			return ret;
++
++		frame->dolby_vision = conn_state->hdmi.dolby_vision ==
++			DRM_HDMI_DOLBY_VISION_STANDARD_HDMI_VSIF;
++	} else if (conn_state->hdmi.dolby_vision == DRM_HDMI_DOLBY_VISION_STANDARD_HDMI_VSIF) {
++		/* no HDMI_VIC: the AVI infoframe carries the VIC */
++		ret = hdmi_vendor_infoframe_init(frame);
++		if (ret)
++			return ret;
++
++		frame->dolby_vision = true;
++	} else {
++		return 0;
++	}
+ 
+ 	infoframe->set = true;
+ 
+@@ -863,11 +959,16 @@ int drm_atomic_helper_connector_hdmi_check(struct drm_connector *connector,
+ 
+ 	new_conn_state->hdmi.is_limited_range = hdmi_is_limited_range(connector, new_conn_state);
+ 
++	ret = hdmi_dolby_vision_check(connector, new_conn_state, mode);
++	if (ret)
++		return ret;
++
+ 	ret = hdmi_generate_infoframes(connector, new_conn_state);
+ 	if (ret)
+ 		return ret;
+ 
+ 	if (old_conn_state->hdmi.broadcast_rgb != new_conn_state->hdmi.broadcast_rgb ||
++	    old_conn_state->hdmi.dolby_vision != new_conn_state->hdmi.dolby_vision ||
+ 	    old_conn_state->hdmi.output_bpc != new_conn_state->hdmi.output_bpc ||
+ 	    old_conn_state->hdmi.output_format != new_conn_state->hdmi.output_format) {
+ 		struct drm_crtc *crtc = new_conn_state->crtc;
+@@ -1046,13 +1147,11 @@ int drm_atomic_helper_connector_hdmi_update_infoframes(struct drm_connector *con
+ 	if (ret)
+ 		goto out;
+ 
+-	if (info->has_hdmi_infoframe) {
+-		ret = write_or_clear_infoframe(connector,
+-					       &old_conn_state->hdmi.infoframes.hdmi,
+-					       &new_conn_state->hdmi.infoframes.hdmi);
+-		if (ret)
+-			goto out;
+-	}
++	ret = write_or_clear_infoframe(connector,
++				       &old_conn_state->hdmi.infoframes.hdmi,
++				       &new_conn_state->hdmi.infoframes.hdmi);
++	if (ret)
++		goto out;
+ 
+ out:
+ 	mutex_unlock(&connector->hdmi.infoframes.lock);

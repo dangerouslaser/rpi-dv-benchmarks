@@ -1,0 +1,32 @@
+From 110c22bed2ec4afc57bdfe249bd7b8e0233b02db Mon Sep 17 00:00:00 2001
+From: Bryan Hoban <bryan.hoban@gmail.com>
+Date: Sat, 7 Nov 2026 15:28:45 +0000
+Subject: [PATCH 5/5] drm/vc4: hdmi: Attach the "Dolby Vision" property
+
+vc4 checks the HDMI connector state with the HDMI state helper and
+writes the infoframes with it when the encoder is enabled, so it only
+needs to attach the property. The Dolby vendor infoframe, 31 bytes with
+its header, fits a packet RAM slot (VC4_HDMI_PACKET_SIZE).
+
+Tested on a Raspberry Pi 5 with an LG B4 (webOS 9.1) at 3840x2160 24 Hz:
+the TV reports Dolby Vision with either value, shows the tunnelled frames
+correctly, and returns to SDR with Off.
+---
+ drivers/gpu/drm/vc4/vc4_hdmi.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/drivers/gpu/drm/vc4/vc4_hdmi.c b/drivers/gpu/drm/vc4/vc4_hdmi.c
+index e858a5b87..559825397 100644
+--- a/drivers/gpu/drm/vc4/vc4_hdmi.c
++++ b/drivers/gpu/drm/vc4/vc4_hdmi.c
+@@ -599,6 +599,10 @@ static int vc4_hdmi_connector_init(struct drm_device *dev,
+ 	if (ret)
+ 		return ret;
+ 
++	ret = drm_connector_attach_dolby_vision_property(connector);
++	if (ret)
++		return ret;
++
+ 	drm_connector_attach_encoder(connector, encoder);
+ 
+ 	return 0;

@@ -1,0 +1,256 @@
+From ba5b2950c036cb539216f79a9758e02da0a62dd6 Mon Sep 17 00:00:00 2001
+From: Bryan Hoban <bryan.hoban@gmail.com>
+Date: Sat, 7 Nov 2026 15:28:45 +0000
+Subject: [PATCH 2/5] drm/connector: Add the HDMI "Dolby Vision" property
+
+In standard (TV-led) Dolby Vision the frames carry the Dolby Vision
+signal, the video and its metadata, tunnelled in 8-bit RGB, and the sink
+does the display mapping. User-space can make those frames, but has no
+way to send the infoframe that tells the sink to decode them: without
+it the sink shows them as SDR RGB.
+
+Add an enum connector property, "Dolby Vision", in the connector's HDMI
+state: "Off", or standard Dolby Vision signalled with the HDMI
+vendor-specific infoframe padded to 24 bytes ("Standard (HDMI VSIF)"),
+or with the Dolby one ("Standard (Dolby VSIF)"). Sinks with a version 2
+Dolby Vision VSVDB are commonly sent the Dolby one, others the HDMI one;
+the EDID block is left to user-space.
+
+Low-latency (source-led) Dolby Vision is left out: there the source does
+the display mapping, which needs more than infoframes.
+
+The HDMI state helper implements the property in the next patch.
+---
+ drivers/gpu/drm/drm_atomic.c      |  2 +
+ drivers/gpu/drm/drm_atomic_uapi.c |  4 ++
+ drivers/gpu/drm/drm_connector.c   | 96 +++++++++++++++++++++++++++++++
+ include/drm/drm_connector.h       | 39 +++++++++++++
+ 4 files changed, 141 insertions(+)
+
+diff --git a/drivers/gpu/drm/drm_atomic.c b/drivers/gpu/drm/drm_atomic.c
+index cef19351a..77fdb1236 100644
+--- a/drivers/gpu/drm/drm_atomic.c
++++ b/drivers/gpu/drm/drm_atomic.c
+@@ -1201,6 +1201,8 @@ static void drm_atomic_connector_print_state(struct drm_printer *p,
+ 	    connector->connector_type == DRM_MODE_CONNECTOR_HDMIB) {
+ 		drm_printf(p, "\tbroadcast_rgb=%s\n",
+ 			   drm_hdmi_connector_get_broadcast_rgb_name(state->hdmi.broadcast_rgb));
++		drm_printf(p, "\tdolby_vision=%s\n",
++			   drm_hdmi_connector_get_dolby_vision_name(state->hdmi.dolby_vision));
+ 		drm_printf(p, "\tis_limited_range=%c\n", state->hdmi.is_limited_range ? 'y' : 'n');
+ 		drm_printf(p, "\toutput_bpc=%u\n", state->hdmi.output_bpc);
+ 		drm_printf(p, "\toutput_format=%s\n",
+diff --git a/drivers/gpu/drm/drm_atomic_uapi.c b/drivers/gpu/drm/drm_atomic_uapi.c
+index 746c24fd3..554b398ef 100644
+--- a/drivers/gpu/drm/drm_atomic_uapi.c
++++ b/drivers/gpu/drm/drm_atomic_uapi.c
+@@ -797,6 +797,8 @@ static int drm_atomic_connector_set_property(struct drm_connector *connector,
+ 		state->privacy_screen_sw_state = val;
+ 	} else if (property == connector->broadcast_rgb_property) {
+ 		state->hdmi.broadcast_rgb = val;
++	} else if (property == connector->dolby_vision_property) {
++		state->hdmi.dolby_vision = val;
+ 	} else if (property == connector->rotation_property) {
+ 		if (!is_power_of_2(val & DRM_MODE_ROTATE_MASK)) {
+ 			drm_dbg_atomic(connector->dev,
+@@ -896,6 +898,8 @@ drm_atomic_connector_get_property(struct drm_connector *connector,
+ 		*val = state->privacy_screen_sw_state;
+ 	} else if (property == connector->broadcast_rgb_property) {
+ 		*val = state->hdmi.broadcast_rgb;
++	} else if (property == connector->dolby_vision_property) {
++		*val = state->hdmi.dolby_vision;
+ 	} else if (property == connector->rotation_property) {
+ 		*val = state->rotation;
+ 	} else if (connector->funcs->atomic_get_property) {
+diff --git a/drivers/gpu/drm/drm_connector.c b/drivers/gpu/drm/drm_connector.c
+index 79eeaf66d..6105bdea8 100644
+--- a/drivers/gpu/drm/drm_connector.c
++++ b/drivers/gpu/drm/drm_connector.c
+@@ -1473,6 +1473,29 @@ drm_hdmi_connector_get_broadcast_rgb_name(enum drm_hdmi_broadcast_rgb broadcast_
+ }
+ EXPORT_SYMBOL(drm_hdmi_connector_get_broadcast_rgb_name);
+ 
++static const struct drm_prop_enum_list dolby_vision_names[] = {
++	{ DRM_HDMI_DOLBY_VISION_OFF, "Off" },
++	{ DRM_HDMI_DOLBY_VISION_STANDARD_HDMI_VSIF, "Standard (HDMI VSIF)" },
++	{ DRM_HDMI_DOLBY_VISION_STANDARD_DOLBY_VSIF, "Standard (Dolby VSIF)" },
++};
++
++/*
++ * drm_hdmi_connector_get_dolby_vision_name - Return the name of a Dolby Vision signalling
++ * @dolby_vision: Dolby Vision signalling to compute the name of
++ *
++ * Returns: the name of the Dolby Vision signalling, or NULL if the value is
++ * not valid.
++ */
++const char *
++drm_hdmi_connector_get_dolby_vision_name(enum drm_hdmi_dolby_vision dolby_vision)
++{
++	if (dolby_vision >= ARRAY_SIZE(dolby_vision_names))
++		return NULL;
++
++	return dolby_vision_names[dolby_vision].name;
++}
++EXPORT_SYMBOL(drm_hdmi_connector_get_dolby_vision_name);
++
+ static const char * const output_format_str[] = {
+ 	[HDMI_COLORSPACE_RGB]		= "RGB",
+ 	[HDMI_COLORSPACE_YUV420]	= "YUV 4:2:0",
+@@ -2005,6 +2028,43 @@ EXPORT_SYMBOL(drm_connector_attach_dp_subconnector_property);
+  *      Drivers can set up this property by calling
+  *      drm_connector_attach_broadcast_rgb_property().
+  *
++ * Dolby Vision (HDMI specific)
++ *      Signals standard (TV-led) Dolby Vision to the sink. Its frames carry
++ *      the Dolby Vision signal, the video and its metadata, tunnelled in
++ *      8-bit RGB, and the sink does the display mapping. User-space makes
++ *      those frames; the kernel sends the signalling, a vendor-specific
++ *      infoframe.
++ *
++ *      The value of this property can be one of the following:
++ *
++ *      Off:
++ *              No Dolby Vision signalling. This is the default.
++ *
++ *      Standard (HDMI VSIF):
++ *              The HDMI vendor-specific infoframe (OUI 00-0C-03) is padded
++ *              with zeros to 24 bytes, which a Dolby Vision sink takes as
++ *              the Dolby Vision signal.
++ *
++ *      Standard (Dolby VSIF):
++ *              The Dolby vendor-specific infoframe (OUI 00-D0-46), with
++ *              Dolby_Vision_Signal set, is sent instead of the HDMI one. The
++ *              AVI infoframe then carries the VIC of the modes the HDMI one
++ *              would signal with an HDMI_VIC (the HDMI 1.4b 4k modes).
++ *
++ *      Sinks with a version 2 Dolby Vision Vendor-Specific Video Data Block
++ *      in their EDID are commonly sent the Dolby infoframe, others the HDMI
++ *      one. The kernel doesn't parse that block: user-space chooses.
++ *
++ *      Any value but Off needs an output that carries the frames unchanged.
++ *      A commit is rejected unless the output is RGB at 8 bpc (``max bpc``
++ *      may have to be 8) and full range (``Broadcast RGB`` set to Full for
++ *      CTA-861 modes), ``Colorspace`` is Default, no ``HDR_OUTPUT_METADATA``
++ *      is set, the mode is progressive and not 3D, and the sink is an HDMI
++ *      (not DVI) sink. Changing the value needs a modeset.
++ *
++ *      Drivers can set up this property by calling
++ *      drm_connector_attach_dolby_vision_property().
++ *
+  * content type (HDMI specific):
+  *	Indicates content type setting to be used in HDMI infoframes to indicate
+  *	content type for the external device, so that it adjusts its display
+@@ -2953,6 +3013,42 @@ int drm_connector_attach_broadcast_rgb_property(struct drm_connector *connector)
+ }
+ EXPORT_SYMBOL(drm_connector_attach_broadcast_rgb_property);
+ 
++/**
++ * drm_connector_attach_dolby_vision_property - attach "Dolby Vision" property
++ * @connector: connector to attach the property on.
++ *
++ * This is used to add support for signalling standard (TV-led) Dolby Vision
++ * on an HDMI connector. Drivers using it must check the connector state with
++ * drm_atomic_helper_connector_hdmi_check() and write the infoframes with
++ * drm_atomic_helper_connector_hdmi_update_infoframes().
++ *
++ * Returns:
++ * Zero on success, negative errno on failure.
++ */
++int drm_connector_attach_dolby_vision_property(struct drm_connector *connector)
++{
++	struct drm_device *dev = connector->dev;
++	struct drm_property *prop;
++
++	prop = connector->dolby_vision_property;
++	if (!prop) {
++		prop = drm_property_create_enum(dev, DRM_MODE_PROP_ENUM,
++						"Dolby Vision",
++						dolby_vision_names,
++						ARRAY_SIZE(dolby_vision_names));
++		if (!prop)
++			return -EINVAL;
++
++		connector->dolby_vision_property = prop;
++	}
++
++	drm_object_attach_property(&connector->base, prop,
++				   DRM_HDMI_DOLBY_VISION_OFF);
++
++	return 0;
++}
++EXPORT_SYMBOL(drm_connector_attach_dolby_vision_property);
++
+ /**
+  * drm_connector_attach_colorspace_property - attach "Colorspace" property
+  * @connector: connector to attach the property on.
+diff --git a/include/drm/drm_connector.h b/include/drm/drm_connector.h
+index 1ea4cf8b6..7ad5e35e0 100644
+--- a/include/drm/drm_connector.h
++++ b/include/drm/drm_connector.h
+@@ -405,6 +405,32 @@ drm_hdmi_connector_get_broadcast_rgb_name(enum drm_hdmi_broadcast_rgb broadcast_
+ const char *
+ drm_hdmi_connector_get_output_format_name(enum hdmi_colorspace fmt);
+ 
++/**
++ * enum drm_hdmi_dolby_vision - Dolby Vision signalling for an HDMI @drm_connector
++ */
++enum drm_hdmi_dolby_vision {
++	/**
++	 * @DRM_HDMI_DOLBY_VISION_OFF: No Dolby Vision signalling.
++	 */
++	DRM_HDMI_DOLBY_VISION_OFF,
++
++	/**
++	 * @DRM_HDMI_DOLBY_VISION_STANDARD_HDMI_VSIF: Standard (TV-led)
++	 * Dolby Vision, signalled with the HDMI vendor-specific infoframe
++	 * padded to 24 bytes.
++	 */
++	DRM_HDMI_DOLBY_VISION_STANDARD_HDMI_VSIF,
++
++	/**
++	 * @DRM_HDMI_DOLBY_VISION_STANDARD_DOLBY_VSIF: Standard (TV-led)
++	 * Dolby Vision, signalled with the Dolby vendor-specific infoframe.
++	 */
++	DRM_HDMI_DOLBY_VISION_STANDARD_DOLBY_VSIF,
++};
++
++const char *
++drm_hdmi_connector_get_dolby_vision_name(enum drm_hdmi_dolby_vision dolby_vision);
++
+ /**
+  * struct drm_monitor_range_info - Panel's Monitor range in EDID for
+  * &drm_display_info
+@@ -948,6 +974,12 @@ struct drm_connector_hdmi_state {
+ 	 */
+ 	enum drm_hdmi_broadcast_rgb broadcast_rgb;
+ 
++	/**
++	 * @dolby_vision: Connector property to pass the Dolby Vision
++	 * signalling value.
++	 */
++	enum drm_hdmi_dolby_vision dolby_vision;
++
+ 	/**
+ 	 * @infoframes: HDMI Infoframes matching that state
+ 	 */
+@@ -2108,6 +2140,12 @@ struct drm_connector {
+ 	 */
+ 	struct drm_property *broadcast_rgb_property;
+ 
++	/**
++	 * @dolby_vision_property: Connector property to set the Dolby Vision
++	 * signalling to output with.
++	 */
++	struct drm_property *dolby_vision_property;
++
+ 	/**
+ 	 * @rotation_property: Optional DRM property controlling rotation of the
+ 	 * output.
+@@ -2460,6 +2498,7 @@ int drm_connector_attach_scaling_mode_property(struct drm_connector *connector,
+ int drm_connector_attach_vrr_capable_property(
+ 		struct drm_connector *connector);
+ int drm_connector_attach_broadcast_rgb_property(struct drm_connector *connector);
++int drm_connector_attach_dolby_vision_property(struct drm_connector *connector);
+ int drm_connector_attach_colorspace_property(struct drm_connector *connector);
+ int drm_connector_attach_hdr_output_metadata_property(struct drm_connector *connector);
+ bool drm_connector_atomic_hdr_metadata_equal(struct drm_connector_state *old_state,
