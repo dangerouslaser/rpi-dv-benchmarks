@@ -104,6 +104,26 @@ P2  w/2 × h/2   one fragment per 2×2 output block: 4:2:2 vertical filter,
   "or later" allows. Kodi's FFmpeg must carry `patches/ffmpeg` (the Dolby Vision RPU
   extensions the planner reads, `DV_FFMPEG_RAW_EXTENSIONS`).
 
+## Display output
+
+What the HDMI output must carry for a TV to show the tunnel frame as Dolby
+Vision (`dvbench --kms-play` sets all of it):
+- **The stream's size and frame rate** (3840×2160 at 23.976 Hz for a UHD
+  Blu-ray), no scaling.
+- **RGB, full range, 8 bits per channel:** the connector's `Broadcast RGB` =
+  Full and `max bpc` = 8. Limited range would rewrite the packed bits.
+- **The Dolby Vision vendor infoframe:** the HDMI 1.4 VSIF (OUI 00-0C-03)
+  with a 24-byte payload, zero but for the OUI. The Raspberry Pi kernel has no
+  way to send it; `patches/linux/` adds one to `vc4`. Without it the TV shows
+  the frame as SDR RGB.
+- **The output behind its sync_file** (`IN_FENCE_FD`), as above.
+
+On an LG B4 (webOS 9.1), the TV then reports `hdrType` DolbyVision for its
+HDMI input (`com.webos.service.videooutput/getStatus`), and its own captures
+of the screen show the correct pictures. Checked: Profile 7 FEL (the three
+DV FEL test clips), 5 and 8.1 at 4K and 1080p, 8.4, and 8.1 MMR, each at the
+stream's full rate.
+
 ## Routes
 
 The CPU half, the planner in `engine/planner/` (vendored from yblod), picks a
@@ -283,8 +303,10 @@ On the Pi itself, `V3D_DEBUG=shaderdb` prints the compiler's statistics,
 - **Not implemented:** the Annex B EL upscale (the EL is upscaled
   bilinearly) and resized output (the planner's `PACK_RESIZED`: the tunnel
   frame is the stream's size).
-- **Profile 8.4 with `--filters phase`** takes 43–53 ms per picture: not real
-  time at 24p. With the default filters it is.
+- **`--filters phase` on single-layer MMR** isn't real time at 24p: it
+  reshapes both output rows' chroma, twice pass 1's MMR. Profile 8.4 takes
+  43–53 ms per picture, an 8.1 MMR cut of 1917 66 ms. With the default
+  filters both are real time (31 and 27 ms).
 - **Coverage:** Profiles 5, 8.1 and 8.4 are checked on Dolby's Sol Levante
   samples (`DolbyLaboratories/dolby-vision-contents`), identical to yblod's
   engine at 4 points through the film (8.4 with `--filters phase`; under

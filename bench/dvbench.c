@@ -30,6 +30,9 @@
  *     --selftest         only the API's behaviour on the decoded pictures: errors,
  *                        validation, frame lifetime, pipeline cache growth,
  *                        import release, teardown with renders in flight
+ *     --kms-play S       then play S seconds on the HDMI output (KMS): the
+ *                        stream's size and frame rate, RGB full range, 8 bits
+ *                        per channel, each frame behind its sync_file
  *     --kms-writeback    then show the output on a KMS plane with the render's
  *                        sync_file as IN_FENCE_FD, captured by a writeback
  *                        connector (no display needed), and compare the
@@ -209,6 +212,7 @@ static void json_string(FILE *f, const char *s)
 
 static struct pi_engine *g_pi;
 static int g_profile, g_fel = 1, g_fences = 1, g_implicit, g_reopen, g_kms, g_selftest;
+static double g_kms_play;
 
 /* acquire_fd: taken; release_fd: NULL, or the render's sync_file (-1 none). */
 static int render_fenced(const struct dv_picture *q, double pts, struct out_buf *o, int acquire_fd, int *release_fd)
@@ -663,6 +667,228 @@ static void kms_close(struct kms *k)
     close(k->fd);
 }
 
+/* ---- KMS: playing on the HDMI output ------------------------------------------- */
+
+struct kms_out {
+    int fd;
+    uint32_t crtc, conn, plane, mode_blob, fb[3];
+};
+
+/* The connected HDMI connector, its CRTC and primary plane, a mode of the
+ * stream's size nearest its frame rate, and the outputs as framebuffers. */
+static int kms_out_open(struct kms_out *k, const struct out_buf *o, double rate)
+{
+    memset(k, 0, sizeof(*k));
+    k->fd = -1;
+    for (int card = 0; card < 4 && !k->conn; card++) {
+        char path[32];
+        snprintf(path, sizeof(path), "/dev/dri/card%d", card);
+        int fd = open(path, O_RDWR | O_CLOEXEC);
+        if (fd < 0)
+            continue;
+        drmModeRes *res = NULL;
+        if (!drmSetClientCap(fd, DRM_CLIENT_CAP_ATOMIC, 1) && !drmSetClientCap(fd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1))
+            res = drmModeGetResources(fd);
+        for (int i = 0; res && i < res->count_connectors && !k->conn; i++) {
+            drmModeConnector *c = drmModeGetConnector(fd, res->connectors[i]);
+            if (c && c->connection == DRM_MODE_CONNECTED && c->connector_type == DRM_MODE_CONNECTOR_HDMIA &&
+                c->count_encoders) {
+                drmModeEncoder *enc = drmModeGetEncoder(fd, c->encoders[0]);
+                int ci = enc ? __builtin_ffs((int)enc->possible_crtcs) - 1 : -1;
+                int best = -1;
+                double best_err = 1e9;
+                for (int m = 0; ci >= 0 && m < c->count_modes; m++) {
+                    const drmModeModeInfo *mi = &c->modes[m];
+                    if (mi->hdisplay != o->w || mi->vdisplay != o->h || (mi->flags & DRM_MODE_FLAG_INTERLACE))
+                        continue;
+                    double hz = mi->clock * 1000.0 / ((double)mi->htotal * mi->vtotal);
+                    if (fabs(hz - rate) < best_err)
+                        best_err = fabs(hz - rate), best = m;
+                }
+                if (best >= 0 && !drmModeCreatePropertyBlob(fd, &c->modes[best], sizeof(c->modes[best]), &k->mode_blob)) {
+                    const drmModeModeInfo *mi = &c->modes[best];
+                    printf("kms: %s on card%d: %ux%u at %.3f Hz, RGB full range, 8 bpc\n", "HDMI", card, mi->hdisplay,
+                           mi->vdisplay, mi->clock * 1000.0 / ((double)mi->htotal * mi->vtotal));
+                    k->fd = fd;
+                    k->conn = c->connector_id;
+                    k->crtc = res->crtcs[ci];
+                    drmModePlaneRes *pr = drmModeGetPlaneResources(fd);
+                    for (uint32_t p = 0; pr && p < pr->count_planes && !k->plane; p++) {
+                        drmModePlane *pl = drmModeGetPlane(fd, pr->planes[p]);
+                        drmModeObjectProperties *pp = pl ? drmModeObjectGetProperties(fd, pl->plane_id, DRM_MODE_OBJECT_PLANE) : NULL;
+                        for (uint32_t q = 0; pp && (pl->possible_crtcs & (1u << ci)) && q < pp->count_props; q++) {
+                            drmModePropertyRes *r = drmModeGetProperty(fd, pp->props[q]);
+                            if (r && !strcmp(r->name, "type") && pp->prop_values[q] == DRM_PLANE_TYPE_PRIMARY)
+                                k->plane = pl->plane_id;
+                            drmModeFreeProperty(r);
+                        }
+                        drmModeFreeObjectProperties(pp);
+                        drmModeFreePlane(pl);
+                    }
+                    drmModeFreePlaneResources(pr);
+                }
+                drmModeFreeEncoder(enc);
+            }
+            drmModeFreeConnector(c);
+        }
+        drmModeFreeResources(res);
+        if (!k->conn)
+            close(fd);
+    }
+    if (!k->conn || !k->plane) {
+        fprintf(stderr, "kms: no connected HDMI output with a %ux%u mode\n", o->w, o->h);
+        return -1;
+    }
+    for (int i = 0; i < 3; i++) {
+        uint32_t h, handles[4] = {0}, pitches[4] = {o[i].stride}, offsets[4] = {0};
+        if (drmPrimeFDToHandle(k->fd, o[i].buf.fd, &h))
+            return -1;
+        handles[0] = h;
+        if (drmModeAddFB2(k->fd, o[i].w, o[i].h, DRM_FORMAT_XRGB8888, handles, pitches, offsets, &k->fb[i], 0))
+            return -1;
+    }
+    return 0;
+}
+
+static uint64_t enum_value(int fd, uint32_t obj, uint32_t type, const char *prop, const char *name)
+{
+    drmModeObjectProperties *p = drmModeObjectGetProperties(fd, obj, type);
+    uint64_t v = 0;
+    for (uint32_t i = 0; p && i < p->count_props; i++) {
+        drmModePropertyRes *r = drmModeGetProperty(fd, p->props[i]);
+        if (r && !strcmp(r->name, prop))
+            for (int e = 0; e < r->count_enums; e++)
+                if (!strcmp(r->enums[e].name, name))
+                    v = r->enums[e].value;
+        drmModeFreeProperty(r);
+    }
+    drmModeFreeObjectProperties(p);
+    return v;
+}
+
+/* Output i on the plane, behind fence (-1 none); blocking: returns once shown. */
+static int kms_out_show(struct kms_out *k, const struct out_buf *o, int i, int fence, int first)
+{
+    drmModeAtomicReq *r = drmModeAtomicAlloc();
+    uint32_t P = DRM_MODE_OBJECT_PLANE, C = DRM_MODE_OBJECT_CRTC, N = DRM_MODE_OBJECT_CONNECTOR;
+    if (first) {
+        drmModeAtomicAddProperty(r, k->crtc, prop_id(k->fd, k->crtc, C, "MODE_ID"), k->mode_blob);
+        drmModeAtomicAddProperty(r, k->crtc, prop_id(k->fd, k->crtc, C, "ACTIVE"), 1);
+        drmModeAtomicAddProperty(r, k->conn, prop_id(k->fd, k->conn, N, "CRTC_ID"), k->crtc);
+        drmModeAtomicAddProperty(r, k->conn, prop_id(k->fd, k->conn, N, "Broadcast RGB"),
+                                 enum_value(k->fd, k->conn, N, "Broadcast RGB", "Full"));
+        drmModeAtomicAddProperty(r, k->conn, prop_id(k->fd, k->conn, N, "max bpc"), 8);
+        drmModeAtomicAddProperty(r, k->plane, prop_id(k->fd, k->plane, P, "CRTC_ID"), k->crtc);
+        drmModeAtomicAddProperty(r, k->plane, prop_id(k->fd, k->plane, P, "SRC_X"), 0);
+        drmModeAtomicAddProperty(r, k->plane, prop_id(k->fd, k->plane, P, "SRC_Y"), 0);
+        drmModeAtomicAddProperty(r, k->plane, prop_id(k->fd, k->plane, P, "SRC_W"), (uint64_t)o->w << 16);
+        drmModeAtomicAddProperty(r, k->plane, prop_id(k->fd, k->plane, P, "SRC_H"), (uint64_t)o->h << 16);
+        drmModeAtomicAddProperty(r, k->plane, prop_id(k->fd, k->plane, P, "CRTC_X"), 0);
+        drmModeAtomicAddProperty(r, k->plane, prop_id(k->fd, k->plane, P, "CRTC_Y"), 0);
+        drmModeAtomicAddProperty(r, k->plane, prop_id(k->fd, k->plane, P, "CRTC_W"), o->w);
+        drmModeAtomicAddProperty(r, k->plane, prop_id(k->fd, k->plane, P, "CRTC_H"), o->h);
+    }
+    drmModeAtomicAddProperty(r, k->plane, prop_id(k->fd, k->plane, P, "FB_ID"), k->fb[i]);
+    if (fence >= 0)
+        drmModeAtomicAddProperty(r, k->plane, prop_id(k->fd, k->plane, P, "IN_FENCE_FD"), (uint64_t)fence);
+    int rc = drmModeAtomicCommit(k->fd, r, first ? DRM_MODE_ATOMIC_ALLOW_MODESET : 0, NULL);
+    drmModeAtomicFree(r);
+    if (rc)
+        fprintf(stderr, "kms: commit failed: %s\n", strerror(errno));
+    return rc;
+}
+
+static void kms_out_close(struct kms_out *k)
+{
+    if (k->fd < 0)
+        return;
+    for (int i = 0; i < 3; i++)
+        if (k->fb[i])
+            drmModeRmFB(k->fd, k->fb[i]);
+    if (k->mode_blob)
+        drmModeDestroyPropertyBlob(k->fd, k->mode_blob);
+    close(k->fd);   /* the console takes the output back */
+}
+
+/* --kms-play: the decoding thread of --play, each picture rendered and shown
+ * on the HDMI output behind its sync_file, paced by the display. */
+static int kms_play(const char *file, struct dv_source_options so, double seconds, struct out_buf *out)
+{
+    so.extra_frames = PLAY_QUEUE + 6;
+    struct play_queue pq = {.lock = PTHREAD_MUTEX_INITIALIZER, .cond = PTHREAD_COND_INITIALIZER,
+                            .w = out[0].w, .h = out[0].h};
+    pq.src = dv_source_open(file, &so);
+    if (!pq.src)
+        return -1;
+    AVRational rate = dv_source_rate(pq.src);
+    double fps = rate.num > 0 ? (double)rate.num / rate.den : 24;
+    struct kms_out k;
+    if (kms_out_open(&k, out, fps)) {
+        kms_out_close(&k);
+        dv_source_close(pq.src);
+        return -1;
+    }
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, play_decoder, &pq)) {
+        kms_out_close(&k);
+        dv_source_close(pq.src);
+        return -1;
+    }
+    struct dv_picture held[3] = {{0}};
+    long shown = 0, failed = 0, frames = (long)(seconds * fps);
+    double t0 = now_ms();
+    for (long n = 0; n < frames; n++) {
+        pthread_mutex_lock(&pq.lock);
+        while (!pq.count && !pq.eof)
+            pthread_cond_wait(&pq.cond, &pq.lock);
+        if (!pq.count) {
+            pthread_mutex_unlock(&pq.lock);
+            break;
+        }
+        struct dv_picture p = pq.q[pq.head];
+        pq.head = (pq.head + 1) % PLAY_QUEUE;
+        pq.count--;
+        pthread_cond_broadcast(&pq.cond);
+        pthread_mutex_unlock(&pq.lock);
+        int slot = (int)(n % 3), fence = -1;
+        /* the output shown three frames ago is free: two flips have passed */
+        pi_output_wait(g_pi, out[slot].out);
+        dv_picture_free(&held[slot]);
+        if (!render_fenced(&p, n / fps, &out[slot], -1, &fence)) {
+            failed++;
+            dv_picture_free(&p);
+            continue;
+        }
+        held[slot] = p;
+        int rc = kms_out_show(&k, &out[slot], slot, fence, shown == 0);
+        if (fence >= 0)
+            close(fence);
+        if (rc)
+            break;
+        shown++;
+    }
+    double wall = now_ms() - t0;
+    printf("kms-play: %ld pictures shown in %.1f s (%.2f fps; the stream's %.3f)%s\n", shown, wall / 1e3,
+           shown * 1e3 / wall, fps, failed ? " FAILURES" : "");
+    for (int s = 0; s < 3; s++) {
+        pi_output_wait(g_pi, out[s].out);
+        dv_picture_free(&held[s]);
+    }
+    pthread_mutex_lock(&pq.lock);
+    pq.stop = 1;
+    pthread_cond_broadcast(&pq.cond);
+    pthread_mutex_unlock(&pq.lock);
+    pthread_join(thread, NULL);
+    while (pq.count) {
+        dv_picture_free(&pq.q[pq.head]);
+        pq.head = (pq.head + 1) % PLAY_QUEUE;
+        pq.count--;
+    }
+    kms_out_close(&k);
+    dv_source_close(pq.src);
+    return failed ? 1 : 0;
+}
+
 /* Per picture: the output filled with a marker, rendered, committed at once
  * (fenced or not), captured; then the capture against the finished frame.
  * Returns the pictures whose capture was the finished frame. */
@@ -919,6 +1145,8 @@ int main(int argc, char **argv)
             g_reopen = 1;
         else if (!strcmp(a, "--kms-writeback"))
             g_kms = 1;
+        else if (!strcmp(a, "--kms-play") && takes)
+            ok = to_seconds(a, v, &g_kms_play), i++;
         else if (!strcmp(a, "--selftest"))
             g_selftest = 1;
         else if (!strcmp(a, "--el-sw"))
@@ -1216,6 +1444,8 @@ int main(int argc, char **argv)
     }
 
     /* 5. Real-time playback from a decoding thread. */
+    if (g_kms_play > 0 && kms_play(file, so, g_kms_play, out))
+        status = 1;
     if (play_seconds > 0) {
         struct play_result r;
         if (play(file, so, play_seconds, out, &r)) {

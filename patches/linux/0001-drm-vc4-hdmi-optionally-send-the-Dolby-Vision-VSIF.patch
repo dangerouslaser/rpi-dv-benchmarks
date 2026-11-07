@@ -1,0 +1,71 @@
+From: Bryan Hoban <bryan.hoban@gmail.com>
+Subject: [PATCH] drm/vc4: hdmi: optionally send the Dolby Vision VSIF
+
+A TV-led (standard) Dolby Vision source signals the mode with the HDMI 1.4
+vendor-specific infoframe (OUI 00-0C-03) carrying a 24-byte payload, zero but
+for the OUI. With the vc4 module parameter dv_vsif=1, that infoframe replaces
+the HDMI vendor infoframe at the next modeset (and is sent where none would
+be). Against raspberrypi/linux rpi-6.18.y (a4985478de14).
+
+--- a/drivers/gpu/drm/vc4/vc4_hdmi.c
++++ b/drivers/gpu/drm/vc4/vc4_hdmi.c
+@@ -630,7 +630,34 @@
+ 	drm_dev_exit(idx);
+ 	return ret;
+ }
++
++/*
++ * Test only: dv_vsif=1 replaces the HDMI vendor infoframe with the one a
++ * standard (TV-led) Dolby Vision source sends: the HDMI 1.4 VSIF (OUI
++ * 00-0C-03) with a 24-byte payload, zero but for the OUI. Takes effect at the
++ * next modeset.
++ */
++static bool dv_vsif;
++module_param(dv_vsif, bool, 0644);
++MODULE_PARM_DESC(dv_vsif, "Send the Dolby Vision (TV-led) HDMI vendor infoframe (test)");
+ 
++static size_t vc4_hdmi_dv_vsif(u8 *buffer)
++{
++	unsigned int sum = 0, i;
++
++	memset(buffer, 0, 28);
++	buffer[0] = HDMI_INFOFRAME_TYPE_VENDOR;   /* 0x81 */
++	buffer[1] = 1;                            /* version */
++	buffer[2] = 0x18;                         /* length */
++	buffer[4] = 0x03;                         /* OUI 00-0C-03, LSB first */
++	buffer[5] = 0x0c;
++	buffer[6] = 0x00;
++	for (i = 0; i < 28; i++)
++		sum += buffer[i];
++	buffer[3] = (u8)(256 - (sum & 0xff));     /* checksum */
++	return 28;
++}
++
+ static int vc4_hdmi_write_infoframe(struct drm_connector *connector,
+ 				    enum hdmi_infoframe_type type,
+ 				    const u8 *infoframe, size_t len)
+@@ -660,6 +687,10 @@
+ 	}
+ 
+ 	memcpy(buffer, infoframe, len);
++	if (type == HDMI_INFOFRAME_TYPE_VENDOR && dv_vsif) {
++		len = vc4_hdmi_dv_vsif(buffer);
++		drm_info(drm, "HDMI vendor infoframe: Dolby Vision (dv_vsif)\n");
++	}
+ 
+ 	WARN_ONCE(!(HDMI_READ(HDMI_RAM_PACKET_CONFIG) &
+ 		    VC4_HDMI_RAM_PACKET_ENABLE),
+@@ -720,7 +751,13 @@
+ 	struct drm_device *drm = connector->dev;
+ 	int ret;
+ 	int idx;
++
++	if (type == HDMI_INFOFRAME_TYPE_VENDOR && dv_vsif) {   /* sent anyway */
++		u8 buffer[28];
+ 
++		return vc4_hdmi_write_infoframe(connector, type, buffer, vc4_hdmi_dv_vsif(buffer));
++	}
++
+ 	if (!drm_dev_enter(drm, &idx))
+ 		return 0;
+ 
