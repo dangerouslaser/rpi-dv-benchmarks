@@ -1,6 +1,6 @@
 # Khronos validation, GPU-assisted (tests/check.sh --gpuav): the shaders are
 # instrumented to report out-of-bounds buffer and texel-buffer reads
-# (docs/REVIEW.md P2 #3). Slow: a few pictures only.
+# (the engine's edge reads). Slow: a few pictures only.
 khronos_validation.validate_gpu_based = GPU_BASED_GPU_ASSISTED
 khronos_validation.gpuav_buffer_oob = true
 khronos_validation.gpuav_descriptor_checks = true

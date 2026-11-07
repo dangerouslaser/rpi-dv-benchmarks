@@ -131,14 +131,14 @@ it is not implemented in the passes.
 
 The output is bit-exact against yblod's Vulkan engine with the bilinear EL
 upscale: every sample of the tunnel frame, metadata included.
-- **How it was proven:** sample by sample, on every clip and film point
-  tested, before yblod was removed from this repository.
+- **How it was proven:** sample by sample against yblod's engine, on every
+  clip and film point tested.
 - **What keeps it:** `tests/golden/hashes.txt` carries those results.
   `tests/check.sh` must reproduce them.
 - **MMR curves beyond the 64-bit LUT** (the planner's MMR96 / MMR128 kinds)
-  are computed in emulated 128-bit in every exact mode. No stream tested so
-  far has them; `--measure force_wide` runs a 64-bit stream through that
-  path, and its golden case must equal the stream's own.
+  are computed in emulated 128-bit in every exact mode. No test stream has
+  them; `--measure force_wide` runs a 64-bit stream through that path, and
+  its golden case must equal the stream's own.
 - **1080p** matches yblod's render of the same pictures (centred in a 4K
   canvas: its engine can't render native 1080p), except the metadata
   packets' LSBs, which our frame carries in its own first rows.
@@ -150,12 +150,10 @@ MMR is a 3-variable polynomial of up to 3rd order. Computed exactly it needs
 
 | Mode | How | Exact | 1917 |
 |---|---|---|---|
-| `exact`, the default | Float, with a per-sample error bound (see below). Samples whose bound straddles a 12-bit step take `split`. | yes | 35.2 ms |
-| `split` | The 64-bit sum's low 32 bits from wrapping 32-bit integer multiply-adds, its high 32 bits from a float sum: `H = round(y − L / 2³²)`. The CPU bounds float's error for the frame's largest magnitudes: 32 × 2⁻²⁴ × Σ max\|terms\| < 0.5 (1917: 0.01; Sol Levante 8.4: up to 0.46). A frame over it checks each sample's own magnitudes instead, and takes `exact64` where that fails too (the guard, about 2 ms). | yes | 33.1 ms |
-| `exact64` | yblod's emulated 64-bit (`umulExtended`) | yes | 45.8 ms |
-| `float` | 32-bit float | within 2 codes, about 0.001% of samples | 28.9 ms |
-
-`exact32` (16-bit coefficient halves) was slower than `exact64` and is gone.
+| `exact`, the default | Float, with a per-sample error bound (see below). Samples whose bound straddles a 12-bit step take `split`. | yes | 33.0 ms |
+| `split` | The 64-bit sum's low 32 bits from wrapping 32-bit integer multiply-adds, its high 32 bits from a float sum: `H = round(y − L / 2³²)`. The CPU bounds float's error for the frame's largest magnitudes: 32 × 2⁻²⁴ × Σ max\|terms\| < 0.5 (1917: 0.01; Sol Levante 8.4: up to 0.46). A frame over it checks each sample's own magnitudes instead, and takes `exact64` where that fails too (the guard, about 2 ms). | yes | 32.9 ms |
+| `exact64` | yblod's emulated 64-bit (`umulExtended`) | yes | 53.1 ms |
+| `float` | 32-bit float | within 2 codes, about 0.001% of samples | 30.8 ms |
 
 **The `exact` bound.** Vulkan's add and multiply are correctly rounded, so
 the float value lies within 20 × 2⁻²⁴ × Σ|terms| of the exact one, with the
@@ -169,7 +167,7 @@ read over SMB:
 
 | Film | Route | Per picture | 24p real time |
 |---|---|---|---|
-| 1917 (UHD BD, P7.6 FEL, MMR, 2.39:1) | dual, `exact` | 33.0 ms (30.3 fps; 35.2 before the review) | with sync_file fences, 4 × 120 s: 0, 0, 0 and 1 late (≤ 0.8 ms); without, 0, 1 and 0; 73 °C, no throttling |
+| 1917 (UHD BD, P7.6 FEL, MMR, 2.39:1) | dual, `exact` | 33.0 ms (30.3 fps) | 120 s with sync_file fences, 0–1 late (≤ 0.8 ms); 73 °C, no throttling |
 | Dune (2021) (UHD BD, P7.6 MEL) | single | 16.1 ms (65 fps) | 60 s, 0 late |
 | Profile 8.1 MMR cuts (1917, test clips) | piecewise | 26.1–27.9 ms | 8 s, 0 late |
 | DV FEL test clips (polynomial chroma) | dual | 29.0 ms (35 fps) | — |
@@ -191,9 +189,8 @@ clocks; don't rely on an overclock.
 ## What V3D taught us (rules for these shaders)
 
 1. **Fragment passes, never compute.** The same 4K shader is about 10× faster
-   as a fragment pass than as compute, in Vulkan and GLES alike (measured with
-   the since-removed `vk-micro`; `pi5/V3DV.md`). Vulkan and GLES fragment
-   passes run at the same speed.
+   as a fragment pass than as compute, in Vulkan and GLES alike
+   (`pi5/V3DV.md`). Vulkan and GLES fragment passes run at the same speed.
 2. **Few passes, no intermediates.** The 4:2:2 filter and the pack, fused
    into one pass with the output written as two row-interleaved images, went
    from 42 to 17 ms.
@@ -281,24 +278,15 @@ On the Pi itself, `V3D_DEBUG=shaderdb` prints the compiler's statistics,
 `V3D_DEBUG=fs` the QPU code, and `V3D_DEBUG=nir` the NIR.
 `bundle/run-bench.sh` does it all per clip.
 
-## Open
+## Limitations
 
-- **LibreELEC 13 integration:**
-  - Vulkan enabled in our branch: `VULKAN="vulkan-loader"`; it is off for RPi
-    by default.
-  - The output dmabuf on a KMS plane (DRM PRIME).
-  - The DV VSIF / HDMI signalling for the Pi's `vc4_hdmi`.
-  - Kodi wiring.
-- **Integration review:** `docs/REVIEW.md` lists what the engine needs
-  before it runs inside Kodi.
-- **Coverage:**
-  - Profiles 5, 8.1 and 8.4 were checked on Dolby's Sol Levante samples
-    (`DolbyLaboratories/dolby-vision-contents`). At 4 points through the film,
-    they are identical to yblod's engine, Profile 8.4 with `--filters yblod`.
-    yblod refuses 8.4 under `cb1`, so that output has no reference; there,
-    `exact`, `split` and `exact64` agree on V3D at the same 4 points.
-  - Profile 8.4 is real time with the default `cb1` filters only.
-  - 1080p (Profiles 5, 8.1, 8.4) is checked as above; Profile 7 at 1080p
-    has no test clip.
-  - The Annex B EL upscale and resized output (the planner's
-    `PACK_RESIZED`) aren't implemented.
+- **Not implemented:** the Annex B EL upscale (the EL is upscaled
+  bilinearly) and resized output (the planner's `PACK_RESIZED`: the tunnel
+  frame is the stream's size).
+- **Profile 8.4 with `--filters phase`** takes 43–53 ms per picture: not real
+  time at 24p. With the default filters it is.
+- **Coverage:** Profiles 5, 8.1 and 8.4 are checked on Dolby's Sol Levante
+  samples (`DolbyLaboratories/dolby-vision-contents`), identical to yblod's
+  engine at 4 points through the film (8.4 with `--filters phase`; under
+  `cb1` yblod refuses 8.4, and there `exact`, `split` and `exact64` agree on
+  V3D). No Profile 7 1080p stream has been tested.

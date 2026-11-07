@@ -1,7 +1,7 @@
 # Per-picture output hashes of the Pi engine (dvbench --hash), first 6 pictures,
 # software decode into SAND128 (the Pi decoder's layout; its hardware decode is
 # picture-identical). Each case was verified identical to yblod's Vulkan engine
-# (bilinear FEL) sample for sample before yblod was removed (2026-11-06).
+# (bilinear FEL) sample for sample.
 # clip | options | picture | hash
 DV FEL All Layers Test (Woman at 80s).mkv |  | 000 | 2a98b8898c1f6f85
 DV FEL All Layers Test (Woman at 80s).mkv |  | 001 | 6a3d6a03975adcbd
@@ -87,7 +87,6 @@ p81mmr-dune2.mkv | --filters yblod | 002 | 93670cb1b5acedad
 p81mmr-dune2.mkv | --filters yblod | 003 | 4390a6b4fc108a05
 p81mmr-dune2.mkv | --filters yblod | 004 | 33e22c1bfb857351
 p81mmr-dune2.mkv | --filters yblod | 005 | 58019c160c10690d
-# Added 2026-11-07, verified on the same day:
 #   sol/*: Dolby's Sol Levante samples (clips/sol, docs/SETUP.md). The 4K 5 and
 #   8.1 cuts, and 8.4 with --filters yblod, are identical to yblod's engine;
 #   8.4 under cb1 has no yblod reference (it refuses it): exact, split and

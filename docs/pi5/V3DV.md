@@ -311,13 +311,4 @@ Expensive:
 - VkEvents, timestamps inside passes, CPU readback
 
 yblod's desktop-style compute engine hit most of the expensive list, at 515 ms
-per picture on the first FEL clip (`../HISTORY.md`).
-
-## 9. Still open
-
-1. **TFU:** present or not (§1); is a linear→UIF `vkCmdCopyImage` fast?
-2. **HDMI:** are `HDR_OUTPUT_METADATA` and Colorspace exposed; can a plane
-   take 4K60 linear P010 or 10-bit RGB (§7)?
-3. **Kernel 6.18:** does it match the cited submit and scheduler behaviour
-   (a clean after every CSD job, `credit_limit = 1`)? The engine uses no
-   compute, so this matters only for other work.
+per picture on an FEL clip.

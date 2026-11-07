@@ -18,10 +18,9 @@ at `00d9aa1a7241f2af00255a759ae02a9a34db699c`:
   nearest option is planned as bilinear.
 - `dv_engine_vk.h`: the declarations the port added.
 
-Taking this code over keeps the GPU output defined by yblod's arithmetic.
-Before yblod's Vulkan engine was removed from this repository, the Pi engine's
-output was verified identical to it, sample for sample. `tests/golden/` keeps
-those results as the regression reference.
+Taking this code over keeps the GPU output defined by yblod's arithmetic. The
+Pi engine's output was verified identical to yblod's Vulkan engine, sample for
+sample; `tests/golden/` keeps those results as the regression reference.
 
 **Licences:** see `LICENSE` and `LICENSES/`.
 - The C sources are GPL-2.0-or-later (yblod's GPL-3.0-or-later, relicensed

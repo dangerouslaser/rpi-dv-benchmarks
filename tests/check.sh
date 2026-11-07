@@ -80,7 +80,7 @@ ran=$((ran + 1))
 if [ $cli_ok = 1 ]; then echo "ok    dvbench: bad option values refused, --json escaped"; else fail=1; fi
 
 if [ $GPUAV = 1 ]; then
-  # out-of-bounds reads in the shaders (P2 #3), every route and filter set
+  # out-of-bounds reads in the shaders, every route and filter set
   for c in "DV FEL Power Rangers Credits Test.mkv|" "DV FEL Power Rangers Credits Test.mkv|--filters phase" \
            "sol/p84-2160-100.hevc|" "sol/p84-2160-100.hevc|--filters phase" "sol/p5-1080-100.hevc|" \
            "p81mmr-cmv.mkv|--filters phase"; do

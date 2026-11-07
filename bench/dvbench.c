@@ -770,7 +770,7 @@ static int selftest(struct pi_options base, struct dv_picture *pics, int count, 
              "odd stream size: PI_E_INVALID", 0);
     st_check(pi_stream_open(e, &si) == 0, "stream open", 0);
 
-    /* output validation (P2 #2) */
+    /* output validation */
     struct pi_output *bad = NULL;
     st_check(pi_output_import(e, o[1].buf.fd, W, H, W * 4 - 4, o[1].buf.size, &bad) == PI_E_INVALID,
              "output stride below width x 4: PI_E_INVALID", 0);
@@ -789,7 +789,7 @@ static int selftest(struct pi_options base, struct dv_picture *pics, int count, 
     } else
         st_check(0, "importing a half-size output", rc);
 
-    /* input validation (P2 #1) */
+    /* input validation */
     AVFrame *fake = av_frame_alloc();
     fake->format = AV_PIX_FMT_YUV420P10;
     fake->width = (int)W;
@@ -808,7 +808,7 @@ static int selftest(struct pi_options base, struct dv_picture *pics, int count, 
     rc = pi_render(e, &f, o[0].out, NULL);
     st_check(rc == PI_E_BAD_RPU || rc == PI_E_UNSUPPORTED_PLAN, "a junk RPU: refused, PI_E_BAD_RPU or _UNSUPPORTED_PLAN", rc);
 
-    /* frame lifetime (P0 #4): the engine holds the frames until the GPU is done */
+    /* frame lifetime: the engine holds the frames until the GPU is done */
     uint64_t want = 0, got = 0;
     for (int k = 0; k < 2; k++)   /* the first render after a stream opens refreshes the metadata */
         if (render(&pics[0], 0, &o[0]) && !pi_output_wait(e, o[0].out))
@@ -827,7 +827,7 @@ static int selftest(struct pi_options base, struct dv_picture *pics, int count, 
     st_check(after == before, "after the render, the engine has dropped it", after - before);
     st_check(want && got == want, "the caller's frames freed right after pi_render: the same output", 0);
 
-    /* every picture, three in flight; then the pipeline cache's growth (P0 #2) */
+    /* every picture, three in flight; then the pipeline cache's growth */
     int rendered = 0;
     for (int i = 0; i < count; i++) {
         pi_output_wait(e, o[i & 1].out);
@@ -851,7 +851,7 @@ static int selftest(struct pi_options base, struct dv_picture *pics, int count, 
     } else
         printf("selftest: (no MMR: no variants built ahead to count)\n");
 
-    /* stream close releases the imports (P0 #3); a new stream works */
+    /* stream close releases the imports; a new stream works */
     pi_stream_close(e);
     st_check(lc.closed == 1 && lc.released > 0, "stream close released its imports", lc.released);
     ok = pi_stream_open(e, &si) == 0;
@@ -859,7 +859,7 @@ static int selftest(struct pi_options base, struct dv_picture *pics, int count, 
         ok = render(&pics[0], 0, &o[0]) && !pi_output_wait(e, o[0].out);
     st_check(ok && out_hash(&o[0]) == want, "a new stream: imports again, the same output", 0);
 
-    /* teardown with renders in flight and outputs still imported (P0 #5) */
+    /* teardown with renders in flight and outputs still imported */
     for (int i = 0; i < 3 && i < count; i++)
         render(&pics[i], i * period, &o[i & 1]);
     pi_engine_destroy(e);   /* no waits, no releases first */
