@@ -1,4 +1,4 @@
-From 3f29e27f73d046ba017e4b248fb2ad90071106b9 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Bryan Hoban <bryan.hoban@gmail.com>
 Date: Sat, 7 Nov 2026 12:24:35 -0500
 Subject: [PATCH 1/4] pi-dv-engine: initial package
@@ -13,7 +13,7 @@ Signed-off-by: Bryan Hoban <bryan.hoban@gmail.com>
 
 diff --git a/packages/multimedia/pi-dv-engine/package.mk b/packages/multimedia/pi-dv-engine/package.mk
 new file mode 100644
-index 0000000000..0d152542d4
+index 0000000000..72117ffc53
 --- /dev/null
 +++ b/packages/multimedia/pi-dv-engine/package.mk
 @@ -0,0 +1,19 @@
@@ -22,7 +22,7 @@ index 0000000000..0d152542d4
 +
 +PKG_NAME="pi-dv-engine"
 +PKG_VERSION="0.1.0"
-+PKG_SHA256="84378669095ab5986fe365ed774a6858ddbd30b196f08ed23bb0fe4f1203e895"
++PKG_SHA256="8f9d234988d126b429eea8640f92542d3fbaef2ea3c02c5215bc7f15b4bed364"
 +PKG_LICENSE="GPL-2.0-or-later"
 +PKG_SITE="https://github.com/dangerouslaser/rpi-dv-benchmarks"
 +PKG_URL="https://github.com/dangerouslaser/rpi-dv-benchmarks/releases/download/v${PKG_VERSION}/${PKG_NAME}-${PKG_VERSION}.tar.xz"
@@ -36,3 +36,6 @@ index 0000000000..0d152542d4
 +post_makeinstall_target() {
 +  rm -rf ${INSTALL}/usr/share/doc
 +}
+-- 
+2.43.0
+

@@ -1,4 +1,4 @@
-From 377ab7934c9787ed5b21c97ff91b7a617312d5c9 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Bryan Hoban <bryan.hoban@gmail.com>
 Date: Sat, 7 Nov 2026 12:24:35 -0500
 Subject: [PATCH 3/4] kodi: optional Dolby Vision output (DOLBY_VISION_SUPPORT)
@@ -36,3 +36,6 @@ index 41db2c0809..58dce0f380 100644
                           ${KODI_CEC} \
                           ${KODI_PLATFORM} \
                           ${KODI_SAMBA} \
+-- 
+2.43.0
+

@@ -16,15 +16,15 @@ between the tunnel and the decoder's own frames.
 
 Signed-off-by: Bryan Hoban <bryan.hoban@gmail.com>
 ---
- .../resources/strings.po                      |  98 ++++++++++++++++-
+ .../resources/strings.po                      |  98 ++++++++++++++-
  xbmc/cores/IPlayer.h                          |   3 +-
- .../HwDecRender/RendererDRMPRIME.cpp          | 104 ++++++++++++++++--
+ .../HwDecRender/RendererDRMPRIME.cpp          | 116 ++++++++++++++++--
  .../HwDecRender/RendererDRMPRIME.h            |   3 +
  xbmc/cores/VideoSettings.cpp                  |  12 ++
- xbmc/cores/VideoSettings.h                    |  40 +++++++
+ xbmc/cores/VideoSettings.h                    |  42 +++++++
  xbmc/settings/MediaSettings.cpp               |  24 ++++
- xbmc/video/dialogs/GUIDialogVideoSettings.cpp |  79 +++++++++++++
- 8 files changed, 350 insertions(+), 13 deletions(-)
+ xbmc/video/dialogs/GUIDialogVideoSettings.cpp |  83 +++++++++++++
+ 8 files changed, 368 insertions(+), 13 deletions(-)
 
 diff --git a/addons/resource.language.en_gb/resources/strings.po b/addons/resource.language.en_gb/resources/strings.po
 index 58ddc85..6b0e8e2 100644
@@ -150,10 +150,10 @@ index 5f96bc3..bb6accb 100644
  
  class IPlayer
 diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIME.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIME.cpp
-index 818a48a..0609f0c 100644
+index 818a48a..86d9d4a 100644
 --- a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIME.cpp
 +++ b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIME.cpp
-@@ -161,26 +161,75 @@ void CRendererDRMPRIME::SetHDROutput(const VideoPicture& picture)
+@@ -161,26 +161,87 @@ void CRendererDRMPRIME::SetHDROutput(const VideoPicture& picture)
    }
  }
  
@@ -181,9 +181,21 @@ index 818a48a..0609f0c 100644
 +  options.filters = settings.m_DolbyVisionFilters == VS_DOLBYVISION_FILTERS_PHASE
 +                        ? PI_FILTERS_PHASE
 +                        : PI_FILTERS_CB1;
-+  options.elUpscale = settings.m_DolbyVisionUpscale == VS_DOLBYVISION_UPSCALE_ANNEX_B
-+                          ? PI_EL_ANNEX_B
-+                          : PI_EL_BILINEAR;
++  switch (settings.m_DolbyVisionUpscale)
++  {
++    case VS_DOLBYVISION_UPSCALE_ANNEX_B:
++      options.elUpscale = PI_EL_ANNEX_B;
++      break;
++    case VS_DOLBYVISION_UPSCALE_BICUBIC:
++      options.elUpscale = PI_EL_BICUBIC;
++      break;
++    case VS_DOLBYVISION_UPSCALE_LANCZOS:
++      options.elUpscale = PI_EL_LANCZOS;
++      break;
++    default:
++      options.elUpscale = PI_EL_BILINEAR;
++      break;
++  }
 +  options.enhancementLayer = settings.m_DolbyVisionEL != VS_DOLBYVISION_EL_OFF;
 +  return options;
 +}
@@ -240,7 +252,7 @@ index 818a48a..0609f0c 100644
    {
      m_dolbyVision.reset();
      return false;
-@@ -189,6 +238,8 @@ bool CRendererDRMPRIME::SetDolbyVisionOutput(const VideoPicture& picture)
+@@ -189,6 +250,8 @@ bool CRendererDRMPRIME::SetDolbyVisionOutput(const VideoPicture& picture)
    m_dolbyVisionMismatches = 0;
    winSystem->SetGuiCompositing(false);
    winSystem->SetHDR(nullptr);
@@ -249,7 +261,7 @@ index 818a48a..0609f0c 100644
    return true;
  #else
    return false;
-@@ -207,9 +258,38 @@ void CRendererDRMPRIME::ResetDolbyVisionOutput(const VideoPicture& picture)
+@@ -207,9 +270,38 @@ void CRendererDRMPRIME::ResetDolbyVisionOutput(const VideoPicture& picture)
  #endif
  }
  
@@ -288,7 +300,7 @@ index 818a48a..0609f0c 100644
    if (!m_dolbyVision)
      return false;
  
-@@ -403,6 +483,8 @@ bool CRendererDRMPRIME::Supports(ERENDERFEATURE feature) const
+@@ -403,6 +495,8 @@ bool CRendererDRMPRIME::Supports(ERENDERFEATURE feature) const
      case RENDERFEATURE_VERTICAL_SHIFT:
      case RENDERFEATURE_PIXEL_RATIO:
        return true;
@@ -349,10 +361,10 @@ index 0589484..a9028d3 100644
  }
  
 diff --git a/xbmc/cores/VideoSettings.h b/xbmc/cores/VideoSettings.h
-index 82779fb..0d3b7ee 100644
+index 82779fb..5b635d0 100644
 --- a/xbmc/cores/VideoSettings.h
 +++ b/xbmc/cores/VideoSettings.h
-@@ -196,6 +196,40 @@ private:
+@@ -196,6 +196,42 @@ private:
                  "add/remove a mapping?");
  };
  
@@ -366,7 +378,9 @@ index 82779fb..0d3b7ee 100644
 +enum EDOLBYVISIONUPSCALE
 +{
 +  VS_DOLBYVISION_UPSCALE_BILINEAR = 0,
-+  VS_DOLBYVISION_UPSCALE_ANNEX_B = 1,
++  VS_DOLBYVISION_UPSCALE_ANNEX_B = 1, //!< ETSI GS CCM 001 Annex B's filters
++  VS_DOLBYVISION_UPSCALE_BICUBIC = 2, //!< Catmull-Rom
++  VS_DOLBYVISION_UPSCALE_LANCZOS = 3, //!< Lanczos-3
 +};
 +
 +enum EDOLBYVISIONMMR
@@ -393,7 +407,7 @@ index 82779fb..0d3b7ee 100644
  enum ViewMode
  {
    ViewModeNormal = 0,
-@@ -247,6 +281,12 @@ public:
+@@ -247,6 +283,12 @@ public:
    float m_ToneMapParam;
    int m_Orientation;
    int m_CenterMixLevel; // relative to metadata or default
@@ -407,7 +421,7 @@ index 82779fb..0d3b7ee 100644
        m_isDefaultVideoSettings; //!< true: default video settings, false: video specific
  };
 diff --git a/xbmc/settings/MediaSettings.cpp b/xbmc/settings/MediaSettings.cpp
-index 25fe6f5..cbc0f2b 100644
+index 25fe6f5..c6768e8 100644
 --- a/xbmc/settings/MediaSettings.cpp
 +++ b/xbmc/settings/MediaSettings.cpp
 @@ -109,6 +109,24 @@ bool CMediaSettings::Load(const TiXmlNode *settings)
@@ -421,7 +435,7 @@ index 25fe6f5..cbc0f2b 100644
 +                         VS_DOLBYVISION_EL_OFF))
 +      m_defaultVideoSettings.m_DolbyVisionEL = static_cast<EDOLBYVISIONEL>(value);
 +    if (XMLUtils::GetInt(pElement, "dolbyvisionupscale", value, VS_DOLBYVISION_UPSCALE_BILINEAR,
-+                         VS_DOLBYVISION_UPSCALE_ANNEX_B))
++                         VS_DOLBYVISION_UPSCALE_LANCZOS))
 +      m_defaultVideoSettings.m_DolbyVisionUpscale = static_cast<EDOLBYVISIONUPSCALE>(value);
 +    if (XMLUtils::GetInt(pElement, "dolbyvisionmmr", value, VS_DOLBYVISION_MMR_EXACT,
 +                         VS_DOLBYVISION_MMR_FLOAT))
@@ -449,7 +463,7 @@ index 25fe6f5..cbc0f2b 100644
    // default audio settings for dsp addons
    TiXmlElement audioSettingsNode("defaultaudiosettings");
 diff --git a/xbmc/video/dialogs/GUIDialogVideoSettings.cpp b/xbmc/video/dialogs/GUIDialogVideoSettings.cpp
-index 4f42759..482f44b 100644
+index 4f42759..7e5afd8 100644
 --- a/xbmc/video/dialogs/GUIDialogVideoSettings.cpp
 +++ b/xbmc/video/dialogs/GUIDialogVideoSettings.cpp
 @@ -54,6 +54,13 @@
@@ -512,7 +526,7 @@ index 4f42759..482f44b 100644
    const std::shared_ptr<CSettingGroup> groupStereoscopic = AddGroup(category);
    if (groupStereoscopic == NULL)
    {
-@@ -455,6 +494,46 @@ void CGUIDialogVideoSettings::InitializeSettings()
+@@ -455,6 +494,50 @@ void CGUIDialogVideoSettings::InitializeSettings()
                visible);
    }
  
@@ -529,9 +543,13 @@ index 4f42759..482f44b 100644
 +               videoSettings.m_DolbyVisionEL, entries);
 +
 +    entries.clear();
++    // the enhancement layer's upscale: an expert's choice. Bilinear is the
++    // default; the others are sharper but too slow for 4K24 FEL on a Pi 5.
 +    entries.emplace_back(16302, VS_DOLBYVISION_UPSCALE_BILINEAR);
++    entries.emplace_back(16321, VS_DOLBYVISION_UPSCALE_BICUBIC);
++    entries.emplace_back(16305, VS_DOLBYVISION_UPSCALE_LANCZOS);
 +    entries.emplace_back(36647, VS_DOLBYVISION_UPSCALE_ANNEX_B);
-+    AddSpinner(groupDolbyVision, SETTING_VIDEO_DOLBYVISION_UPSCALE, 36646, SettingLevel::Basic,
++    AddSpinner(groupDolbyVision, SETTING_VIDEO_DOLBYVISION_UPSCALE, 36646, SettingLevel::Expert,
 +               videoSettings.m_DolbyVisionUpscale, entries);
 +
 +    entries.clear();
@@ -559,3 +577,6 @@ index 4f42759..482f44b 100644
    // stereoscopic settings
    entries.clear();
    entries.emplace_back(16316, static_cast<int>(RenderStereoMode::OFF));
+-- 
+2.43.0
+

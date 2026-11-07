@@ -23,9 +23,9 @@ Signed-off-by: Bryan Hoban <bryan.hoban@gmail.com>
  .../DVDCodecs/Video/DVDVideoCodecDRMPRIME.h   |   6 +
  .../DVDCodecs/Video/DVELDecoderDRMPRIME.cpp   | 328 ++++++++++++++++++
  .../DVDCodecs/Video/DVELDecoderDRMPRIME.h     |  69 ++++
- .../HwDecRender/DVTunnelDRMPRIME.cpp          |  21 +-
+ .../HwDecRender/DVTunnelDRMPRIME.cpp          |  36 +-
  .../HwDecRender/DVTunnelDRMPRIME.h            |   1 +
- 9 files changed, 502 insertions(+), 4 deletions(-)
+ 9 files changed, 517 insertions(+), 4 deletions(-)
  create mode 100644 xbmc/cores/VideoPlayer/DVDCodecs/Video/DVELDecoderDRMPRIME.cpp
  create mode 100644 xbmc/cores/VideoPlayer/DVDCodecs/Video/DVELDecoderDRMPRIME.h
 
@@ -672,10 +672,32 @@ index 0000000..0e96acb
 +  unsigned int m_logged[3] = {};
 +};
 diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.cpp
-index 93c585a..8076608 100644
+index 93c585a..c01145e 100644
 --- a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.cpp
 +++ b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.cpp
-@@ -277,7 +277,10 @@ bool CDVTunnelDRMPRIME::SetOptions(const Options& options)
+@@ -29,6 +29,21 @@ namespace
+ // one on the plane, one leaving it, one being rendered, one spare
+ constexpr int OUTPUTS = 4;
+ 
++const char* UpscaleName(pi_el_upscale upscale)
++{
++  switch (upscale)
++  {
++    case PI_EL_ANNEX_B:
++      return "Annex B";
++    case PI_EL_BICUBIC:
++      return "bicubic";
++    case PI_EL_LANCZOS:
++      return "Lanczos";
++    default:
++      return "bilinear";
++  }
++}
++
+ void Log(void* /*opaque*/, pi_log_level level, const char* message)
+ {
+   int kodiLevel = LOGDEBUG;
+@@ -277,7 +292,10 @@ bool CDVTunnelDRMPRIME::SetOptions(const Options& options)
  
    m_options = options;
    m_failures = 0;
@@ -683,11 +705,11 @@ index 93c585a..8076608 100644
 +  CLog::Log(LOGINFO,
 +            "CDVTunnelDRMPRIME: {}, {} filters, {} enhancement layer upscale, enhancement layer {}",
 +            pi_engine_describe(m_engine), m_options.filters == PI_FILTERS_PHASE ? "phase" : "CB1",
-+            m_options.elUpscale == PI_EL_ANNEX_B ? "Annex B" : "bilinear",
++            UpscaleName(m_options.elUpscale),
              m_options.enhancementLayer ? "where needed" : "off");
    return true;
  }
-@@ -306,11 +309,27 @@ CVideoBufferDRMPRIME* CDVTunnelDRMPRIME::Render(CVideoBufferDRMPRIME* buffer, in
+@@ -306,11 +324,27 @@ CVideoBufferDRMPRIME* CDVTunnelDRMPRIME::Render(CVideoBufferDRMPRIME* buffer, in
  
    pi_frame frame{};
    frame.bl = decoded->GetFrame();
@@ -725,3 +747,6 @@ index d718934..524ae9d 100644
    unsigned int m_failures = 0;
 +  bool m_warnedEnhancementLayer = false;
  };
+-- 
+2.43.0
+

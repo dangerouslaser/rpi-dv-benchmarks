@@ -1,4 +1,4 @@
-From d5357b58d2943c2dbc85e787b926b5c99d15fb2d Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Bryan Hoban <bryan.hoban@gmail.com>
 Date: Sat, 7 Nov 2026 12:24:35 -0500
 Subject: [PATCH 2/4] ffmpeg: rpi: leave the decode queue when no dst buffer is
@@ -39,3 +39,6 @@ index 0000000000..478788b839
 +             return AVERROR(ENOMEM);
 +         }
 +     }
+-- 
+2.43.0
+
