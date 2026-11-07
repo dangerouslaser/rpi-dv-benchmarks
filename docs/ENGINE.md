@@ -72,16 +72,21 @@ P2  w/2 × h/2   one fragment per 2×2 output block: 4:2:2 vertical filter,
   dropped 0–5 frames in 120 s with one, none with the fence.
 - **An acquire fence already signalled isn't imported,** for the same reason
   on the waiting side.
-- **Give KMS the sync_file (`IN_FENCE_FD`).** v3d does put an implicit fence
-  on the output dmabuf, and KMS waits on it. But it appears only once v3dv
-  has passed the job to the kernel, after `vkQueueSubmit` returns
-  (`dvbench --implicit-sync`, kernel 6.18.60: no fence right after submit
-  in 12 of 12 pictures, a fence 2 ms later in all 12). A commit inside that
-  window would show an unfinished frame. The sync_file has no such window.
-  `dvbench --kms-writeback` checks the whole path without a display: the
-  output on a KMS plane with `IN_FENCE_FD`, captured by a writeback
-  connector, is the finished frame (12 of 12, 1080p, a 46 ms render
-  committed while still drawing).
+- **Give KMS the sync_file (`IN_FENCE_FD`): implicit sync doesn't hold.**
+  `dvbench --kms-writeback` puts each output on a KMS plane, committed while
+  the GPU still draws it, and captures what KMS scans out with the vc4
+  writeback connector (no display needed). The output is pre-filled with a
+  marker. At 3840×2160:
+  - with `IN_FENCE_FD`, every capture is the finished frame (1917 12 of 12;
+    a 46 ms 8.4 render 8 of 8);
+  - without it, the commit doesn't wait: every capture shows the unfinished
+    marker (12 of 12, 8 of 8).
+
+  v3d's implicit fence on the output does exist, but only once v3dv has
+  passed the job to the kernel, a moment after `vkQueueSubmit` returns
+  (`dvbench --implicit-sync`: none right after submit, 12 of 12; one 2 ms
+  later, 12 of 12). At 1080p a bare commit happened to wait on it, at 4K it
+  didn't.
 - **Input glue** for a player (`engine/pi_input.c`): `pi_chroma_top_left()`,
   `pi_is_sand128()` and `pi_p7_split()`, the single-track Profile 7 BL / EL
   split. `bench/source.c` is the reference for decoding and pairing the
@@ -260,8 +265,14 @@ reads no environment. `--measure` takes the same names, comma-separated.
 fence right after each submit and 2 ms later. `--kms-writeback` shows each
 output on a KMS plane with its sync_file as `IN_FENCE_FD`, captured by a
 writeback connector, against the finished frame, then the same without the
-fence (`DVBENCH_KMS_DEBUG=1`: commit timings). The Pi's writeback offers no
-3840×2160 mode, so it needs a 1080p stream. `--reopen` closes and reopens
+fence (`DVBENCH_KMS_DEBUG=1`: commit timings; a mode of the stream's size
+is made when the connector doesn't list one). `--selftest` checks the API's
+behaviour on the decoded pictures: error codes, input and output
+validation, the engine's references to the frames, the pipeline cache's
+growth, imports released at stream close, teardown with renders in flight.
+`tests/check.sh` runs it (under the validation layer with `--validate`);
+`tests/check.sh --gpuav` adds Vulkan's GPU-assisted validation, which reports
+out-of-bounds buffer reads in the shaders, on every route and filter set. `--reopen` closes and reopens
 the stream in the same engine and requires identical output (the planner
 reset; without it no picture matches). `DVBENCH_DROP_EL=N` discards the Nth EL picture
 (the BL / EL pairing's test).

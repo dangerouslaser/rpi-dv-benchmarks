@@ -92,11 +92,15 @@ what was done. The changes were checked as follows:
      unfinished frame. So Kodi gives KMS the release sync_file as
      `IN_FENCE_FD`.
    - Tested directly: `dvbench --kms-writeback` puts the output on a KMS
-     plane with the sync_file as `IN_FENCE_FD`, captures it with the vc4
-     writeback connector, and compares the capture with the finished frame.
-     The output was pre-filled with a marker. Result: 12 of 12 captures are
-     the finished frame, with no marker, both with a 4.7 ms render and with
-     a 46 ms one committed while still rendering.
+     plane, committed while the GPU still draws it, captures it with the
+     vc4 writeback connector, and compares the capture with the finished
+     frame. The output was pre-filled with a marker. At 3840×2160:
+     - with `IN_FENCE_FD`, 12 of 12 captures (1917) and 8 of 8 (a 46 ms 8.4
+       render) are the finished frame;
+     - without it, the commit returned in 10 ms and every capture showed the
+       marker.
+
+     The implicit fence isn't reliable; the sync_file is required.
 3. ~~**Sizes other than 3840×2160.**~~
    - **Done:** the size is the stream's (`pi_stream_open`), and outputs are
      validated against it. Dolby's 1080p Profile 5, 8.1 and 8.4 samples
@@ -134,8 +138,11 @@ what was done. The changes were checked as follows:
    - `install()` rules for the libraries and `pi_engine.h`.
    - `LICENSE`: GPL-2.0-or-later, as Kodi. The planner was yblod's
      GPL-3.0-or-later; its author relicensed it here. Its third-party parts
-     (dovi_tool's MIT, libplacebo's LGPL-2.1, CroqueMr's and Kodi's
-     GPL-2.0-or-later in `dm_cm4.c`) all allow that. README.md and ENGINE.md
+     (dovi_tool's MIT; CroqueMr's and Kodi's GPL-2.0-or-later in
+     `dm_cm4.c`) all allow that. `cb1_overlay.c` (LGPL-2.1, from libplacebo)
+     had no caller here and is gone. Compared with upstream at the pinned
+     commit, by content: every other vendored file is identical, or differs
+     only by its SPDX line or the documented port changes. README.md and ENGINE.md
      say so, and that Kodi's FFmpeg needs `patches/ffmpeg`.
 8. ~~**Input glue to move next to the engine.**~~
    - **Done:** `engine/pi_input.c` has `pi_p7_split` (the single-track
@@ -147,10 +154,22 @@ what was done. The changes were checked as follows:
 ## P2: hardening
 
 1. ~~**The input frame isn't checked**~~ (`pi_engine.c:662`).
-   - **Done:** the engine checks the frame format (DRM PRIME), the
-     descriptor, its object and layer counts, the SAND128 modifier, each
-     plane's object index and offset, and the frame's size. Any failure is
-     `PI_E_UNSUPPORTED_FORMAT`.
+   - **Done:** before planning, the engine checks the frame format (DRM
+     PRIME), the descriptor, its object and layer counts, the SAND128
+     modifier, each plane's object index, fd and offset, and the frame's
+     size. Any failure is `PI_E_UNSUPPORTED_FORMAT`.
+   - `dvbench --selftest` checks these, the output validation (P2 #2) and
+     the error codes. It also checks that the engine holds a reference to
+     the frames until the render is done (P0 #4), that more than 16 P1
+     variants build (P0 #2), that stream close releases the imports
+     (P0 #3), and teardown with renders in flight and outputs imported
+     (P0 #5). `tests/check.sh` runs it, under the validation layer with
+     `--validate`.
+   - It found two faults, both fixed:
+     - Planning ran before the input check, so a software frame was
+       refused as a plan, not as a format.
+     - In copy mode (lavapipe), two renders into one output had no
+       ordering against the earlier copy.
 2. ~~**Unvalidated indices and buffers.**~~
    - **Done:** there are no slot indices any more. An output's size, stride
      and byte count are checked against `pi_output_size`'s rules and the
@@ -163,6 +182,10 @@ what was done. The changes were checked as follows:
        only when a sample is in it.
    - Every read now holds a sample that exists. Clamping each read instead
      cost 1.3 ms on 1917. The output is bit-identical.
+   - Tested: `tests/check.sh --gpuav` runs Vulkan's GPU-assisted
+     validation, whose instrumented shaders report out-of-bounds buffer
+     reads, on every route and filter set. The pre-review engine shows 12
+     such reads on Power Rangers; the engine now shows none anywhere.
 4. ~~**MMR96 and MMR128 streams render in float, not exactly**~~
    (`pi_engine.c:970`).
    - **Done:** routing them through `exact64` would have been wrong: their
@@ -174,7 +197,7 @@ what was done. The changes were checked as follows:
      both filter sets, and has a golden case.
 5. ~~**`dvbench` accepts unknown option values as the default.**~~
    - **Done:** unknown values, malformed numbers and a second file are
-     errors (exit 2).
+     errors (exit 2). `tests/check.sh` checks seven bad values.
 6. ~~**Decoder feed**~~ (`bench/source.c`).
    - **Done:**
      - A packet the decoder can't take yet is kept and sent again; it is
@@ -182,8 +205,13 @@ what was done. The changes were checked as follows:
      - The EL is given up only if no EL picture has ever arrived.
      - Contexts are freed on every `open_decoder` failure, and allocations
        are checked.
-     - BL and EL pair by display time. An EL picture's own timestamp is
-       its packet's. Where the EL's coding order differs from the packets'
+     - **BL and EL pair by timestamp, but not by the EL's raw PTS, a
+       deliberate departure from the finding, accepted by the project owner
+       on 2026-11-07** (`source.c` `take()`). Equal
+       timestamps pair, an EL picture older than its BL is dropped, and a
+       BL picture without an EL is shown alone. The EL's timestamps are
+       corrected first, because raw PTS pairing is wrong. An EL picture's
+       own timestamp is its packet's. Where the EL's coding order differs from the packets'
        (the "All Layers" test clip), that isn't its display time, and plain
        timestamp pairing lost pictures 1 and 4 of its first six. So
        `el_display_times()` sorts the output EL pictures' packet times
@@ -198,15 +226,20 @@ what was done. The changes were checked as follows:
        later one has the same pixels (Power Rangers' metadata packet ids
        renumber). Output-order pairing would have mispaired every picture
        after the loss.
-     - Identical to before on every golden case, and on the Pi with hardware
-       decode (1917, "All Layers", Power Rangers).
+     - Identical to before on every golden case. With hardware decode on the
+       Pi, identical to the pre-review build at 19 points through 1917 and
+       Dune (2021) (each a fresh seek, with leading pictures), with no
+       pairing warnings, and on the three FEL test clips.
+     - Losing an EL picture on the Pi (1917, the CMV test clip): only that
+       picture is lost, and the later ones keep their pixels.
 7. ~~**Smaller issues.**~~
    - **Done:**
      - A device with no graphics queue is an error.
      - `VK_INCOMPLETE` is accepted.
      - Shader modules are freed on every path.
      - `memtype` fails instead of falling back to type 0.
-     - JSON strings are escaped.
+     - JSON strings are escaped. `tests/check.sh` reads back the JSON for a
+       file name with a quote, a backslash and a newline.
      - `--json`/`--dump` open and write failures are reported and fail the
        run.
      - `run-bench.sh` exits 1 on any failure.
@@ -283,6 +316,27 @@ what was done. The changes were checked as follows:
     - **Done:** `run-bench.sh` runs each clip with CB1's filters, and reruns
       it with the phase filters when the plan is refused. The image note
       says so.
+
+## Verification on the final tree (2026-11-07)
+
+Run on the final code, after every change above. VM: lavapipe. Pi: V3D,
+hardware decode, stock clocks.
+
+| Finding | Test | Result |
+|---|---|---|
+| all (output unchanged) | every clip × filter set × MMR mode against the pre-review engine (VM) | 224 cases: 188 identical; 24 are 1080p, which it refused (see P1 #3); 12 are route 3 `--mmr float` (P3 #2, intended) |
+| all (output unchanged) | 8 streams with hardware decode against the pre-review build (Pi): 1917, Dune, Sol 5 / 8.1 / 8.4, the 3 FEL test clips | all identical |
+| all | `tests/check.sh --validate --gpuav`; `--mmr split`; `--mmr exact64` | 29, 23 and 23 checks pass; no validation or out-of-bounds errors |
+| P0 #1, #2, #3, #4, #5; P1 #1; P2 #1, #2 | `dvbench --selftest` | VM 20 of 20 (also under validation); Pi 20 of 20, 20 of 20, 19 of 19 (no MMR: no variant count) |
+| P0 #6 | real-time play with sync_files (Pi) | the whole 8.4 film: 6,314 pictures, 1 late (1.3 ms) |
+| P1 #2 | `--kms-writeback` at 3840×2160 (Pi) | Sol 5, 8.1, 8.4 and 1917: with `IN_FENCE_FD` 12 of 12 finished frames each; without, 0 of 12 |
+| P1 #2 | `--implicit-sync`; 1917 120 s play with sync_files | no implicit fence right after submit (12 of 12), one 2 ms later (12 of 12); 2,877 pictures, 0 late |
+| P1 #3 | 1080p golden cases; centred-canvas comparison with yblod | pass; identical but for the metadata LSBs |
+| P1 #5 | `--reopen` (Pi, 1917) | 12 of 12 identical; without the reset 0 of 6 (VM) |
+| P2 #3 | `check.sh --gpuav` | 0 out-of-bounds reads on every route and filter set (pre-review: 12) |
+| P2 #4 | golden `--measure force_wide` | identical to the stream's own case |
+| P2 #5, #7 | `check.sh` command-line case | 7 bad values refused; odd file name kept in valid JSON |
+| P2 #6 | goldens; 19 film points (Pi); `DVBENCH_DROP_EL` (VM and Pi) | identical; no pairing warnings; a lost EL picture loses only that picture |
 
 ## What checked out
 

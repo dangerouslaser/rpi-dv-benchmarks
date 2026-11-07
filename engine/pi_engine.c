@@ -1682,6 +1682,29 @@ static void prepare(struct pi_engine *e, const dvvk_plan *p, int has_el)
 
 /* ---- per frame ------------------------------------------------------------------- */
 
+/* A frame the passes can read: DRM PRIME, one layer of two planes in
+ * SAND128, objects and offsets in range. Checked before planning. */
+static int frame_ok(struct pi_engine *e, const AVFrame *f)
+{
+    const AVDRMFrameDescriptor *d = f->format == AV_PIX_FMT_DRM_PRIME ? (const void *)f->data[0] : NULL;
+    if (!d || d->nb_layers != 1 || d->layers[0].nb_planes != 2 || d->nb_objects < 1 ||
+        d->nb_objects > AV_DRM_MAX_PLANES) {
+        WARN_ONCE(e, W_INPUT, "input isn't a DRM PRIME frame with one layer of two planes");
+        return 0;
+    }
+    if (!pi_is_sand128(d->objects[0].format_modifier)) {
+        WARN_ONCE(e, W_INPUT, "input isn't SAND128 (modifier %#llx)", (unsigned long long)d->objects[0].format_modifier);
+        return 0;
+    }
+    for (int p = 0; p < 2; p++) {
+        const AVDRMPlaneDescriptor *pl = &d->layers[0].planes[p];
+        if (pl->object_index < 0 || pl->object_index >= d->nb_objects || pl->offset < 0 || (pl->offset & 3) ||
+            d->objects[pl->object_index].fd < 0)
+            return 0;
+    }
+    return 1;
+}
+
 /* The input frames' SAND128 planes as texel buffers: in[0..1] BL luma,
  * chroma; in[2..3] the EL's. */
 static int bind_inputs(struct pi_engine *e, struct ctx *c, const AVFrame *bl, const AVFrame *el, struct params *q)
@@ -1689,18 +1712,9 @@ static int bind_inputs(struct pi_engine *e, struct ctx *c, const AVFrame *bl, co
     const AVFrame *f[2] = {bl, el};
     VkBufferView views[4];
     for (int l = 0; l < 2; l++) {
-        const AVDRMFrameDescriptor *d = f[l]->format == AV_PIX_FMT_DRM_PRIME ? (const void *)f[l]->data[0] : NULL;
-        if (!d || d->nb_layers != 1 || d->layers[0].nb_planes != 2 || d->nb_objects < 1 ||
-            d->nb_objects > AV_DRM_MAX_PLANES) {
-            WARN_ONCE(e, W_INPUT, "input isn't a DRM PRIME frame with one layer of two planes");
-            return PI_E_UNSUPPORTED_FORMAT;
-        }
+        const AVDRMFrameDescriptor *d = (const void *)f[l]->data[0];   /* frame_ok checked it */
         const AVDRMLayerDescriptor *ly = &d->layers[0];
         uint64_t mod = d->objects[0].format_modifier;
-        if (!pi_is_sand128(mod)) {
-            WARN_ONCE(e, W_INPUT, "input isn't SAND128 (modifier %#llx)", (unsigned long long)mod);
-            return PI_E_UNSUPPORTED_FORMAT;
-        }
         uint32_t *o = l ? q->el : q->bl;
         if (e->first && (l == 0 || el != bl)) {
             logf_(e, PI_LOG_DEBUG, "%s %dx%d, %d objects, planes at object %d +%td (pitch %td), object %d +%td",
@@ -1709,8 +1723,6 @@ static int bind_inputs(struct pi_engine *e, struct ctx *c, const AVFrame *bl, co
         }
         for (int p = 0; p < 2; p++) {
             int obj = ly->planes[p].object_index;
-            if (obj < 0 || obj >= d->nb_objects || ly->planes[p].offset < 0 || (ly->planes[p].offset & 3))
-                return PI_E_UNSUPPORTED_FORMAT;
             struct import *im = import_dmabuf(e, d->objects[obj].fd);
             if (!im) {
                 WARN_ONCE(e, W_IMPORT, "decoder dmabuf import failed");
@@ -1888,6 +1900,16 @@ static int record(struct pi_engine *e, struct ctx *c, const dvvk_plan *p, struct
         vkCmdWriteTimestamp(c->cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, c->qp, 0);
     }
     ownership(e, c, o, 1);
+    if (o->copy_buf) {
+        /* copy mode: the output's images and buffer may still be in an earlier
+         * render's copy (the render pass's own dependency covers attachments
+         * only) */
+        VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                              .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT};
+        vkCmdPipelineBarrier(c->cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 1, &mb, 0,
+                             NULL, 0, NULL);
+    }
     /* Pass 1 only over the letterbox's row window (yblod's, with the margin the
      * filters need; 8-aligned): pass 2 reads no chroma or EL outside it, and
      * writes black there itself. */
@@ -2013,7 +2035,8 @@ int pi_render(struct pi_engine *e, const struct pi_frame *f, struct pi_output *o
     rc = PI_E_UNSUPPORTED_FORMAT;
     if ((uint32_t)f->bl->width != e->w || (uint32_t)f->bl->height != e->h ||
         (f->el && ((uint32_t)f->el->width > e->w || (uint32_t)f->el->height > e->h || f->el->width < 4 ||
-                   f->el->height < 4)))
+                   f->el->height < 4)) ||
+        !frame_ok(e, f->bl) || (f->el && !frame_ok(e, f->el)))
         goto out;
     struct ctx *c = &e->c[e->next];
     ctx_retire(e, c, 1);

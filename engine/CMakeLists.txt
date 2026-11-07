@@ -1,7 +1,7 @@
 # The planner (vendored from yblod: planner/README.md) and the Pi engine:
 # libpi_engine.a, its fragment shaders compiled in as SPIR-V.
 add_library(dv_planner STATIC
-  planner/plan.c planner/cb1_overlay.c planner/dm_cm4.c planner/dv_ffmpeg_metadata.c planner/dv_cm4.c
+  planner/plan.c planner/dm_cm4.c planner/dv_ffmpeg_metadata.c planner/dv_cm4.c
   planner/single_reshape.c planner/single_reshape_ffmpeg.c planner/mmr_prepare.c planner/pixel_luma.c
   planner/pixel_chroma_final.c planner/pixel_spatial.c planner/source_geometry.c planner/source_overlay.c
   planner/pixel_colour.c planner/colour_lut.c)

@@ -27,6 +27,9 @@
  *                        stream's frame clock; counts pictures that missed
  *                        their display deadline and decode stalls
  *     --no-fences        --play: wait on the engine instead of its sync_files
+ *     --selftest         only the API's behaviour on the decoded pictures: errors,
+ *                        validation, frame lifetime, pipeline cache growth,
+ *                        import release, teardown with renders in flight
  *     --kms-writeback    then show the output on a KMS plane with the render's
  *                        sync_file as IN_FENCE_FD, captured by a writeback
  *                        connector (no display needed), and compare the
@@ -205,7 +208,7 @@ static void json_string(FILE *f, const char *s)
 /* ---- one picture ------------------------------------------------------------ */
 
 static struct pi_engine *g_pi;
-static int g_profile, g_fel = 1, g_fences = 1, g_implicit, g_reopen, g_kms;
+static int g_profile, g_fel = 1, g_fences = 1, g_implicit, g_reopen, g_kms, g_selftest;
 
 /* acquire_fd: taken; release_fd: NULL, or the render's sync_file (-1 none). */
 static int render_fenced(const struct dv_picture *q, double pts, struct out_buf *o, int acquire_fd, int *release_fd)
@@ -523,9 +526,29 @@ static int kms_open(struct kms *k, const struct out_buf *o)
             if (c && c->connector_type == DRM_MODE_CONNECTOR_WRITEBACK && c->count_encoders) {
                 drmModeEncoder *enc = drmModeGetEncoder(k->fd, c->encoders[0]);
                 int ci = enc ? __builtin_ffs((int)enc->possible_crtcs) - 1 : -1;
-                for (int m = 0; ci >= 0 && ci < res->count_crtcs && m < c->count_modes && !k->conn; m++)
-                    if (c->modes[m].hdisplay == o->w && c->modes[m].vdisplay == o->h &&
-                        !drmModeCreatePropertyBlob(k->fd, &c->modes[m], sizeof(c->modes[m]), &k->mode_blob)) {
+                /* the stream's size among the connector's modes, else a CEA-style
+                 * mode of that size (writeback needs no real timings) */
+                drmModeModeInfo own = {0};
+                if (c->count_modes) {
+                    own = c->modes[0];
+                    own.hdisplay = (uint16_t)o->w;
+                    own.hsync_start = (uint16_t)(o->w + 176);
+                    own.hsync_end = (uint16_t)(o->w + 264);
+                    own.htotal = (uint16_t)(o->w + 560);
+                    own.vdisplay = (uint16_t)o->h;
+                    own.vsync_start = (uint16_t)(o->h + 8);
+                    own.vsync_end = (uint16_t)(o->h + 18);
+                    own.vtotal = (uint16_t)(o->h + 90);
+                    own.vrefresh = 30;
+                    own.clock = (uint32_t)((uint64_t)own.htotal * own.vtotal * 30 / 1000);
+                    own.type = DRM_MODE_TYPE_USERDEF;
+                    snprintf(own.name, sizeof(own.name), "%ux%u", o->w, o->h);
+                }
+                for (int m = 0; ci >= 0 && ci < res->count_crtcs && m <= c->count_modes && !k->conn; m++)
+                    if ((m == c->count_modes ? c->count_modes > 0
+                                             : c->modes[m].hdisplay == o->w && c->modes[m].vdisplay == o->h) &&
+                        !drmModeCreatePropertyBlob(k->fd, m == c->count_modes ? &own : &c->modes[m], sizeof(own),
+                                                   &k->mode_blob)) {
                         k->conn = c->connector_id;
                         k->crtc = res->crtcs[ci];
                         drmModePlaneRes *pr = drmModeGetPlaneResources(k->fd);
@@ -689,6 +712,166 @@ static int kms_run(struct kms *k, const struct dv_picture *pics, int count, doub
     return match;
 }
 
+/* ---- --selftest ---------------------------------------------------------------- */
+
+struct logcount {
+    int variants, closed, released, mmr;
+};
+
+static void count_log(void *opaque, enum pi_log_level level, const char *msg)
+{
+    struct logcount *c = opaque;
+    int n;
+    if (strstr(msg, "pipeline P1 variant made"))
+        c->variants++;
+    if (strstr(msg, "one MMR piece") || (strstr(msg, "tables:") && strstr(msg, "route 1") && !strstr(msg, "kinds 0 0")))
+        c->mmr = 1;   /* the streams whose MMR variants are built ahead */
+    if (sscanf(msg, "stream closed: %d imports released", &n) == 1) {
+        c->closed++;
+        c->released = n;
+    }
+    if (level <= PI_LOG_WARNING)
+        fprintf(stderr, "pi: %s\n", msg);
+}
+
+static int st_fails, st_runs;
+
+static void st_check(int ok, const char *what, int got)
+{
+    st_runs++;
+    st_fails += !ok;
+    printf("selftest: %s  %s (%d)\n", ok ? "ok  " : "FAIL", what, got);
+}
+
+static int selftest(struct pi_options base, struct dv_picture *pics, int count, uint32_t W, uint32_t H, double period)
+{
+    struct logcount lc = {0};
+    struct pi_options po = base;
+    po.log = count_log;
+    po.log_opaque = &lc;
+    po.log_level = PI_LOG_DEBUG;
+    struct pi_engine *e;
+    if (pi_engine_create(&po, &e))
+        return 1;
+    g_pi = e;
+    struct out_buf o[2];
+    memset(o, 0, sizeof(o));
+    struct pi_stream_info si = {.width = W, .height = H, .profile = g_profile};
+    struct pi_frame f = {.acquire_fd = -1};
+    int rc;
+
+    /* call order and arguments */
+    st_check(pi_render(e, NULL, NULL, NULL) == PI_E_INVALID, "render with no frame: PI_E_INVALID", 0);
+    if (out_alloc(e, &o[0], W, H) || out_alloc(e, &o[1], W, H))
+        return 1;
+    rc = render(&pics[0], 0, &o[0]);
+    st_check(!rc, "render before pi_stream_open refused", rc);
+    st_check(pi_stream_open(e, &(struct pi_stream_info){.width = 15, .height = 8}) == PI_E_INVALID,
+             "odd stream size: PI_E_INVALID", 0);
+    st_check(pi_stream_open(e, &si) == 0, "stream open", 0);
+
+    /* output validation (P2 #2) */
+    struct pi_output *bad = NULL;
+    st_check(pi_output_import(e, o[1].buf.fd, W, H, W * 4 - 4, o[1].buf.size, &bad) == PI_E_INVALID,
+             "output stride below width x 4: PI_E_INVALID", 0);
+    st_check(pi_output_import(e, o[1].buf.fd, W, H, o[1].stride, (uint64_t)o[1].stride * H, &bad) == PI_E_INVALID,
+             "output a row short: PI_E_INVALID", 0);
+    off_t real = lseek(o[1].buf.fd, 0, SEEK_END);   /* the kernel's size: its page size may exceed ours */
+    lseek(o[1].buf.fd, 0, SEEK_SET);
+    st_check(pi_output_import(e, o[1].buf.fd, W, H, o[1].stride, (uint64_t)real + 1, &bad) == PI_E_INVALID,
+             "output claiming more bytes than the dmabuf: PI_E_INVALID", (int)(real & 0x7fffffff));
+    rc = pi_output_import(e, o[1].buf.fd, W / 2, H / 2, o[1].stride / 2, o[1].buf.size, &bad);
+    if (!rc) {
+        f = (struct pi_frame){.bl = pics[0].bl, .el = g_fel ? pics[0].el : NULL, .rpu = pics[0].dovi->data,
+                              .rpu_size = pics[0].dovi->size, .acquire_fd = -1};
+        st_check(pi_render(e, &f, bad, NULL) == PI_E_INVALID, "render into an output of another size: PI_E_INVALID", 0);
+        pi_output_release(e, bad);
+    } else
+        st_check(0, "importing a half-size output", rc);
+
+    /* input validation (P2 #1) */
+    AVFrame *fake = av_frame_alloc();
+    fake->format = AV_PIX_FMT_YUV420P10;
+    fake->width = (int)W;
+    fake->height = (int)H;
+    f = (struct pi_frame){.bl = fake, .rpu = pics[0].dovi->data, .rpu_size = pics[0].dovi->size, .acquire_fd = -1};
+    st_check(pi_render(e, &f, o[0].out, NULL) == PI_E_UNSUPPORTED_FORMAT, "a software frame: PI_E_UNSUPPORTED_FORMAT", 0);
+    fake->format = AV_PIX_FMT_DRM_PRIME;
+    fake->width = (int)W / 2;
+    st_check(pi_render(e, &f, o[0].out, NULL) == PI_E_UNSUPPORTED_FORMAT, "a frame of another size: PI_E_UNSUPPORTED_FORMAT", 0);
+    fake->width = (int)W;   /* DRM PRIME, no descriptor */
+    st_check(pi_render(e, &f, o[0].out, NULL) == PI_E_UNSUPPORTED_FORMAT, "DRM PRIME without a descriptor: PI_E_UNSUPPORTED_FORMAT", 0);
+    av_frame_free(&fake);
+    static const uint8_t junk[64];
+    f = (struct pi_frame){.bl = pics[0].bl, .el = g_fel ? pics[0].el : NULL, .rpu = junk, .rpu_size = sizeof(junk),
+                          .acquire_fd = -1};
+    rc = pi_render(e, &f, o[0].out, NULL);
+    st_check(rc == PI_E_BAD_RPU || rc == PI_E_UNSUPPORTED_PLAN, "a junk RPU: refused, PI_E_BAD_RPU or _UNSUPPORTED_PLAN", rc);
+
+    /* frame lifetime (P0 #4): the engine holds the frames until the GPU is done */
+    uint64_t want = 0, got = 0;
+    for (int k = 0; k < 2; k++)   /* the first render after a stream opens refreshes the metadata */
+        if (render(&pics[0], 0, &o[0]) && !pi_output_wait(e, o[0].out))
+            want = out_hash(&o[0]);
+    int before = av_buffer_get_ref_count(pics[0].bl->buf[0]);
+    struct dv_picture c = {.bl = av_frame_clone(pics[0].bl), .el = pics[0].el ? av_frame_clone(pics[0].el) : NULL,
+                           .dovi = pics[0].dovi};
+    int ok = render(&c, 0, &o[0]);
+    dv_picture_free(&c);   /* the caller's references gone before the GPU is done */
+    int held = av_buffer_get_ref_count(pics[0].bl->buf[0]);
+    if (ok && !pi_output_wait(e, o[0].out))
+        got = out_hash(&o[0]);
+    pi_output_done(e, o[0].out);
+    int after = av_buffer_get_ref_count(pics[0].bl->buf[0]);
+    st_check(ok && held == before + 1, "after pi_render the engine holds a reference to the BL frame", held - before);
+    st_check(after == before, "after the render, the engine has dropped it", after - before);
+    st_check(want && got == want, "the caller's frames freed right after pi_render: the same output", 0);
+
+    /* every picture, three in flight; then the pipeline cache's growth (P0 #2) */
+    int rendered = 0;
+    for (int i = 0; i < count; i++) {
+        pi_output_wait(e, o[i & 1].out);
+        rendered += render(&pics[i], i * period, &o[i & 1]);
+    }
+    pi_output_wait(e, o[0].out);
+    pi_output_wait(e, o[1].out);
+    st_check(rendered == count, "every picture rendered", rendered);
+    if (lc.mmr) {
+        /* the stream's family: 9 MMR order pairs, times the split's guard on
+         * and off in the modes that use the split */
+        int family = base.mmr == PI_MMR_SPLIT || base.mmr == PI_MMR_EXACT ? 18 : 9;
+        for (int s = 0; s < 120 && lc.variants < family; s++) {   /* the worker (lavapipe compiles slowly) */
+            struct timespec one = {1, 0};
+            nanosleep(&one, NULL);
+        }
+        st_check(lc.variants >= family,
+                 family > 16 ? "the stream's 18 P1 variants built ahead (more than the old fixed cache's 16)"
+                             : "the stream's 9 P1 variants built ahead",
+                 lc.variants);
+    } else
+        printf("selftest: (no MMR: no variants built ahead to count)\n");
+
+    /* stream close releases the imports (P0 #3); a new stream works */
+    pi_stream_close(e);
+    st_check(lc.closed == 1 && lc.released > 0, "stream close released its imports", lc.released);
+    ok = pi_stream_open(e, &si) == 0;
+    for (int k = 0; k < 2 && ok; k++)   /* the second render: past the new stream's refresh */
+        ok = render(&pics[0], 0, &o[0]) && !pi_output_wait(e, o[0].out);
+    st_check(ok && out_hash(&o[0]) == want, "a new stream: imports again, the same output", 0);
+
+    /* teardown with renders in flight and outputs still imported (P0 #5) */
+    for (int i = 0; i < 3 && i < count; i++)
+        render(&pics[i], i * period, &o[i & 1]);
+    pi_engine_destroy(e);   /* no waits, no releases first */
+    g_pi = NULL;
+    for (int i = 0; i < 2; i++)
+        if (o[i].buf.map)
+            dv_dmabuf_free(&o[i].buf);
+    st_check(1, "destroy with renders in flight and outputs imported (the validation layer checks the rest)", 0);
+    printf("selftest: %d of %d passed\n", st_runs - st_fails, st_runs);
+    return st_fails ? 1 : 0;
+}
+
 /* --probe: what dvbench and the engine need from this machine. */
 static int probe(struct pi_options *po)
 {
@@ -736,6 +919,8 @@ int main(int argc, char **argv)
             g_reopen = 1;
         else if (!strcmp(a, "--kms-writeback"))
             g_kms = 1;
+        else if (!strcmp(a, "--selftest"))
+            g_selftest = 1;
         else if (!strcmp(a, "--el-sw"))
             so.el_software = 1;
         else if (!strcmp(a, "--frames") && takes) {
@@ -867,6 +1052,15 @@ int main(int argc, char **argv)
         printf("decode: of that, %.1f ms/picture copying into SAND128 dmabufs\n", copy_ms / count);
     AVRational rate = dv_source_rate(src);
     double period = rate.num > 0 ? (double)rate.den / rate.num : 1.0 / 24;
+
+    if (g_selftest) {
+        int r = selftest(po, pics, count, W, H, period);
+        for (int i = 0; i < count; i++)
+            dv_picture_free(&pics[i]);
+        dv_source_close(src);
+        free(pics);
+        return r;
+    }
 
     /* 2. The engine, the stream and three outputs. */
     int rc = pi_engine_create(&po, &g_pi);

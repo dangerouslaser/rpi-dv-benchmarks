@@ -26,8 +26,8 @@ The design, its routes, MMR modes and measurements are in
 about each finding are in [docs/REVIEW.md](docs/REVIEW.md).
 
 Licence: GPL-2.0-or-later ([LICENSE](LICENSE)), as Kodi. Third-party pieces
-keep their notices: `engine/planner/LICENSE` (dovi_tool's MIT parts,
-libplacebo's LGPL-2.1 overlay coefficients) and `patches/ffmpeg/` (FFmpeg's
+keep their notices: `engine/planner/LICENSE` (dovi_tool's MIT parts, and
+`dm_cm4.c`'s GPL-2.0-or-later origins) and `patches/ffmpeg/` (FFmpeg's
 terms).
 
 ## Layout
