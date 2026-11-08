@@ -1,0 +1,642 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Bryan Hoban <bryan.hoban@gmail.com>
+Date: Sun, 8 Nov 2026 11:42:38 -0500
+Subject: [PATCH 8/8] RPi5: kodi: composite subtitles into the Dolby Vision
+ signal
+
+Subtitles drawn over the tunnel frame by the display come out in wrong
+colours, since the TV decodes them as signal. Draw them offscreen and
+let the engine composite them into the picture's signal.
+
+Signed-off-by: Bryan Hoban <bryan.hoban@gmail.com>
+---
+ ...PRIME-composite-subtitles-into-the-D.patch | 617 ++++++++++++++++++
+ 1 file changed, 617 insertions(+)
+ create mode 100644 projects/RPi/devices/RPi5/patches/kodi/0007-VideoPlayer-DRM-PRIME-composite-subtitles-into-the-D.patch
+
+diff --git a/projects/RPi/devices/RPi5/patches/kodi/0007-VideoPlayer-DRM-PRIME-composite-subtitles-into-the-D.patch b/projects/RPi/devices/RPi5/patches/kodi/0007-VideoPlayer-DRM-PRIME-composite-subtitles-into-the-D.patch
+new file mode 100644
+index 0000000000..42a7759b84
+--- /dev/null
++++ b/projects/RPi/devices/RPi5/patches/kodi/0007-VideoPlayer-DRM-PRIME-composite-subtitles-into-the-D.patch
+@@ -0,0 +1,617 @@
++From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
++From: Bryan Hoban <bryan.hoban@gmail.com>
++Date: Sun, 8 Nov 2026 11:15:00 -0500
++Subject: [PATCH 7/7] [VideoPlayer] DRM PRIME: composite subtitles into the
++ Dolby Vision signal
++
++In standard Dolby Vision the sink decodes every pixel of the tunnel
++frame as the packed 12-bit signal, so subtitles the display blends over
++it from the GUI plane come out in the wrong colours: white text turns
++purple.
++
++Let a renderer draw the overlays into the video itself
++(CBaseRenderer::RenderOverlays). While the tunnel is used,
++CRendererDRMPRIME draws them into an offscreen buffer of the GUI's size,
++a dma-buf, and libpi_engine composites them into the picture's signal,
++which also reports the whole picture as the active area while they are
++shown. The overlays report the area they draw (COverlay::GetBounds), so
++the engine composites only there. A change over a paused picture
++renders it again.
++
++Signed-off-by: Bryan Hoban <bryan.hoban@gmail.com>
++---
++ .../VideoPlayer/VideoRenderers/BaseRenderer.h    |   8 +
++ .../HwDecRender/DVTunnelDRMPRIME.cpp             | 214 +++++++++++++++++++
++ .../HwDecRender/DVTunnelDRMPRIME.h               |  29 +++
++ .../HwDecRender/RendererDRMPRIME.cpp             |  23 ++
++ .../HwDecRender/RendererDRMPRIME.h               |   1 +
++ .../VideoRenderers/OverlayRenderer.cpp           |  14 ++
++ .../VideoPlayer/VideoRenderers/OverlayRenderer.h |   7 +
++ .../VideoRenderers/OverlayRendererGLES.cpp       |  17 ++
++ .../VideoRenderers/OverlayRendererGLES.h         |   3 +
++ .../VideoPlayer/VideoRenderers/RenderManager.cpp |   3 +-
++ 10 files changed, 318 insertions(+), 1 deletion(-)
++
++diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/BaseRenderer.h b/xbmc/cores/VideoPlayer/VideoRenderers/BaseRenderer.h
++index 4efda66..8c7fae9 100644
++--- a/xbmc/cores/VideoPlayer/VideoRenderers/BaseRenderer.h
+++++ b/xbmc/cores/VideoPlayer/VideoRenderers/BaseRenderer.h
++@@ -50,6 +50,11 @@ struct CaptureSpec;
++ struct CaptureResult;
++ } // namespace KODI::RENDERING::CAPTURE
++ 
+++namespace OVERLAY
+++{
+++class CRenderer;
+++}
+++
++ class CBaseRenderer
++ {
++ public:
++@@ -84,6 +89,9 @@ public:
++   virtual void Update() = 0;
++   virtual void RenderUpdate(
++       int index, int index2, bool clear, unsigned int flags, unsigned int alpha) = 0;
+++  //! \brief Renders the overlays (subtitles) of buffer index into the video itself.
+++  //! False: they are drawn over it, in the GUI.
+++  virtual bool RenderOverlays(OVERLAY::CRenderer& overlays, int index) { return false; }
++   virtual bool ConfigChanged(const VideoPicture &picture) = 0;
++ 
++   // Feature support
++diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.cpp
++index 8076608..0feb5cc 100644
++--- a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.cpp
+++++ b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.cpp
++@@ -8,26 +8,40 @@
++ 
++ #include "DVTunnelDRMPRIME.h"
++ 
+++#include "ServiceBroker.h"
++ #include "cores/VideoPlayer/Buffers/VideoBufferDRMPRIME.h"
++ #include "filesystem/SpecialProtocol.h"
++ #include "threads/CriticalSection.h"
+++#include "utils/EGLFence.h"
+++#include "utils/EGLImage.h"
++ #include "utils/StringUtils.h"
++ #include "utils/log.h"
+++#include "windowing/GraphicContext.h"
+++#include "windowing/WinSystem.h"
+++#include "windowing/linux/WinSystemEGL.h"
++ 
+++#include <algorithm>
+++#include <cmath>
++ #include <deque>
+++#include <iterator>
++ #include <mutex>
++ #include <vector>
++ 
++ #include <drm_fourcc.h>
++ #include <fcntl.h>
++ #include <linux/dma-heap.h>
+++#include <poll.h>
++ #include <sys/ioctl.h>
++ #include <unistd.h>
++ 
+++#include "system_gl.h"
+++
++ namespace
++ {
++ // one on the plane, one leaving it, one being rendered, one spare
++ constexpr int OUTPUTS = 4;
+++// one the renders read, one being drawn, one spare
+++constexpr int OVERLAYS = 3;
++ 
++ void Log(void* /*opaque*/, pi_log_level level, const char* message)
++ {
++@@ -147,6 +161,18 @@ private:
++   std::deque<int> m_free;
++ };
++ 
+++//! \brief An offscreen buffer for the subtitles: an ARGB8888 linear dma-buf, drawn by GL
+++struct CDVTunnelDRMPRIME::Overlay
+++{
+++  int fd = -1;
+++  pi_overlay* overlay = nullptr;
+++  std::unique_ptr<CEGLImage> image;
+++  GLuint texture = 0;
+++  GLuint framebuffer = 0;
+++  //! the last render reading it, a sync_file
+++  int busy = -1;
+++};
+++
++ bool CDVTunnelDRMPRIME::Supports(const VideoPicture& picture)
++ {
++   if (picture.hdrType != StreamHdrType::HDR_TYPE_DOLBYVISION ||
++@@ -251,9 +277,177 @@ CDVTunnelDRMPRIME::~CDVTunnelDRMPRIME()
++   pi_stream_close(m_engine);
++   if (m_pool)
++     m_pool->ReleaseImports(m_engine);
+++  ReleaseOverlays();
++   pi_engine_destroy(m_engine);
++ }
++ 
+++bool CDVTunnelDRMPRIME::AllocateOverlays(unsigned int width, unsigned int height)
+++{
+++  ReleaseOverlays();
+++
+++  auto* winSystem =
+++      dynamic_cast<KODI::WINDOWING::LINUX::CWinSystemEGL*>(CServiceBroker::GetWinSystem());
+++  if (!winSystem)
+++    return false;
+++
+++  const uint32_t stride = width * 4;
+++  const uint64_t size = (static_cast<uint64_t>(stride) * height + 4095) & ~static_cast<uint64_t>(4095);
+++  GLint framebuffer = 0;
+++  glGetIntegerv(GL_FRAMEBUFFER_BINDING, &framebuffer);
+++
+++  bool ok = true;
+++  for (int i = 0; i < OVERLAYS && ok; i++)
+++  {
+++    auto& overlay = m_overlays.emplace_back(std::make_unique<Overlay>());
+++    overlay->fd = AllocateDmaBuf(size);
+++    if (overlay->fd < 0 || pi_overlay_import(m_engine, overlay->fd, width, height, stride, size,
+++                                             &overlay->overlay) != PI_OK)
+++    {
+++      ok = false;
+++      break;
+++    }
+++
+++    CEGLImage::EglAttrs attrs;
+++    attrs.width = static_cast<int>(width);
+++    attrs.height = static_cast<int>(height);
+++    attrs.format = DRM_FORMAT_ARGB8888;
+++    attrs.planes[0].fd = overlay->fd;
+++    attrs.planes[0].pitch = static_cast<int>(stride);
+++    attrs.planes[0].modifier = DRM_FORMAT_MOD_LINEAR;
+++    overlay->image = std::make_unique<CEGLImage>(winSystem->GetEGLDisplay());
+++    if (!overlay->image->CreateImage(attrs))
+++    {
+++      ok = false;
+++      break;
+++    }
+++
+++    glGenTextures(1, &overlay->texture);
+++    glBindTexture(GL_TEXTURE_2D, overlay->texture);
+++    overlay->image->UploadImage(GL_TEXTURE_2D);
+++    glBindTexture(GL_TEXTURE_2D, 0);
+++    glGenFramebuffers(1, &overlay->framebuffer);
+++    glBindFramebuffer(GL_FRAMEBUFFER, overlay->framebuffer);
+++    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, overlay->texture, 0);
+++    ok = glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+++  }
+++
+++  glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+++  if (!ok)
+++    return false;
+++
+++  m_overlayWidth = width;
+++  m_overlayHeight = height;
+++  return true;
+++}
+++
+++void CDVTunnelDRMPRIME::ReleaseOverlays()
+++{
+++  for (auto& overlay : m_overlays)
+++  {
+++    if (overlay->overlay)
+++      pi_overlay_release(m_engine, overlay->overlay);
+++    if (overlay->framebuffer)
+++      glDeleteFramebuffers(1, &overlay->framebuffer);
+++    if (overlay->texture)
+++      glDeleteTextures(1, &overlay->texture);
+++    if (overlay->image)
+++      overlay->image->DestroyImage();
+++    if (overlay->fd >= 0)
+++      close(overlay->fd);
+++    if (overlay->busy >= 0)
+++      close(overlay->busy);
+++  }
+++  m_overlays.clear();
+++  m_overlayWidth = m_overlayHeight = 0;
+++  m_overlayShown = -1;
+++  if (m_overlayFence >= 0)
+++    close(m_overlayFence);
+++  m_overlayFence = -1;
+++}
+++
+++bool CDVTunnelDRMPRIME::DrawOverlay(const std::function<CRect()>& draw)
+++{
+++  if (m_overlayFailed)
+++    return false;
+++
+++  const RESOLUTION_INFO& info = CServiceBroker::GetWinSystem()->GetGfxContext().GetResInfo();
+++  const auto width = static_cast<unsigned int>(info.iWidth);
+++  const auto height = static_cast<unsigned int>(info.iHeight);
+++  if (width != m_overlayWidth || height != m_overlayHeight)
+++  {
+++    if (!AllocateOverlays(width, height))
+++    {
+++      CLog::Log(LOGERROR,
+++                "CDVTunnelDRMPRIME: no {}x{} buffers for the subtitles: drawn over the picture",
+++                width, height);
+++      ReleaseOverlays();
+++      m_overlayFailed = true;
+++      return false;
+++    }
+++  }
+++
+++  // the buffer after the one shown; the renders reading it are done by now, or nearly
+++  const int next = (m_overlayShown + 1) % OVERLAYS;
+++  Overlay& overlay = *m_overlays[next];
+++  if (overlay.busy >= 0)
+++  {
+++    pollfd pfd{overlay.busy, POLLIN, 0};
+++    poll(&pfd, 1, 100);
+++    close(overlay.busy);
+++    overlay.busy = -1;
+++  }
+++
+++  GLint framebuffer = 0;
+++  GLfloat clear[4];
+++  glGetIntegerv(GL_FRAMEBUFFER_BINDING, &framebuffer);
+++  glGetFloatv(GL_COLOR_CLEAR_VALUE, clear);
+++  const bool scissor = glIsEnabled(GL_SCISSOR_TEST);
+++
+++  glBindFramebuffer(GL_FRAMEBUFFER, overlay.framebuffer);
+++  glDisable(GL_SCISSOR_TEST);
+++  glClearColor(0, 0, 0, 0);
+++  glClear(GL_COLOR_BUFFER_BIT);
+++  if (scissor)
+++    glEnable(GL_SCISSOR_TEST);
+++  CRect area = draw();
+++  glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+++  glClearColor(clear[0], clear[1], clear[2], clear[3]);
+++
+++  // filtered edges reach a pixel past the area
+++  if (!area.IsEmpty())
+++  {
+++    area = CRect(std::floor(area.x1) - 2, std::floor(area.y1) - 2, std::ceil(area.x2) + 2,
+++                 std::ceil(area.y2) + 2);
+++    area.Intersect(CRect(0, 0, static_cast<float>(width), static_cast<float>(height)));
+++  }
+++  if (area.IsEmpty())
+++  {
+++    m_overlayChanged |= m_overlayShown >= 0;
+++    m_overlayShown = -1;
+++    return true;
+++  }
+++
+++  auto* winSystem =
+++      dynamic_cast<KODI::WINDOWING::LINUX::CWinSystemEGL*>(CServiceBroker::GetWinSystem());
+++  KODI::UTILS::EGL::CEGLFence fence(winSystem->GetEGLDisplay());
+++  fence.CreateGPUFence();
+++  glFlush();
+++  const int fd = fence.FlushFence();
+++  if (fd < 0)
+++    glFinish();
+++  if (m_overlayFence >= 0)
+++    close(m_overlayFence);
+++  m_overlayFence = fd;
+++
+++  m_overlayRect[0] = static_cast<uint32_t>(area.x1);
+++  m_overlayRect[1] = static_cast<uint32_t>(area.y1);
+++  m_overlayRect[2] = static_cast<uint32_t>(area.x2);
+++  m_overlayRect[3] = static_cast<uint32_t>(area.y2);
+++  m_overlayShown = next;
+++  m_overlayChanged = true;
+++  return true;
+++}
+++
++ bool CDVTunnelDRMPRIME::SetOptions(const Options& options)
++ {
++   if (options == m_options)
++@@ -319,7 +513,17 @@ CVideoBufferDRMPRIME* CDVTunnelDRMPRIME::Render(CVideoBufferDRMPRIME* buffer, in
++   frame.chroma_top_left = pi_chroma_top_left(frame.bl, m_info.profile);
++   frame.pts_us = static_cast<int64_t>(buffer->GetPicture().pts);
++   frame.acquire_fd = -1;
+++  if (m_overlayShown >= 0)
+++  {
+++    frame.overlay = m_overlays[m_overlayShown]->overlay;
+++    std::copy(std::begin(m_overlayRect), std::end(m_overlayRect), frame.overlay_rect);
+++    // GL's rows are bottom first
+++    frame.overlay_bottom_up = 1;
+++  }
+++  // the overlay's sync_file: each render takes one
+++  auto overlayFence = [this] { return m_overlayFence >= 0 ? dup(m_overlayFence) : -1; };
++ 
+++  frame.overlay_fd = overlayFence();
++   int ret = pi_render(m_engine, &frame, output->m_output, &fence);
++   if (ret == PI_E_UNSUPPORTED_PLAN && el && !frame.el)
++   {
++@@ -328,6 +532,7 @@ CVideoBufferDRMPRIME* CDVTunnelDRMPRIME::Render(CVideoBufferDRMPRIME* buffer, in
++       CLog::Log(LOGWARNING, "CDVTunnelDRMPRIME: full enhancement layer: rendered with it");
++     m_warnedEnhancementLayer = true;
++     frame.el = el;
+++    frame.overlay_fd = overlayFence();
++     ret = pi_render(m_engine, &frame, output->m_output, &fence);
++   }
++   if (ret != PI_OK)
++@@ -338,5 +543,14 @@ CVideoBufferDRMPRIME* CDVTunnelDRMPRIME::Render(CVideoBufferDRMPRIME* buffer, in
++     return nullptr;
++   }
++ 
+++  if (m_overlayShown >= 0 && fence >= 0)
+++  {
+++    Overlay& overlay = *m_overlays[m_overlayShown];
+++    if (overlay.busy >= 0)
+++      close(overlay.busy);
+++    overlay.busy = dup(fence);
+++  }
+++  m_overlayChanged = false;
+++
++   return output;
++ }
++diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.h b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.h
++index 524ae9d..a02cfd6 100644
++--- a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.h
+++++ b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.h
++@@ -8,8 +8,12 @@
++ 
++ #pragma once
++ 
+++#include "utils/Geometry.h"
+++
+++#include <functional>
++ #include <memory>
++ #include <string>
+++#include <vector>
++ 
++ extern "C"
++ {
++@@ -66,8 +70,22 @@ public:
++    */
++   CVideoBufferDRMPRIME* Render(CVideoBufferDRMPRIME* buffer, int& fence);
++ 
+++  /*!
+++   * \brief Draws the graphics the next renders composite into the picture (subtitles), into an
+++   * offscreen buffer of the GUI's size, with the GUI's GL context current.
+++   * \param draw Issues the GL calls, as into the GUI's framebuffer; returns the area drawn
+++   * \return False if there is no offscreen buffer: draw wasn't called
+++   */
+++  bool DrawOverlay(const std::function<CRect()>& draw);
+++  //! \brief Whether the overlay changed since the last Render
+++  bool OverlayChanged() const { return m_overlayChanged; }
+++
++ private:
+++  struct Overlay;
+++
++   CDVTunnelDRMPRIME() = default;
+++  bool AllocateOverlays(unsigned int width, unsigned int height);
+++  void ReleaseOverlays();
++ 
++   pi_engine* m_engine = nullptr;
++   pi_stream_info m_info{};
++@@ -76,4 +94,15 @@ private:
++   std::shared_ptr<CDVTunnelOutputPool> m_pool;
++   unsigned int m_failures = 0;
++   bool m_warnedEnhancementLayer = false;
+++
+++  std::vector<std::unique_ptr<Overlay>> m_overlays;
+++  unsigned int m_overlayWidth = 0;
+++  unsigned int m_overlayHeight = 0;
+++  bool m_overlayFailed = false;
+++  //! the overlay the renders composite, -1 none; its area, GUI pixels, rows top first
+++  int m_overlayShown = -1;
+++  uint32_t m_overlayRect[4]{};
+++  //! the overlay's drawing, a sync_file
+++  int m_overlayFence = -1;
+++  bool m_overlayChanged = false;
++ };
++diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIME.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIME.cpp
++index 0609f0c..41e6843 100644
++--- a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIME.cpp
+++++ b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIME.cpp
++@@ -26,6 +26,7 @@
++ 
++ #if defined(HAVE_PIDV)
++ #include "DVTunnelDRMPRIME.h"
+++#include "cores/VideoPlayer/VideoRenderers/OverlayRenderer.h"
++ #include "settings/SettingUtils.h"
++ #include "settings/lib/SettingDefinitions.h"
++ #endif
++@@ -430,6 +431,13 @@ void CRendererDRMPRIME::RenderUpdate(
++ {
++   if (m_iLastRenderBuffer == index && m_videoLayerBridge)
++   {
+++#if defined(HAVE_PIDV)
+++    // the subtitles changed over the picture shown (paused)
+++    auto* shown = dynamic_cast<CVideoBufferDRMPRIME*>(m_buffers[index].videoBuffer);
+++    if (m_dolbyVision && m_dolbyVision->OverlayChanged() && shown && shown->IsValid() &&
+++        RenderDolbyVision(shown))
+++      return;
+++#endif
++     m_videoLayerBridge->UpdateVideoPlane();
++     return;
++   }
++@@ -460,6 +468,21 @@ void CRendererDRMPRIME::RenderUpdate(
++   m_iLastRenderBuffer = index;
++ }
++ 
+++bool CRendererDRMPRIME::RenderOverlays(OVERLAY::CRenderer& overlays, int index)
+++{
+++#if defined(HAVE_PIDV)
+++  // composited into the tunnel's signal: over it, the sink would decode them as signal
+++  if (m_dolbyVision)
+++    return m_dolbyVision->DrawOverlay(
+++        [&overlays, index]
+++        {
+++          overlays.Render(index);
+++          return overlays.GetRenderedBounds();
+++        });
+++#endif
+++  return false;
+++}
+++
++ bool CRendererDRMPRIME::ConfigChanged(const VideoPicture& picture)
++ {
++   if (picture.videoBuffer->GetFormat() != m_format)
++diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIME.h b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIME.h
++index 83fcdc6..b3a0106 100644
++--- a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIME.h
+++++ b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIME.h
++@@ -42,6 +42,7 @@ public:
++   void Update() override;
++   void RenderUpdate(
++       int index, int index2, bool clear, unsigned int flags, unsigned int alpha) override;
+++  bool RenderOverlays(OVERLAY::CRenderer& overlays, int index) override;
++   bool ConfigChanged(const VideoPicture& picture) override;
++ 
++   // Feature support
++diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/OverlayRenderer.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/OverlayRenderer.cpp
++index f3d63e0..957f722 100644
++--- a/xbmc/cores/VideoPlayer/VideoRenderers/OverlayRenderer.cpp
+++++ b/xbmc/cores/VideoPlayer/VideoRenderers/OverlayRenderer.cpp
++@@ -46,6 +46,12 @@ COverlay::COverlay()
++ 
++ COverlay::~COverlay() = default;
++ 
+++CRect COverlay::GetBounds(const SRenderState& state) const
+++{
+++  const CGraphicContext& gfx = CServiceBroker::GetWinSystem()->GetGfxContext();
+++  return CRect(0, 0, static_cast<float>(gfx.GetWidth()), static_cast<float>(gfx.GetHeight()));
+++}
+++
++ void OVERLAY::MarkDirty()
++ {
++   CServiceBroker::GetGUI()->GetWindowManager().MarkDirty();
++@@ -150,6 +156,7 @@ void CRenderer::ReleaseUnused()
++ void CRenderer::Render(int idx, float depth)
++ {
++   std::unique_lock lock(m_section);
+++  m_renderedBounds = CRect();
++ 
++   // during HDR composite the m_isHDROverlay overlays render via
++   // RenderHDROverlays instead
++@@ -296,6 +303,13 @@ void CRenderer::Render(COverlay* o)
++ 
++   state.x += GetStereoscopicDepth();
++ 
+++  const CRect bounds = o->GetBounds(state);
+++  const CGraphicContext& gfx = CServiceBroker::GetWinSystem()->GetGfxContext();
+++  m_renderedBounds.Union(CRect(gfx.ScaleFinalXCoord(bounds.x1, bounds.y1),
+++                               gfx.ScaleFinalYCoord(bounds.x1, bounds.y1),
+++                               gfx.ScaleFinalXCoord(bounds.x2, bounds.y2),
+++                               gfx.ScaleFinalYCoord(bounds.x2, bounds.y2)));
+++
++   o->Render(state);
++ }
++ 
++diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/OverlayRenderer.h b/xbmc/cores/VideoPlayer/VideoRenderers/OverlayRenderer.h
++index 8977a27..b9a39e1 100644
++--- a/xbmc/cores/VideoPlayer/VideoRenderers/OverlayRenderer.h
+++++ b/xbmc/cores/VideoPlayer/VideoRenderers/OverlayRenderer.h
++@@ -61,6 +61,9 @@ namespace OVERLAY {
++ 
++     virtual void Render(SRenderState& state) = 0;
++ 
+++    //! \brief The area Render(state) draws into, in the state's coordinates
+++    virtual CRect GetBounds(const SRenderState& state) const;
+++
++     enum EType
++     {
++       TYPE_NONE,
++@@ -113,6 +116,9 @@ namespace OVERLAY {
++     void AddOverlay(std::shared_ptr<CDVDOverlay> o, double pts, int index);
++     virtual void Render(int idx, float depth = 0.0f);
++ 
+++    //! \brief The screen area the last Render(idx) drew into, empty if none
+++    const CRect& GetRenderedBounds() const { return m_renderedBounds; }
+++
++     // render overlays already in HDR (not sRGB)
++     void RenderHDROverlays(int idx);
++ 
++@@ -192,6 +198,7 @@ namespace OVERLAY {
++ 
++     void Render(COverlay* o);
++     std::shared_ptr<COverlay> Convert(SElement& e);
+++    CRect m_renderedBounds;
++     // Build a COverlay (cached or freshly created) from the libass output
++     // already produced by PrepareOverlays. Does not call ass_render_frame.
++     std::shared_ptr<COverlay> ConvertLibass(SElement& e);
++diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/OverlayRendererGLES.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/OverlayRendererGLES.cpp
++index 68a7673..54436a0 100644
++--- a/xbmc/cores/VideoPlayer/VideoRenderers/OverlayRendererGLES.cpp
+++++ b/xbmc/cores/VideoPlayer/VideoRenderers/OverlayRendererGLES.cpp
++@@ -313,6 +313,8 @@ COverlayGlyphGLES::COverlayGlyphGLES(ASS_Image* images, float width, float heigh
++ 
++   for (size_t i = 0; i < quads.quad.size(); i++)
++   {
+++    m_vertexBounds.Union(CRect(vs->x * scale_x, vs->y * scale_y, (vs->x + vs->w) * scale_x,
+++                               (vs->y + vs->h) * scale_y));
++     for (int s = 0; s < 4; s++)
++     {
++       vt[s].a = vs->a;
++@@ -377,6 +379,12 @@ COverlayGlyphGLES::COverlayGlyphGLES(ASS_Image* images, float width, float heigh
++   m_vertexCount = vecVertices.size();
++ }
++ 
+++CRect COverlayGlyphGLES::GetBounds(const SRenderState& state) const
+++{
+++  return CRect(state.x + m_vertexBounds.x1 * state.width, state.y + m_vertexBounds.y1 * state.height,
+++               state.x + m_vertexBounds.x2 * state.width, state.y + m_vertexBounds.y2 * state.height);
+++}
+++
++ COverlayGlyphGLES::~COverlayGlyphGLES()
++ {
++   glDeleteTextures(1, &m_texture);
++@@ -450,6 +458,15 @@ void COverlayGlyphGLES::Render(SRenderState& state)
++   glBindTexture(GL_TEXTURE_2D, 0);
++ }
++ 
+++CRect COverlayTextureGLES::GetBounds(const SRenderState& state) const
+++{
+++  if (m_pos == POSITION_RELATIVE)
+++    return CRect(state.x - state.width * 0.5f, state.y - state.height * 0.5f,
+++                 state.x + state.width * 0.5f, state.y + state.height * 0.5f);
+++
+++  return CRect(state.x, state.y, state.x + state.width, state.y + state.height);
+++}
+++
++ COverlayTextureGLES::~COverlayTextureGLES()
++ {
++   glDeleteTextures(1, &m_texture);
++diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/OverlayRendererGLES.h b/xbmc/cores/VideoPlayer/VideoRenderers/OverlayRendererGLES.h
++index 3a3a627..27f06c5 100644
++--- a/xbmc/cores/VideoPlayer/VideoRenderers/OverlayRendererGLES.h
+++++ b/xbmc/cores/VideoPlayer/VideoRenderers/OverlayRendererGLES.h
++@@ -33,6 +33,7 @@ public:
++   ~COverlayTextureGLES() override;
++ 
++   void Render(SRenderState& state) override;
+++  CRect GetBounds(const SRenderState& state) const override;
++ 
++   GLuint m_texture = 0;
++   float m_u;
++@@ -48,6 +49,7 @@ public:
++   ~COverlayGlyphGLES() override;
++ 
++   void Render(SRenderState& state) override;
+++  CRect GetBounds(const SRenderState& state) const override;
++ 
++   struct VERTEX
++   {
++@@ -63,6 +65,7 @@ public:
++   GLsizei m_vertexCount = 0;
++   float m_u;
++   float m_v;
+++  CRect m_vertexBounds;
++ };
++ 
++ } // namespace OVERLAY
++diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.cpp
++index 1bbe704..a47cf86 100644
++--- a/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.cpp
+++++ b/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.cpp
++@@ -652,7 +652,8 @@ void CRenderManager::Render(bool clear, DWORD flags, DWORD alpha, bool gui)
++     CRect src, dst, view;
++     m_pRenderer->GetVideoRect(src, dst, view);
++     m_overlays.SetVideoRect(src, dst, view);
++-    m_overlays.Render(m_presentsource);
+++    if (!m_pRenderer->RenderOverlays(m_overlays, m_presentsource))
+++      m_overlays.Render(m_presentsource);
++ 
++     if (m_renderDebug)
++     {
++-- 
++2.43.0
++
+-- 
+2.43.0
+

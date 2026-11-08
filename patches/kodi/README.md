@@ -15,6 +15,7 @@ series `projects/RPi/patches/kodi/0001–0011`). Apply in order with `git am`.
 | `0004` [VideoPlayer] DRM PRIME: standard Dolby Vision through libpi_engine | The optional dependency `PiDV` (`cmake/modules/FindPiDV.cmake`, pkg-config `pi_engine`, `ENABLE_PIDV`). `CDVTunnelDRMPRIME` (owned by `CRendererDRMPRIME`) renders each Dolby Vision profile 5, 7 or 8 picture into a tunnel frame, on four XRGB8888 linear buffers from the system DMA heap, and the bridge shows it 1:1, fenced. `VideoPicture::doviProfile` carries the stream's profile. `videoplayer.allowedhdrformats` is offered on builds with the engine (`HAVE_PIDV`). |
 | `0005` [VideoPlayer] DRM PRIME: decode the Dolby Vision profile 7 enhancement layer | `CDVELDecoderDRMPRIME` (owned by `CDVDVideoCodecDRMPRIME`): for single-track profile 7 it splits each packet into its layers (`pi_p7_split`), decodes the enhancement layer with a second hardware decoder and pairs the pictures (`pi_pairer`). `CVideoBufferDRMPRIMEFFmpeg` holds the EL frame; the tunnel renders it where the RPU needs it (`pi_frame_needs_el`). |
 | `0006` [VideoPlayer] Dolby Vision settings in the video settings dialog | A "Dolby Vision" group in the in-video Video settings, shown when the renderer reports `RENDERFEATURE_DOLBYVISION`: output on / off, enhancement layer (auto / off), infoframe (auto / HDMI VSIF / Dolby VSIF), and at the Expert settings level only: EL upscale (bilinear, the default / bicubic (Catmull-Rom) / Lanczos3 / Annex B), chroma MMR (exact / split / exact 64-bit / float), filters (CB1 / phase). The dialog follows the settings level chosen in Kodi's settings. Changes apply during playback. |
+| `0007` [VideoPlayer] DRM PRIME: composite subtitles into the Dolby Vision signal | `CBaseRenderer::RenderOverlays`: a renderer may draw the overlays into the video itself. While the tunnel is used, `CRendererDRMPRIME` draws them into one of three offscreen ARGB8888 dma-bufs of the GUI's size (system DMA heap, an EGL image as a GL framebuffer) and `CDVTunnelDRMPRIME` hands the engine that buffer (`pi_overlay_import`), the area drawn and the drawing's fence (an EGL native fence), so the subtitles are composited into the picture's signal with the whole picture as the active area (L5). `COverlay::GetBounds` gives the area each overlay draws (the GLES glyph and texture overlays: their quads). A change over a paused picture renders it again. Needs the engine's API 2 (0.3.0). |
 
 ## When the tunnel is used
 
@@ -33,11 +34,16 @@ log, prefixed `CDVTunnelDRMPRIME:`; its pipeline cache is
   only 1:1: in practice "Adjust display refresh rate" on, with a desktop of
   the stream's size. If the mode stays another size for 100 frames the
   renderer falls back to the decoder's own frames.
-- **The GUI** (OSD, dialogs, subtitles, debug overlays) is composited over
-  the tunnel frame by the display, below its first 8 rows, which carry the
-  metadata packets: the TV stays in Dolby Vision and the GUI is legible,
-  but its colours are wrong, and a dimmed dialog background shifts the
-  video's colours, since the TV decodes those pixels as tunnelled signal.
+- **Subtitles** (text and image) are composited into the picture's
+  signal (`0007`), white at 203 nits. They cost the GPU about 2 ms a
+  picture while shown (the engine's `docs/ENGINE.md`, Performance), which
+  the Annex B EL upscale on 4K FEL doesn't have to spare.
+- **The rest of the GUI** (OSD, dialogs, debug overlays) is composited
+  over the tunnel frame by the display, below its first 8 rows, which
+  carry the metadata packets: the TV stays in Dolby Vision and the GUI is
+  legible, but its colours are wrong, and a dimmed dialog background
+  shifts the video's colours, since the TV decodes those pixels as
+  tunnelled signal.
 - **Enhancement layer off** renders MEL pictures without their EL. The
   engine refuses a FEL picture without its EL (`PI_E_UNSUPPORTED_PLAN`), so
   such a picture is rendered with it, and a warning is logged once.

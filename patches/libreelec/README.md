@@ -13,6 +13,8 @@ with `git am`.
 | `0004` RPi5: Dolby Vision output | `DOLBY_VISION_SUPPORT="yes"` in `projects/RPi/devices/RPi5/options`, and `../kodi/` as `projects/RPi/devices/RPi5/patches/kodi/`. |
 | `0005` pi-dv-engine: download from the libreelec-rpi-dv release | `PKG_URL` / `PKG_SITE`: the engine tarball is an asset of the [libreelec-rpi-dv](https://github.com/dangerouslaser/libreelec-rpi-dv) release `v<version>`. |
 | `0006` pi-dv-engine: update to 0.2.0 | `PKG_VERSION` / `PKG_SHA256` of the 0.2.0 tarball. |
+| `0007` pi-dv-engine: update to 0.3.0 | `PKG_VERSION` / `PKG_SHA256` of the 0.3.0 tarball: `libpi_engine.so.2`, the overlay input. |
+| `0008` RPi5: kodi: composite subtitles into the Dolby Vision signal | `../kodi/0007` as `projects/RPi/devices/RPi5/patches/kodi/0007-…`. |
 
 **Building:** `make image` as usual (`PROJECT=RPi DEVICE=RPi5 ARCH=aarch64`).
 The engine tarball downloads from the release. To build an engine version
