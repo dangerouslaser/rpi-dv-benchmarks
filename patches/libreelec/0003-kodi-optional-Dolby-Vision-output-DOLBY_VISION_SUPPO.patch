@@ -1,7 +1,7 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From 165d54632a28467ccb484e12815f75fafe3179b1 Mon Sep 17 00:00:00 2001
 From: Bryan Hoban <bryan.hoban@gmail.com>
 Date: Sat, 7 Nov 2026 12:24:35 -0500
-Subject: [PATCH 3/4] kodi: optional Dolby Vision output (DOLBY_VISION_SUPPORT)
+Subject: [PATCH 3/6] kodi: optional Dolby Vision output (DOLBY_VISION_SUPPORT)
 
 With DOLBY_VISION_SUPPORT=yes Kodi is built with pi-dv-engine (ENABLE_PIDV) for standard Dolby Vision output.
 

@@ -1,0 +1,31 @@
+From 4f995c42d4df5eaefbffc68c5a348af78edc47b7 Mon Sep 17 00:00:00 2001
+From: Bryan Hoban <bryan.hoban@gmail.com>
+Date: Sat, 7 Nov 2026 15:37:06 -0500
+Subject: [PATCH 5/6] pi-dv-engine: download from the libreelec-rpi-dv release
+
+Signed-off-by: Bryan Hoban <bryan.hoban@gmail.com>
+---
+ packages/multimedia/pi-dv-engine/package.mk | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/packages/multimedia/pi-dv-engine/package.mk b/packages/multimedia/pi-dv-engine/package.mk
+index 72117ffc53..0bc3840578 100644
+--- a/packages/multimedia/pi-dv-engine/package.mk
++++ b/packages/multimedia/pi-dv-engine/package.mk
+@@ -3,10 +3,10 @@
+ 
+ PKG_NAME="pi-dv-engine"
+ PKG_VERSION="0.1.0"
+-PKG_SHA256="8f9d234988d126b429eea8640f92542d3fbaef2ea3c02c5215bc7f15b4bed364"
++PKG_SHA256="0bd5abc6fc61f87fdf4754391c84a8fa39869293650a02f496650bbb8e835ced"
+ PKG_LICENSE="GPL-2.0-or-later"
+-PKG_SITE="https://github.com/dangerouslaser/rpi-dv-benchmarks"
+-PKG_URL="https://github.com/dangerouslaser/rpi-dv-benchmarks/releases/download/v${PKG_VERSION}/${PKG_NAME}-${PKG_VERSION}.tar.xz"
++PKG_SITE="https://github.com/dangerouslaser/libreelec-rpi-dv"
++PKG_URL="https://github.com/dangerouslaser/libreelec-rpi-dv/releases/download/v${PKG_VERSION}/${PKG_NAME}-${PKG_VERSION}.tar.xz"
+ PKG_DEPENDS_TARGET="toolchain ffmpeg vulkan-headers vulkan-loader"
+ PKG_LONGDESC="Dolby Vision reconstruction for the Raspberry Pi 5 GPU (Vulkan), for Kodi."
+ PKG_TOOLCHAIN="cmake"
+-- 
+2.43.0
+

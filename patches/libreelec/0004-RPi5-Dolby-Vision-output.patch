@@ -1,7 +1,7 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From a8483e9f9745106b25f9f752337e60e346e8f3d1 Mon Sep 17 00:00:00 2001
 From: Bryan Hoban <bryan.hoban@gmail.com>
 Date: Sat, 7 Nov 2026 12:24:35 -0500
-Subject: [PATCH 4/4] RPi5: Dolby Vision output
+Subject: [PATCH 4/6] RPi5: Dolby Vision output
 
 Enable DOLBY_VISION_SUPPORT (it needs VULKAN) and carry the Kodi changes for standard Dolby Vision through pi-dv-engine, until they are merged.
 

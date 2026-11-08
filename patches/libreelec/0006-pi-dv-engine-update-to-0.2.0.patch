@@ -1,0 +1,27 @@
+From 999577c88c70034912355f73fc3079840137731a Mon Sep 17 00:00:00 2001
+From: dangerouslaser <bryan.hoban@gmail.com>
+Date: Sat, 7 Nov 2026 21:04:25 -0500
+Subject: [PATCH 6/6] pi-dv-engine: update to 0.2.0
+
+---
+ packages/multimedia/pi-dv-engine/package.mk | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/packages/multimedia/pi-dv-engine/package.mk b/packages/multimedia/pi-dv-engine/package.mk
+index 0bc3840578..0cd067dc0a 100644
+--- a/packages/multimedia/pi-dv-engine/package.mk
++++ b/packages/multimedia/pi-dv-engine/package.mk
+@@ -2,8 +2,8 @@
+ # Copyright (C) 2026-present Team LibreELEC (https://libreelec.tv)
+ 
+ PKG_NAME="pi-dv-engine"
+-PKG_VERSION="0.1.0"
+-PKG_SHA256="0bd5abc6fc61f87fdf4754391c84a8fa39869293650a02f496650bbb8e835ced"
++PKG_VERSION="0.2.0"
++PKG_SHA256="85d079ac3fca5db73ed96663b3e718b0b2ef8e2c3077394affa1017bd81de558"
+ PKG_LICENSE="GPL-2.0-or-later"
+ PKG_SITE="https://github.com/dangerouslaser/libreelec-rpi-dv"
+ PKG_URL="https://github.com/dangerouslaser/libreelec-rpi-dv/releases/download/v${PKG_VERSION}/${PKG_NAME}-${PKG_VERSION}.tar.xz"
+-- 
+2.43.0
+

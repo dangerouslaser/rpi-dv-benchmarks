@@ -1,7 +1,7 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From b85a2e6da833f57cc57789597440d80fff234351 Mon Sep 17 00:00:00 2001
 From: Bryan Hoban <bryan.hoban@gmail.com>
 Date: Sat, 7 Nov 2026 12:24:35 -0500
-Subject: [PATCH 1/4] pi-dv-engine: initial package
+Subject: [PATCH 1/6] pi-dv-engine: initial package
 
 libpi_engine, the Raspberry Pi 5 GPU (Vulkan) Dolby Vision reconstruction that Kodi renders standard Dolby Vision output with.
 

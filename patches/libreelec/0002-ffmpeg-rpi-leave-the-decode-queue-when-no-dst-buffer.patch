@@ -1,7 +1,7 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From 6d936fd8949d6d4eb809cd5f968c64e9c9c7465e Mon Sep 17 00:00:00 2001
 From: Bryan Hoban <bryan.hoban@gmail.com>
 Date: Sat, 7 Nov 2026 12:24:35 -0500
-Subject: [PATCH 2/4] ffmpeg: rpi: leave the decode queue when no dst buffer is
+Subject: [PATCH 2/6] ffmpeg: rpi: leave the decode queue when no dst buffer is
  free
 
 A failed destination buffer allocation in the V4L2 request HEVC decoder left the frame queued, and closing the decoder then hung.
