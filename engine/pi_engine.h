@@ -9,6 +9,7 @@
  *   pi_engine_create            once
  *   pi_stream_open              per stream: its size; resets the planner
  *   pi_output_import            the caller's scanout buffers (pi_output_size)
+ *   pi_overlay_import           optional: the caller's subtitle buffers
  *   pi_render                   per picture, into an output; returns a
  *                               sync_file for the display (or wait on it)
  *   pi_stream_close             waits, releases the stream's imports and frames
@@ -27,13 +28,14 @@ extern "C" {
 /* This header's version: bumped by every change that breaks a caller built
  * against the last (libpi_engine.so.PI_API_VERSION). pi_api_version() is
  * the library's. */
-#define PI_API_VERSION 1
+#define PI_API_VERSION 2
 int pi_api_version(void);
 
 #define PI_FRAMES_IN_FLIGHT 3
 
 struct pi_engine;
 struct pi_output;
+struct pi_overlay;
 
 /* 0 OK; < 0 an error. */
 enum pi_status {
@@ -153,6 +155,18 @@ int pi_output_import(struct pi_engine *e, int fd, uint32_t width, uint32_t heigh
 /* Waits for the output's last render first. */
 void pi_output_release(struct pi_engine *e, struct pi_output *o);
 
+/* Graphics over the picture (subtitles), composited into its Dolby Vision
+ * signal: an overlay is the caller's linear ARGB8888 dmabuf
+ * (DRM_FORMAT_ARGB8888: B, G, R, A bytes) of sRGB with premultiplied alpha,
+ * width x height pixels, stride bytes a row; it is scaled to the output
+ * (bilinear) and composited at 203 nits for white. While one is shown the
+ * metadata's active area (L5) is the whole picture, so the TV maps the
+ * graphics as it does the picture. fd stays the caller's. */
+int pi_overlay_import(struct pi_engine *e, int fd, uint32_t width, uint32_t height, uint32_t stride, uint64_t size,
+                      struct pi_overlay **out);
+/* Waits for the renders reading it first. */
+void pi_overlay_release(struct pi_engine *e, struct pi_overlay *o);
+
 struct pi_frame {
     const AVFrame *bl, *el;       /* AV_PIX_FMT_DRM_PRIME, SAND128 P030; el NULL: none */
     /* The RPU: the side data FFmpeg's HEVC decoder attaches,
@@ -164,6 +178,14 @@ struct pi_frame {
     int chroma_top_left;          /* pi_chroma_top_left() */
     int64_t pts_us;
     int acquire_fd;               /* a sync_file the output is busy until (KMS); -1 none. Taken. */
+    /* The overlay (pi_overlay_import) composited over the picture; NULL or
+     * an empty rectangle: none. The engine reads it until the render's
+     * release sync_file signals: draw into another one meanwhile. */
+    struct pi_overlay *overlay;
+    uint32_t overlay_rect[4];     /* x0, y0, x1, y1 (exclusive), the overlay's pixels, rows top first:
+                                   * where it may be other than transparent (it is ignored outside) */
+    int overlay_bottom_up;        /* the overlay's rows are stored bottom first (a GL framebuffer) */
+    int overlay_fd;               /* with an overlay: a sync_file it is drawn by; -1 none. Taken. */
 };
 /* Plans and renders f into out. The engine holds references to bl and el
  * until the GPU is done with them. release_fd (may be NULL): a sync_file

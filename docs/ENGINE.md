@@ -23,14 +23,19 @@ P0  w/4 × h/2   (bicubic, Annex B and Lanczos EL upscales only) the EL
 P1  w/2 × h/2   chroma: BL chroma phase, luma guide, the EL chroma
                 upscaled, MMR / polynomial / piecewise chroma mapping + NLQ
                 residual → RG16UI chroma (12-bit), R16UI EL luma
+PO  overlay     (with an overlay only) the overlay's pixels in the area it
+                may cover, as the source's signal: (Y, Cb, Cr) codes ×
+                alpha, alpha → RGBA16
 P2  w/2 × h/2   one fragment per 2×2 output block: 4:2:2 vertical filter,
-                luma (mapping + the EL upscaled + NLQ), metadata bits,
-                tunnel packing → the output dmabuf itself (two RG32UI
-                images: its even and its odd rows)
+                luma (mapping + the EL upscaled + NLQ), the overlay
+                composited (where it may touch), metadata bits, tunnel
+                packing → the output dmabuf itself (two RG32UI images: its
+                even and its odd rows)
 ```
 
 - **One render job per pass.** Each pass is a single render pass, which v3dv
-  runs as one V3D render job: two per frame, three with P0. There are no compute dispatches; v3dv makes
+  runs as one V3D render job: two per frame, three with P0, one more with an
+  overlay. There are no compute dispatches; v3dv makes
   every dispatch its own kernel job with a cache flush (`pi5/V3DV.md` §2).
 - **Inputs are the decoder's own buffers.** They are read as `R32UI` texel
   buffers, with no detile copy, and the BL's planes also as `RG32UI` (word
@@ -60,9 +65,10 @@ P2  w/2 × h/2   one fragment per 2×2 output block: 4:2:2 vertical filter,
 | `pi_engine_configure(e, &options)` | a change of MMR mode, filters or EL upscale (a player's settings), from the next `pi_stream_open` |
 | `pi_stream_open(e, &info)` | per stream: its size and profile. Resets the planner (packet ids, cached tables). |
 | `pi_output_import(e, fd, w, h, stride, size, &out)` | per scanout buffer the caller owns; `pi_output_size()` gives the layout |
+| `pi_overlay_import(e, fd, w, h, stride, size, &ov)` | optional: per buffer the caller draws subtitles into (ARGB8888, premultiplied sRGB), named by `frame.overlay` |
 | `pi_render(e, &frame, out, &release_fd)` | per picture: its BL and EL frames. Returns a sync_file signalled when `out` is complete; `frame.acquire_fd` is one the output is busy until (KMS's). |
 | `pi_output_done` / `pi_output_wait` | without sync_files |
-| `pi_stream_close`, `pi_output_release`, `pi_engine_destroy` | release everything, in reverse |
+| `pi_stream_close`, `pi_overlay_release`, `pi_output_release`, `pi_engine_destroy` | release everything, in reverse |
 
 Kodi on LibreELEC drives it through `patches/kodi/` (a renderer component
 and an EL decoder in its DRM PRIME path, and a Dolby Vision group in the
@@ -78,6 +84,30 @@ player.
   picture with CM v4.0 blocks and no RPU buffer is refused
   (`PI_E_UNSUPPORTED_PLAN`), unless its metadata repeats the last RPU's,
   as FFmpeg's does for an access unit without one.
+- **Graphics over the picture (subtitles) go into its signal,** not over
+  the tunnel frame: the TV decodes every pixel of that frame as the packed
+  12-bit signal, so graphics blended over it at scanout come out in the
+  wrong colours (white text turns purple). `frame.overlay` names an
+  overlay, `frame.overlay_rect` the area it may cover (its pixels, rows top
+  first; nothing outside it is read), `overlay_bottom_up` a GL
+  framebuffer's row order and `overlay_fd` a sync_file for its drawing.
+  - **Colour:** yblod's (`planner/source_overlay.c`): sRGB, white at 203
+    nits, BT.709 to BT.2020, then the source's LMS, PQ and its signal
+    matrix, from the planner's coefficients for the picture.
+  - **Composite:** in the signal, as yblod's tunnel kernel does it: each
+    pixel's luma under its own coverage, each pixel pair's chroma under a
+    1:2:1 filter of the coverage at x − 1, x, x + 1.
+  - **Scale:** bilinear, the overlay to the output. At 1:1 and 2× (a 1080p
+    GUI over 4K) the engine applies the exact weights itself. At other
+    scales it uses the sampler's filter, whose 8-bit weights put a
+    neighbour into a texel centre: up to 1/256 of an edge's step.
+  - **Metadata:** while an overlay is shown, the active area (L5) is the
+    whole picture, so the TV maps the graphics as it maps the picture, and
+    a change either way refreshes the metadata.
+  - **Lifetime:** the engine reads an overlay until the render's release
+    sync_file signals. A player draws the next one into another buffer.
+  - **Refusal:** a source whose signal the planner can't express the
+    overlay's colour in is rendered without the overlay, with one warning.
 - **Up to three renders in flight.** `pi_render` waits for the oldest beyond
   that. The engine holds references to the BL and EL frames until the GPU is
   done with them.
@@ -130,7 +160,7 @@ player.
     that gives no pictures by the 8th BL is given up (BLs alone). Flushed on
     a seek.
   `bench/source.c` is the reference for decoding the layers around them.
-- **Build:** `libpi_engine.so.1` (the SONAME follows `PI_API_VERSION`;
+- **Build:** `libpi_engine.so.2` (the SONAME follows `PI_API_VERSION`;
   `pi_api_version()` is the library's), exporting the `pi_*` API only
   (`engine/pi_engine.map`), with `pi_engine.h` and `pi_engine.pc`
   (requires `libavutil`); `-DPI_SHARED=OFF` builds `libpi_engine.a` and
@@ -301,6 +331,12 @@ vertical filter at every EL column and output row, 1920 × 2160) measured
 slower for bicubic and Lanczos and at most 2.5 ms faster for Annex B: its
 4 M fragments cost about what P2's gathers save.
 
+**An overlay's cost** (DV FEL Power Rangers credits, a two-line subtitle
+drawn at 1920×1080, one line over a translucent box: 2316 × 316 output
+pixels): P2 + PO 12.0 → 14.1 ms with the bilinear EL upscale, 18.9 →
+21.7 ms with Annex B. Of it: PO's render job 0.6 ms, its colour 0.35 ms,
+the composite in P2 1.1 ms. Nothing while no overlay is shown.
+
 Notes:
 - The HEVC decoder alone does 44–79 fps for BL and EL, over SMB.
 - The planner takes 0.4–0.7 ms of CPU per frame.
@@ -407,6 +443,14 @@ reads no environment. `--measure` takes the same names, comma-separated.
 | `DVBENCH_ALLOC=udmabuf\|cma\|system` | | the bench's dmabuf allocator (default: the first that works, in the order udmabuf, system, cma: CMA is the Pi decoder's) |
 | `DVBENCH_DV_VSIF=hdmi\|dolby` | | `--kms-play`'s `Dolby Vision` value: the HDMI VSIF (default) or Dolby's |
 
+`dvbench --overlay WxH` composites a synthetic subtitle (two outlined lines,
+white and yellow, the second over a translucent box) drawn at WxH into every
+picture, `--overlay-bottom-up` stores its rows bottom first, and
+`--overlay-check` renders each of the first pictures again without it and
+compares the overlaid output with a CPU reference of the composite over that
+(the planner's colour coefficients): within 1 code at 1:1 and 2×, 16 at
+other scales.
+
 `dvbench --probe` checks the allocator, the device and an output import.
 `--no-fences` makes `--play` wait on the engine instead of the sync_files.
 `--implicit-sync` reports whether the output dmabuf carries an implicit
@@ -441,8 +485,9 @@ On the Pi itself, `V3D_DEBUG=shaderdb` prints the compiler's statistics,
   FEL stream's base layer alone through the engine.
 - **The sharper EL upscales** (`bicubic`, `annexb`, `lanczos`) fit 4K24 FEL
   with MMR chroma only where the film is letterboxed, by GPU time: bicubic
-  with margin, Annex B and Lanczos with 2–3 ms to spare; on a full-height
-  film with MMR chroma none of them does (Performance).
+  with margin, Annex B and Lanczos with 2–3 ms to spare, which a subtitle
+  on screen (about 2 ms) takes; on a full-height film with MMR chroma none
+  of them does (Performance).
 - **`--filters phase` on single-layer MMR** isn't reliably real time at 24p:
   it reshapes both output rows' chroma, twice pass 1's MMR. Profile 8.4's
   opening takes 41.5 ms per picture, an 8.1 MMR cut of 1917 52 ms. With the

@@ -6,6 +6,9 @@
  *   P2  cw x ch   the 4:2:2 filter + luma + pack + metadata, a 2x2 block per
  *                 fragment -> the output's even and odd rows (two RG32UI
  *                 images over the same dmabuf)
+ * With an overlay (subtitles), before P2:
+ *   PO  the overlay's area: its pixels as the source's signal (RGBA16), which
+ *       P2 samples and blends over the picture where the overlay may touch
  * Per frame: plan (CPU), the tables (only when the planner's generation
  * changed), the pipelines (cached; the scene's family built ahead on a
  * worker thread), then record and submit.
@@ -46,6 +49,9 @@ static const uint32_t spv_p1[] =
 static const uint32_t spv_p2[] =
 #include "shaders/p2_pack.frag.h"
     ;
+static const uint32_t spv_po[] =
+#include "shaders/po_overlay.frag.h"
+    ;
 
 /* ---- layouts shared with the shaders --------------------------------------- */
 
@@ -64,8 +70,12 @@ struct params {   /* common.glsl Params, std140 */
     uint32_t narrow[4], pw[4];
     float err[4];
     uint32_t packets[160];
+    float oc[32];
+    uint32_t orect[4], osrc[4];
+    float oinv[4];
 };
-_Static_assert(sizeof(struct params) == 1232, "common.glsl Params");
+_Static_assert(sizeof(struct params) == 1408, "common.glsl Params");
+_Static_assert(offsetof(struct params, oc) == 1232, "common.glsl Params");
 _Static_assert(offsetof(struct params, c32) == 208, "common.glsl Params");
 _Static_assert(offsetof(struct params, packets) == 592, "common.glsl Params");
 _Static_assert(sizeof(((struct params *)0)->packets) == sizeof(((dvvk_plan *)0)->packets), "packets");
@@ -89,14 +99,16 @@ static const struct {
     {12, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER}, /* P0's EL chroma, filtered vertically */
     {13, VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER},   /* BL luma, RG32UI (word pairs) */
     {14, VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER},   /* BL chroma, RG32UI */
+    {15, VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER},   /* PO: the overlay, R32UI */
+    {16, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER}, /* PO's codes, bilinear */
 };
 enum { NB = sizeof(bindings) / sizeof(bindings[0]) };
 
 /* Specialisation keys: P1's constant ids 0..15, and K1_PRE, which selects P0's
- * shader (its METHOD, ELUP and QUAD are P1's ids); P2's 1..7. */
+ * shader (its METHOD, ELUP and QUAD are P1's ids); P2's 1..8. */
 enum { K1_MODE, K1_METHOD, K1_DUAL, K1_KIND0, K1_KIND1, K1_ORDER0, K1_ORDER1, K1_SINGLE, K1_PIECE, K1_ORDER2,
        K1_FAST, K1_MARK, K1_GUARD, K1_ELUP, K1_ELOUT, K1_QUAD, K1_PRE, K1_N };
-enum { K2_ANNEXB, K2_TOP_LEFT, K2_ABLATE, K2_BARS, K2_SINGLE, K2_FULL422, K2_ELUP, K2_N };
+enum { K2_ANNEXB, K2_TOP_LEFT, K2_ABLATE, K2_BARS, K2_SINGLE, K2_FULL422, K2_ELUP, K2_OVERLAY, K2_N };
 enum { MAX_SPEC = 17, KEY_MAX = K1_N };
 _Static_assert((int)K1_N <= (int)MAX_SPEC && (int)K2_N + 1 <= (int)MAX_SPEC, "a specialisation map fits its entries");
 
@@ -149,6 +161,16 @@ struct pi_output {
     struct pi_output *next;
 };
 
+/* An overlay buffer (pi_overlay_import): the caller's ARGB8888 dmabuf as an
+ * R32UI texel buffer. */
+struct pi_overlay {
+    uint32_t w, h, stride;
+    VkBuffer buf;
+    VkDeviceMemory mem;
+    VkBufferView view;
+    struct pi_overlay *next;
+};
+
 /* A frame in flight. */
 struct ctx {
     struct image c420, ely;
@@ -167,6 +189,7 @@ struct ctx {
     VkCommandBuffer cmd;
     VkFence fence;
     VkSemaphore acquire, release;   /* sync_file import / export, where supported */
+    VkSemaphore drawn;              /* the overlay's sync_file, imported */
     int sync_fd;                    /* the render's fence, exported: its completion (-1 none) */
     VkQueryPool qp;
     int busy;
@@ -174,6 +197,7 @@ struct ctx {
     AVFrame *bl, *el;
     struct import *in[4];
     struct pi_output *out;
+    struct pi_overlay *ov;   /* the overlay it reads, NULL none */
     struct pi_render_stats stats;
 };
 
@@ -194,6 +218,7 @@ struct route {
 
 enum {   /* warnings, each once per engine */
     W_PLAN = 1, W_GUARD = 2, W_INPUT = 4, W_PIPELINE = 8, W_IMPORT = 16, W_PLANNER = 32, W_RPU = 64,
+    W_OVERLAY = 128,
 };
 
 struct pi_engine {
@@ -221,11 +246,11 @@ struct pi_engine {
     int modifiers, foreign, sem_fd, fence_fd, profile;
     int quad;   /* fragment shaders have subgroup quad operations */
     double ts_period;
-    VkSampler sampler;
+    VkSampler sampler, bilinear;
     VkDescriptorSetLayout dsl;
     VkPipelineLayout pl;
     VkDescriptorPool dpool;
-    VkRenderPass rp[3];   /* P1, P2, P0 */
+    VkRenderPass rp[4];   /* P1, P2, P0, PO */
     VkPipelineCache cache;
 
     pthread_mutex_t lock;   /* the variants and the prewarm queue */
@@ -234,6 +259,7 @@ struct pi_engine {
     int worker_started, worker_stop, nq;
     pthread_cond_t wake;
     uint32_t queue_keys[64][KEY_MAX];
+    int queue_p2[64];
 
     struct ctx c[PI_FRAMES_IN_FLIGHT];
     unsigned next;
@@ -241,6 +267,16 @@ struct pi_engine {
     struct import *imports;
     int nimports;
     struct pi_output *outputs;
+
+    /* overlays: the imports, and PO's target (shared by the frames in
+     * flight: PO waits for the last P2 reading it), the overlay's size */
+    struct pi_overlay *overlays;
+    struct image codes;
+    VkFramebuffer codes_fb;
+    uint32_t codes_w, codes_h;
+    int codes_read;          /* in SHADER_READ_ONLY_OPTIMAL */
+    VkPipeline po;
+    int overlay_before;      /* the last frame had an overlay (the planner's overlay edge) */
 
     dvvk_plan_state *state;
     dvvk_plan *plan;
@@ -679,7 +715,7 @@ static VkPipeline build(struct pi_engine *e, int p2, const uint32_t *key)
     return p;
 }
 
-/* The worker: builds queued P1 variants ahead of the frames that need them. */
+/* The worker: builds queued variants ahead of the frames that need them. */
 static void *worker_main(void *arg)
 {
     struct pi_engine *e = arg;
@@ -695,22 +731,26 @@ static void *worker_main(void *arg)
         }
         uint32_t key[KEY_MAX];
         memcpy(key, e->queue_keys[--e->nq], sizeof(key));
+        int p2 = e->queue_p2[e->nq];
         pthread_mutex_unlock(&e->lock);
-        build(e, 0, key);
+        build(e, p2, key);
         pthread_mutex_lock(&e->lock);
     }
     pthread_mutex_unlock(&e->lock);
     return NULL;
 }
 
-static void prewarm(struct pi_engine *e, const uint32_t *key)
+static void prewarm(struct pi_engine *e, int p2, const uint32_t *key)
 {
+    uint32_t n = key_n(p2);
     pthread_mutex_lock(&e->lock);
-    int known = find_locked(&e->v1, key, K1_N) != VK_NULL_HANDLE;
+    int known = find_locked(set_of(e, p2), key, n) != VK_NULL_HANDLE;
     for (int i = 0; i < e->nq && !known; i++)
-        known = !memcmp(e->queue_keys[i], key, K1_N * 4);
+        known = e->queue_p2[i] == p2 && !memcmp(e->queue_keys[i], key, n * 4);
     if (!known && e->nq < (int)(sizeof(e->queue_keys) / sizeof(e->queue_keys[0]))) {
-        memcpy(e->queue_keys[e->nq++], key, K1_N * 4);
+        memset(e->queue_keys[e->nq], 0, sizeof(e->queue_keys[0]));
+        memcpy(e->queue_keys[e->nq], key, n * 4);
+        e->queue_p2[e->nq++] = p2;
         pthread_cond_signal(&e->wake);
     }
     pthread_mutex_unlock(&e->lock);
@@ -734,7 +774,7 @@ static void prewarm_family(struct pi_engine *e, const uint32_t *k1)
                 key[K1_GUARD] = g;
                 key[K1_ORDER0] = o0;
                 key[K1_ORDER1] = o1;
-                prewarm(e, key);
+                prewarm(e, 0, key);
             }
 }
 
@@ -1001,7 +1041,7 @@ static int create_ctx(struct pi_engine *e, struct ctx *c)
                                        .descriptorPool = e->dpool, .descriptorSetCount = 1, .pSetLayouts = &e->dsl};
     VKC(e, vkAllocateDescriptorSets(e->dev, &dai, &c->ds));
     VkDescriptorBufferInfo ub = {c->ubo, 0, VK_WHOLE_SIZE}, rb = {c->reshape, 0, VK_WHOLE_SIZE};
-    VkWriteDescriptorSet wr[5] = {
+    VkWriteDescriptorSet wr[6] = {
         {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = c->ds, .dstBinding = 0, .descriptorCount = 1,
          .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .pBufferInfo = &ub},
         {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = c->ds, .dstBinding = 1, .descriptorCount = 1,
@@ -1011,8 +1051,11 @@ static int create_ctx(struct pi_engine *e, struct ctx *c)
         {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = c->ds, .dstBinding = 10, .descriptorCount = 1,
          .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, .pTexelBufferView = &c->tview128},
         {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = c->ds, .dstBinding = 11, .descriptorCount = 1,
-         .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &rb}};
-    vkUpdateDescriptorSets(e->dev, 5, wr, 0, NULL);
+         .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &rb},
+        /* the overlay until a frame has one: any R32UI buffer */
+        {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = c->ds, .dstBinding = 15, .descriptorCount = 1,
+         .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, .pTexelBufferView = &c->tview}};
+    vkUpdateDescriptorSets(e->dev, 6, wr, 0, NULL);
     VkCommandBufferAllocateInfo cai = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
                                        .commandPool = e->pool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
                                        .commandBufferCount = 1};
@@ -1027,6 +1070,7 @@ static int create_ctx(struct pi_engine *e, struct ctx *c)
                                           .handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT};
         VkSemaphoreCreateInfo sci = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
         VKC(e, vkCreateSemaphore(e->dev, &sci, NULL, &c->acquire));
+        VKC(e, vkCreateSemaphore(e->dev, &sci, NULL, &c->drawn));
         sci.pNext = &ex;
         VKC(e, vkCreateSemaphore(e->dev, &sci, NULL, &c->release));
     }
@@ -1034,6 +1078,47 @@ static int create_ctx(struct pi_engine *e, struct ctx *c)
         VkQueryPoolCreateInfo qpi = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
                                      .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = 3};
         VKC(e, vkCreateQueryPool(e->dev, &qpi, NULL, &c->qp));
+    }
+    return 0;
+}
+
+static void retire_all(struct pi_engine *e);
+
+static void codes_destroy(struct pi_engine *e)
+{
+    vkDestroyFramebuffer(e->dev, e->codes_fb, NULL);
+    e->codes_fb = VK_NULL_HANDLE;
+    image_destroy(e, &e->codes);
+    e->codes_w = e->codes_h = 0;
+}
+
+/* PO's target at the overlay's size (w x h), and every context's binding of
+ * it. */
+static int codes_size(struct pi_engine *e, uint32_t w, uint32_t h)
+{
+    if (e->codes_w == w && e->codes_h == h)
+        return 0;
+    retire_all(e);
+    codes_destroy(e);
+    int rc = image(e, &e->codes, VK_FORMAT_R16G16B16A16_UNORM, w, h,
+                   VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+    if (rc) {
+        codes_destroy(e);
+        return rc;
+    }
+    VkFramebufferCreateInfo fbi = {.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, .renderPass = e->rp[3],
+                                   .attachmentCount = 1, .pAttachments = &e->codes.view, .width = w, .height = h,
+                                   .layers = 1};
+    VKC(e, vkCreateFramebuffer(e->dev, &fbi, NULL, &e->codes_fb));
+    e->codes_w = w;
+    e->codes_h = h;
+    e->codes_read = 0;
+    VkDescriptorImageInfo ii = {e->bilinear, e->codes.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    for (int k = 0; k < PI_FRAMES_IN_FLIGHT; k++) {
+        VkWriteDescriptorSet wr = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = e->c[k].ds,
+                                   .dstBinding = 16, .descriptorCount = 1,
+                                   .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &ii};
+        vkUpdateDescriptorSets(e->dev, 1, &wr, 0, NULL);
     }
     return 0;
 }
@@ -1051,6 +1136,8 @@ static int create(struct pi_engine *e)
                                .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
                                .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE};
     VKC(e, vkCreateSampler(e->dev, &smi, NULL, &e->sampler));
+    smi.magFilter = smi.minFilter = VK_FILTER_LINEAR;
+    VKC(e, vkCreateSampler(e->dev, &smi, NULL, &e->bilinear));
     VkDescriptorSetLayoutBinding b[NB];
     VkDescriptorPoolSize sizes[NB];
     for (int i = 0; i < NB; i++) {
@@ -1068,9 +1155,10 @@ static int create(struct pi_engine *e)
                                       .maxSets = PI_FRAMES_IN_FLIGHT, .poolSizeCount = NB, .pPoolSizes = sizes};
     VKC(e, vkCreateDescriptorPool(e->dev, &dpi, NULL, &e->dpool));
     const VkFormat f1[2] = {VK_FORMAT_R16G16_UINT, VK_FORMAT_R16_UINT},
-                   f2[2] = {VK_FORMAT_R32G32_UINT, VK_FORMAT_R32G32_UINT};
+                   f2[2] = {VK_FORMAT_R32G32_UINT, VK_FORMAT_R32G32_UINT}, fo = VK_FORMAT_R16G16B16A16_UNORM;
     if ((rc = render_pass(e, 2, f1, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 0, &e->rp[0])) ||
         (rc = render_pass(e, 1, f1, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 0, &e->rp[2])) ||
+        (rc = render_pass(e, 1, &fo, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 0, &e->rp[3])) ||
         (rc = render_pass(e, 2, f2, e->modifiers ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, 1,
                           &e->rp[1])))
         return rc;
@@ -1078,6 +1166,8 @@ static int create(struct pi_engine *e)
     for (int k = 0; k < PI_FRAMES_IN_FLIGHT; k++)
         if ((rc = create_ctx(e, &e->c[k])))
             return rc;
+    if ((rc = codes_size(e, 16, 16)))   /* P2 binds it whether or not it reads it */
+        return rc;
     if (!pthread_create(&e->worker, NULL, worker_main, e))
         e->worker_started = 1;
     return 0;
@@ -1207,6 +1297,7 @@ static int ctx_retire(struct pi_engine *e, struct ctx *c, int block)
     if (c->out && c->out->serial == c->serial)
         c->out->stats = c->stats;
     c->out = NULL;
+    c->ov = NULL;
     av_frame_free(&c->bl);
     av_frame_free(&c->el);
     for (int i = 0; i < 4; i++)
@@ -1293,6 +1384,7 @@ int pi_stream_open(struct pi_engine *e, const struct pi_stream_info *info)
     for (int k = 0; k < PI_FRAMES_IN_FLIGHT; k++)
         e->c[k].tables_serial = 0;
     e->first = 1;
+    e->overlay_before = 0;
     e->profile_dv = info->profile;
     if (info->width != e->w || info->height != e->h || !e->c[0].fb) {
         stream_images_destroy(e);
@@ -1469,6 +1561,91 @@ void pi_output_release(struct pi_engine *e, struct pi_output *o)
     output_destroy(e, o);
 }
 
+/* ---- overlays --------------------------------------------------------------- */
+
+static void overlay_destroy(struct pi_engine *e, struct pi_overlay *o)
+{
+    vkDestroyBufferView(e->dev, o->view, NULL);
+    vkDestroyBuffer(e->dev, o->buf, NULL);
+    vkFreeMemory(e->dev, o->mem, NULL);
+    free(o);
+}
+
+int pi_overlay_import(struct pi_engine *e, int fd, uint32_t width, uint32_t height, uint32_t stride, uint64_t size,
+                      struct pi_overlay **out)
+{
+    *out = NULL;
+    if (fd < 0 || width < 2 || height < 2 || width > 7680 || height > 4320 || stride < width * 4 || stride % 4 ||
+        size < (uint64_t)stride * height) {
+        logf_(e, PI_LOG_ERROR, "overlay %ux%u, stride %u, %llu bytes: needs a stride of %u or more and %llu bytes",
+              width, height, stride, (unsigned long long)size, width * 4, (unsigned long long)stride * height);
+        return PI_E_INVALID;
+    }
+    off_t real = dmabuf_size(fd);
+    if (real > 0 && (uint64_t)real < size) {
+        logf_(e, PI_LOG_ERROR, "overlay dmabuf has %lld bytes, not %llu", (long long)real, (unsigned long long)size);
+        return PI_E_INVALID;
+    }
+    if (!e->po) {   /* PO: one variant */
+        uint32_t none = 0;
+        int rc = pipeline(e, spv_po, sizeof(spv_po), e->rp[3], &none, 0, 0, 1, &e->po);
+        if (rc)
+            return rc;
+    }
+    struct pi_overlay *o = calloc(1, sizeof(*o));
+    if (!o)
+        return PI_E_NOMEM;
+    o->w = width;
+    o->h = height;
+    o->stride = stride;
+    VkExternalMemoryBufferCreateInfo ext = {.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
+                                            .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT};
+    VkBufferCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .pNext = &ext,
+                             .size = (VkDeviceSize)stride * height, .usage = VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT};
+    VkMemoryRequirements r;
+    int rc = PI_E_VULKAN;
+    if (vkCreateBuffer(e->dev, &ci, NULL, &o->buf) != VK_SUCCESS)
+        goto fail;
+    vkGetBufferMemoryRequirements(e->dev, o->buf, &r);
+    if (real > 0 && r.size > (VkDeviceSize)real) {
+        logf_(e, PI_LOG_ERROR, "overlay buffer needs %llu bytes, the dmabuf has %lld", (unsigned long long)r.size,
+              (long long)real);
+        rc = PI_E_INVALID;
+        goto fail;
+    }
+    if ((rc = import_memory(e, fd, &r, NULL, &o->mem)))
+        goto fail;
+    rc = PI_E_VULKAN;
+    if (vkBindBufferMemory(e->dev, o->buf, o->mem, 0) != VK_SUCCESS)
+        goto fail;
+    VkBufferViewCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO, .buffer = o->buf,
+                                 .format = VK_FORMAT_R32_UINT, .range = VK_WHOLE_SIZE};
+    if (vkCreateBufferView(e->dev, &vi, NULL, &o->view) != VK_SUCCESS)
+        goto fail;
+    o->next = e->overlays;
+    e->overlays = o;
+    *out = o;
+    return 0;
+fail:
+    overlay_destroy(e, o);
+    return rc;
+}
+
+void pi_overlay_release(struct pi_engine *e, struct pi_overlay *o)
+{
+    if (!o)
+        return;
+    for (int k = 0; k < PI_FRAMES_IN_FLIGHT; k++)
+        if (e->c[k].ov == o)
+            ctx_retire(e, &e->c[k], 1);
+    for (struct pi_overlay **p = &e->overlays; *p; p = &(*p)->next)
+        if (*p == o) {
+            *p = o->next;
+            break;
+        }
+    overlay_destroy(e, o);
+}
+
 void pi_engine_destroy(struct pi_engine *e)
 {
     if (!e)
@@ -1483,6 +1660,13 @@ void pi_engine_destroy(struct pi_engine *e)
             e->outputs = o->next;
             output_destroy(e, o);
         }
+        while (e->overlays) {
+            struct pi_overlay *o = e->overlays;
+            e->overlays = o->next;
+            overlay_destroy(e, o);
+        }
+        codes_destroy(e);
+        vkDestroyPipeline(e->dev, e->po, NULL);
         stream_images_destroy(e);
         for (int k = 0; k < PI_FRAMES_IN_FLIGHT; k++) {
             struct ctx *c = &e->c[k];
@@ -1490,6 +1674,7 @@ void pi_engine_destroy(struct pi_engine *e)
                 close(c->sync_fd);
             vkDestroyQueryPool(e->dev, c->qp, NULL);
             vkDestroySemaphore(e->dev, c->acquire, NULL);
+            vkDestroySemaphore(e->dev, c->drawn, NULL);
             vkDestroySemaphore(e->dev, c->release, NULL);
             vkDestroyFence(e->dev, c->fence, NULL);
             vkDestroyBufferView(e->dev, c->tview, NULL);
@@ -1512,10 +1697,12 @@ void pi_engine_destroy(struct pi_engine *e)
         vkDestroyRenderPass(e->dev, e->rp[0], NULL);
         vkDestroyRenderPass(e->dev, e->rp[1], NULL);
         vkDestroyRenderPass(e->dev, e->rp[2], NULL);
+        vkDestroyRenderPass(e->dev, e->rp[3], NULL);
         vkDestroyDescriptorPool(e->dev, e->dpool, NULL);   /* frees the sets */
         vkDestroyPipelineLayout(e->dev, e->pl, NULL);
         vkDestroyDescriptorSetLayout(e->dev, e->dsl, NULL);
         vkDestroySampler(e->dev, e->sampler, NULL);
+        vkDestroySampler(e->dev, e->bilinear, NULL);
         vkDestroyCommandPool(e->dev, e->pool, NULL);   /* frees the command buffers */
         vkDestroyDevice(e->dev, NULL);
     }
@@ -1957,6 +2144,7 @@ static void keys(const struct pi_engine *e, const dvvk_plan *p, uint32_t k1[K1_N
 struct band {
     VkPipeline p;
     uint32_t y0, rows;
+    uint32_t x0, cols;   /* columns x0 .. x0 + cols - 1; cols 0: all */
 };
 
 /* Pass i over rows y0 .. y0 + rows - 1 of its w x h target (the render area:
@@ -1979,7 +2167,7 @@ static void pass(struct pi_engine *e, struct ctx *c, int i, VkFramebuffer fb, ui
         if (!b[k].rows)
             continue;
         vkCmdBindPipeline(c->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, b[k].p);
-        VkRect2D sc = {{0, (int32_t)b[k].y0}, {w, b[k].rows}};
+        VkRect2D sc = {{(int32_t)b[k].x0, (int32_t)b[k].y0}, {b[k].cols ? b[k].cols : w, b[k].rows}};
         vkCmdSetScissor(c->cmd, 0, 1, &sc);
         vkCmdDraw(c->cmd, 3, 1, 0, 0);
     }
@@ -2036,8 +2224,39 @@ static void ownership(struct pi_engine *e, struct ctx *c, struct pi_output *o, i
     vkCmdPipelineBarrier(c->cmd, src, dst, 0, 0, NULL, nb, bb, ni, ib);
 }
 
+/* Rows lo .. hi - 1, columns x0 .. x1 - 1 with p. */
+static void band_add(struct band *b, int *n, VkPipeline p, uint32_t lo, uint32_t hi, uint32_t x0, uint32_t x1)
+{
+    if (hi > lo && x1 > x0)
+        b[(*n)++] = (struct band){p, lo, hi - lo, x0, x1 - x0};
+}
+
+/* A region of P2's block rows, lo .. hi - 1, of which base draws lo ..
+ * drawn - 1; where the overlay may touch (block rows r0 .. r1 - 1, columns
+ * c0 .. c1 - 1 of cw) over draws instead, and also in rows base leaves. */
+static void region(struct band *b, int *n, VkPipeline base, VkPipeline over, uint32_t lo, uint32_t hi,
+                   uint32_t drawn, const uint32_t r[4], uint32_t cw)
+{
+    uint32_t r0 = over ? r[0] : 0, r1 = over ? r[1] : 0;
+    band_add(b, n, base, lo, drawn < r0 ? drawn : r0, 0, cw);
+    band_add(b, n, base, lo > r1 ? lo : r1, drawn, 0, cw);
+    if (!over)
+        return;
+    uint32_t o0 = lo > r0 ? lo : r0, o1 = hi < r1 ? hi : r1, d1 = drawn < o1 ? drawn : o1;
+    band_add(b, n, over, o0, o1, r[2], r[3]);
+    band_add(b, n, base, o0, d1, 0, r[2]);
+    band_add(b, n, base, o0, d1, r[3], cw);
+}
+
+/* A frame's overlay: PO's area (overlay pixels) and P2's pipelines for the
+ * blocks it may touch; none: area empty. */
+struct overlay_pass {
+    uint32_t area[4];
+    VkPipeline p2, bars;
+};
+
 static int record(struct pi_engine *e, struct ctx *c, const dvvk_plan *p, struct pi_output *o, VkPipeline p0,
-                  VkPipeline p1, VkPipeline p2, VkPipeline pb)
+                  VkPipeline p1, VkPipeline p2, VkPipeline pb, const struct overlay_pass *ov)
 {
     uint32_t w = e->w, h = e->h, cw = w / 2, ch = h / 2;
     VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -2069,7 +2288,7 @@ static int record(struct pi_engine *e, struct ctx *c, const dvvk_plan *p, struct
         crows = (p->row_last - p->row_first) / 2;   /* row_last: exclusive */
     }
     if (p0) {   /* P0: the EL chroma's vertical filter, over the same rows */
-        struct band b0 = {p0, c0, crows};
+        struct band b0 = {p0, c0, crows, 0, 0};
         pass(e, c, 2, c->fb0, cw / 2, ch, c0, crows, &b0, 1, NULL);
         c->elv_read = 1;
     } else if (!c->elv_read) {
@@ -2086,26 +2305,69 @@ static int record(struct pi_engine *e, struct ctx *c, const dvvk_plan *p, struct
                              NULL, 0, NULL, 1, &ib);
         c->elv_read = 1;
     }
-    struct band b1 = {p1, c0, crows};
+    struct band b1 = {p1, c0, crows, 0, 0};
     pass(e, c, 0, c->fb, cw, ch, c0, crows, &b1, 1, NULL);
+    /* PO: the overlay's area as the source's signal, for P2 */
+    const uint32_t *oa = ov->area;
+    int overlay = oa[2] > oa[0] && oa[3] > oa[1];
+    if (overlay) {
+        VkRenderPassBeginInfo rbi = {.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, .renderPass = e->rp[3],
+                                     .framebuffer = e->codes_fb,
+                                     .renderArea = {{(int32_t)oa[0], (int32_t)oa[1]}, {oa[2] - oa[0], oa[3] - oa[1]}}};
+        vkCmdBeginRenderPass(c->cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+        vkCmdBindDescriptorSets(c->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, e->pl, 0, 1, &c->ds, 0, NULL);
+        VkViewport vp = {0, 0, (float)e->codes_w, (float)e->codes_h, 0, 1};
+        vkCmdSetViewport(c->cmd, 0, 1, &vp);
+        vkCmdBindPipeline(c->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, e->po);
+        vkCmdSetScissor(c->cmd, 0, 1, &rbi.renderArea);
+        vkCmdDraw(c->cmd, 3, 1, 0, 0);
+        vkCmdEndRenderPass(c->cmd);
+        e->codes_read = 1;
+    } else if (!e->codes_read) {
+        /* P2 binds PO's image whether or not it reads it: give it the layout
+         * its descriptor names, once */
+        VkImageMemoryBarrier ib = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                                   .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+                                   .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+                                   .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                   .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                   .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .image = e->codes.img,
+                                   .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+        vkCmdPipelineBarrier(c->cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0,
+                             NULL, 0, NULL, 1, &ib);
+        e->codes_read = 1;
+    }
     /* Pass 2: the bars (block rows wholly outside the active rows) with the
      * black pipeline, the rest with the full one: one render pass. The bars
      * are the black pixel pair everywhere but in the rows carrying metadata
      * packets: the tile buffer is cleared to it (free), and only the packet
-     * rows of the bars are drawn. */
+     * rows of the bars are drawn. The block rows the overlay may touch (r0 ..
+     * r1 - 1) take the pipelines that composite it, bars included. */
     uint32_t a0 = p->active[1] / 2, a1 = (p->active[3] + 1) / 2;
     if (all || a1 <= a0 || a1 > ch)
         a0 = 0, a1 = ch;
     uint32_t prow = (c->pmap->pk[3] + 1) / 2;   /* block rows the packets reach */
-    struct band b[3] = {{pb, 0, a0 < prow ? a0 : prow}, {p2, a0, a1 - a0},
-                        {pb, a1, prow > a1 ? (prow < ch ? prow : ch) - a1 : 0}};
+    uint32_t top = a0 < prow ? a0 : prow, bottom = prow > a1 ? (prow < ch ? prow : ch) : a1;
     if (e->o.measure & PI_MEASURE_DRAW_BARS)
-        b[0].rows = a0, b[2].rows = ch - a1;
+        top = a0, bottom = ch;
+    uint32_t r[4] = {0};   /* the overlay's blocks: rows r0 .. r1 - 1, columns c0 .. c1 - 1 */
+    if (overlay) {
+        const uint32_t *orect = c->pmap->orect;
+        r[0] = orect[1] / 2;
+        r[1] = (orect[3] + 1) / 2 < ch ? (orect[3] + 1) / 2 : ch;
+        r[2] = orect[0] / 2;
+        r[3] = (orect[2] + 1) / 2 < cw ? (orect[2] + 1) / 2 : cw;
+    }
+    struct band b[16];
+    int nb = 0;
+    region(b, &nb, pb, overlay ? ov->bars : NULL, 0, a0, top, r, cw);
+    region(b, &nb, p2, overlay ? ov->p2 : NULL, a0, a1, a1, r, cw);
+    region(b, &nb, pb, overlay ? ov->bars : NULL, a1, ch, bottom, r, cw);
     VkClearValue black;
     for (int l = 0; l < 2; l++)
         black.color.uint32[l] = PI_PACK(p->black[0], l ? p->black[2] : p->black[1]);
     black.color.uint32[2] = black.color.uint32[3] = 0;
-    pass(e, c, 1, o->fb, cw, ch, 0, ch, b, 3, &black);
+    pass(e, c, 1, o->fb, cw, ch, 0, ch, b, nb, &black);
     if (o->copy_buf)
         for (int half = 0; half < 2; half++) {
             VkBufferImageCopy cp = {.bufferOffset = (VkDeviceSize)half * o->stride, .bufferRowLength = o->stride / 4,
@@ -2138,30 +2400,44 @@ static int fd_signalled(int fd, int timeout)
     return r != 0;   /* an error: nothing to wait for */
 }
 
-static int submit(struct pi_engine *e, struct ctx *c, int acquire_fd, int *release_fd)
+/* A sync_file the submission waits for at `stage` (taken): imported as sem
+ * into waits; already signalled, nothing; not importable, waited for here. */
+static void wait_fd(struct pi_engine *e, int fd, VkSemaphore sem, VkPipelineStageFlags stage, VkSemaphore *waits,
+                    VkPipelineStageFlags *stages, uint32_t *n)
 {
-    VkPipelineStageFlags stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+    /* A fence already signalled (the usual case: the output's last scanout
+     * ended frames ago) isn't imported: waiting on a semaphore costs v3dv
+     * the overlap of this frame's work with the last's. */
+    if (fd < 0)
+        return;
+    if (fd_signalled(fd, 0)) {
+        close(fd);
+        return;
+    }
+    VkImportSemaphoreFdInfoKHR imp = {.sType = VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_FD_INFO_KHR, .semaphore = sem,
+                                      .flags = VK_SEMAPHORE_IMPORT_TEMPORARY_BIT,
+                                      .handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT, .fd = fd};
+    if (e->sem_fd && e->import_sem_fd(e->dev, &imp) == VK_SUCCESS) {
+        waits[*n] = sem;
+        stages[(*n)++] = stage;
+    } else {
+        fd_signalled(fd, -1);
+        close(fd);
+    }
+}
+
+static int submit(struct pi_engine *e, struct ctx *c, int acquire_fd, int drawn_fd, int *release_fd)
+{
+    VkPipelineStageFlags stages[2];
+    VkSemaphore waits[2];
+    uint32_t nw = 0;
     VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &c->cmd};
-    /* An acquire fence already signalled (the usual case: the output's last
-     * scanout ended frames ago) isn't imported: waiting on a semaphore costs
-     * v3dv the overlap of this frame's work with the last's. */
-    if (acquire_fd >= 0 && fd_signalled(acquire_fd, 0)) {
-        close(acquire_fd);
-        acquire_fd = -1;
-    }
-    if (acquire_fd >= 0) {
-        VkImportSemaphoreFdInfoKHR imp = {.sType = VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_FD_INFO_KHR,
-                                          .semaphore = c->acquire, .flags = VK_SEMAPHORE_IMPORT_TEMPORARY_BIT,
-                                          .handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT, .fd = acquire_fd};
-        if (e->sem_fd && e->import_sem_fd(e->dev, &imp) == VK_SUCCESS) {
-            si.waitSemaphoreCount = 1;
-            si.pWaitSemaphores = &c->acquire;
-            si.pWaitDstStageMask = &stage;
-        } else {
-            fd_signalled(acquire_fd, -1);
-            close(acquire_fd);
-        }
-    }
+    wait_fd(e, acquire_fd, c->acquire, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+            waits, stages, &nw);
+    wait_fd(e, drawn_fd, c->drawn, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, waits, stages, &nw);
+    si.waitSemaphoreCount = nw;
+    si.pWaitSemaphores = waits;
+    si.pWaitDstStageMask = stages;
     /* The release sync_file: the submission's fence exported, where the device
      * can (no semaphore in the submission: a semaphore signal costs v3dv the
      * overlap of consecutive frames, which dropped frames); else a semaphore. */
@@ -2191,11 +2467,67 @@ static int submit(struct pi_engine *e, struct ctx *c, int acquire_fd, int *relea
     return 0;
 }
 
+/* mpv-yblod's GUI colour (dvvk-compare): linear BT.709 to BT.2020, then the
+ * common LMS (Q14). */
+static void overlay_rgb_to_lms(double m[9])
+{
+    static const double rgb[9] = {.6274, .3293, .0433, .0691, .9195, .0114, .0164, .0880, .8956};
+    static const double lms[9] = {7222, 8771, 390, 2654, 12430, 1300, 0, 422, 15962};
+    for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 3; j++) {
+            m[3 * i + j] = 0;
+            for (int k = 0; k < 3; k++)
+                m[3 * i + j] += lms[3 * i + k] * rgb[3 * k + j] / 16384.0;
+        }
+}
+
+/* The overlay's rectangle clamped to it; 0 empty. */
+static int overlay_rect(const struct pi_frame *f, uint32_t r[4])
+{
+    const struct pi_overlay *ov = f->overlay;
+    r[0] = f->overlay_rect[0];
+    r[1] = f->overlay_rect[1];
+    r[2] = f->overlay_rect[2] < ov->w ? f->overlay_rect[2] : ov->w;
+    r[3] = f->overlay_rect[3] < ov->h ? f->overlay_rect[3] : ov->h;
+    return r[2] > r[0] && r[3] > r[1];
+}
+
+/* The overlay's Params (the colour: the planner's) and PO's area: P2 samples
+ * the codes bilinearly at its pixels and their horizontal neighbours, so
+ * both areas have a margin for the filter's reach at the scale. */
+static void overlay_params(const struct pi_engine *e, const struct pi_frame *f, const uint32_t r[4],
+                           const dvvk_plan *p, struct params *q, uint32_t area[4])
+{
+    const struct pi_overlay *ov = f->overlay;
+    uint32_t w = e->w, h = e->h, ow = ov->w, oh = ov->h;
+    for (int i = 0; i < 31; i++)
+        q->oc[i] = p->gui_coeff[i];
+    uint32_t mx = 2 + 2 * ((w + ow - 1) / ow), my = 2 + 2 * ((h + oh - 1) / oh);   /* output pixels */
+    uint64_t x0 = (uint64_t)r[0] * w / ow, y0 = (uint64_t)r[1] * h / oh;
+    uint64_t x1 = ((uint64_t)r[2] * w + ow - 1) / ow + mx, y1 = ((uint64_t)r[3] * h + oh - 1) / oh + my;
+    q->orect[0] = x0 > mx ? (uint32_t)x0 - mx : 0;
+    q->orect[1] = y0 > my ? (uint32_t)y0 - my : 0;
+    q->orect[2] = x1 < w ? (uint32_t)x1 : w;
+    q->orect[3] = y1 < h ? (uint32_t)y1 : h;
+    uint32_t ax = (mx + 1) * ((ow + w - 1) / w) + 2, ay = (my + 1) * ((oh + h - 1) / h) + 2;   /* overlay pixels */
+    area[0] = r[0] > ax ? r[0] - ax : 0;
+    area[1] = r[1] > ay ? r[1] - ay : 0;
+    area[2] = r[2] + ax < ow ? r[2] + ax : ow;
+    area[3] = r[3] + ay < oh ? r[3] + ay : oh;
+    q->osrc[0] = ow;
+    q->osrc[1] = oh;
+    q->osrc[2] = ov->stride / 4;
+    q->osrc[3] = f->overlay_bottom_up != 0;
+    q->oinv[0] = 1.0f / (float)w;
+    q->oinv[1] = 1.0f / (float)h;
+}
+
 int pi_render(struct pi_engine *e, const struct pi_frame *f, struct pi_output *o, int *release_fd)
 {
     if (release_fd)
         *release_fd = -1;
     int acquire_fd = f ? f->acquire_fd : -1;
+    int drawn_fd = f && f->overlay ? f->overlay_fd : -1;
     int rc = PI_E_INVALID;
     if (!e->open || !f || !f->bl || !o || o->w != e->w || o->h != e->h)
         goto out;
@@ -2219,6 +2551,8 @@ int pi_render(struct pi_engine *e, const struct pi_frame *f, struct pi_output *o
     struct ctx *c = &e->c[e->next];
     ctx_retire(e, c, 1);
     imports_trim(e);
+    uint32_t orc[4] = {0};
+    struct pi_overlay *ov = f->overlay && overlay_rect(f, orc) ? f->overlay : NULL;
 
     /* plan */
     double t0 = now_ms();
@@ -2226,10 +2560,19 @@ int pi_render(struct pi_engine *e, const struct pi_frame *f, struct pi_output *o
                        .chroma_top_left = (uint32_t)f->chroma_top_left, .has_el = f->el != NULL,
                        .el_scaler = e->o.el_upscale == PI_EL_ANNEX_B ? 1u : 2u,
                        .fel = 1, .refresh = (uint32_t)e->first, .pts = f->pts_us, .white_nits = 203.0,
-                       .cb1_contract = e->o.filters == PI_FILTERS_CB1};
+                       .cb1_contract = e->o.filters == PI_FILTERS_CB1, .overlay = ov != NULL,
+                       .overlay_visible_before = (uint32_t)e->overlay_before};
+    overlay_rgb_to_lms(in.rgb_to_lms);
     dvvk_plan *p = e->plan;
     int st = dvvk_plan_frame_state_rpu(&in, NULL, e->state, dovi->data, dovi->size, rpu ? rpu->data : NULL,
                                        rpu ? rpu->size : 0, p);
+    if (st && ov) {   /* a source whose signal the overlay's colour can't be expressed in: without it */
+        WARN_ONCE(e, W_OVERLAY, "the planner refuses the overlay (dv_status %d): not composited", st);
+        ov = NULL;
+        in.overlay = 0;
+        st = dvvk_plan_frame_state_rpu(&in, NULL, e->state, dovi->data, dovi->size, rpu ? rpu->data : NULL,
+                                       rpu ? rpu->size : 0, p);
+    }
     if (st) {
         WARN_ONCE(e, W_PLANNER, "the planner refuses the frame: dv_status %d", st);
         rc = st == -1 ? PI_E_BAD_RPU : PI_E_UNSUPPORTED_PLAN;
@@ -2246,6 +2589,8 @@ int pi_render(struct pi_engine *e, const struct pi_frame *f, struct pi_output *o
         logf_(e, PI_LOG_DEBUG, "route %u; active area x %u..%u, y %u..%u; row window %u..%u", p->route, p->active[0],
               p->active[2], p->active[1], p->active[3], p->row_first, p->row_last);
     prepare(e, p, f->el != NULL);
+    if (ov && (rc = codes_size(e, ov->w, ov->h)))
+        goto out;
 
     /* inputs and tables */
     struct params *q = c->pmap;
@@ -2253,6 +2598,14 @@ int pi_render(struct pi_engine *e, const struct pi_frame *f, struct pi_output *o
     if ((rc = bind_inputs(e, c, f->bl, f->el ? f->el : f->bl, q)))
         goto release;
     frame_params(e, p, f->el, q);
+    struct overlay_pass op = {{0}};
+    if (ov) {
+        overlay_params(e, f, orc, p, q, op.area);
+        VkWriteDescriptorSet wr = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = c->ds, .dstBinding = 15,
+                                   .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER,
+                                   .pTexelBufferView = &ov->view};
+        vkUpdateDescriptorSets(e->dev, 1, &wr, 0, NULL);
+    }
     if (c->tables_serial != e->tables_serial) {
         memcpy(c->tmap, e->tables, T_WORDS * 4);
         memcpy(c->rmap, p->reshape, sizeof(p->reshape));
@@ -2270,21 +2623,41 @@ int pi_render(struct pi_engine *e, const struct pi_frame *f, struct pi_output *o
                              [K1_PRE] = 1};
         p0 = build(e, 0, k0);
     }
-    if (!p1 || !p2 || !pb || (k1[K1_ELUP] && !p0)) {
+    /* the overlay's: the same with OVERLAY, its sampling by the scale (the
+     * last overlay imported's, to build ahead) */
+    const struct pi_overlay *scale = ov ? ov : e->overlays;
+    uint32_t mode = !scale                                          ? 1u
+                    : scale->w == e->w && scale->h == e->h          ? 3u
+                    : 2 * scale->w == e->w && 2 * scale->h == e->h ? 2u
+                                                                    : 1u;
+    uint32_t k2o[K2_N], kbo[K2_N] = {[K2_BARS] = 1, [K2_OVERLAY] = mode};
+    memcpy(k2o, k2, sizeof(k2o));
+    k2o[K2_OVERLAY] = mode;
+    if (ov) {
+        op.p2 = build(e, 1, k2o);
+        op.bars = build(e, 1, kbo);
+    }
+    if (!p1 || !p2 || !pb || (k1[K1_ELUP] && !p0) || (ov && (!op.p2 || !op.bars))) {
         WARN_ONCE(e, W_PIPELINE, "a pipeline failed to build");
         rc = PI_E_VULKAN;
         goto release;
     }
     prewarm_family(e, k1);
+    if (e->overlays && e->worker_started) {
+        prewarm(e, 1, k2o);
+        prewarm(e, 1, kbo);
+    }
 
     /* record and submit */
     e->serial++;
-    if ((rc = record(e, c, p, o, p0, p1, p2, pb)))
+    if ((rc = record(e, c, p, o, p0, p1, p2, pb, &op)))
         goto release;
-    rc = submit(e, c, acquire_fd, release_fd);
-    acquire_fd = -1;   /* submit takes it */
+    rc = submit(e, c, acquire_fd, drawn_fd, release_fd);
+    acquire_fd = drawn_fd = -1;   /* submit takes them */
     if (rc)
         goto release;
+    e->overlay_before = ov != NULL;
+    c->ov = ov;
     c->busy = 1;
     c->serial = e->serial;
     c->out = o;
@@ -2304,5 +2677,7 @@ release:
 out:
     if (acquire_fd >= 0)
         close(acquire_fd);
+    if (drawn_fd >= 0)
+        close(drawn_fd);
     return rc;
 }

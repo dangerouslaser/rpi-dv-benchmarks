@@ -30,6 +30,10 @@ layout(std140, binding = 0) uniform Params {
     uvec4 pw;          // route 3: chroma policy (1 top-left: rows k, k+1 at 4/4, 2/4)
     vec4 err;          // mode 4's error factor; the split guard's
     uvec4 packets[40]; // 640 bytes of metadata packets
+    vec4 oc[8];        // the overlay's colour: the planner's gui_coeff (po_overlay.frag)
+    uvec4 orect;       // P2: the output pixels the overlay may touch, x0, y0, x1, y1 (exclusive)
+    uvec4 osrc;        // PO: the overlay's width, height, stride (words), rows bottom first
+    vec4 oinv;         // P2: 1 / w, 1 / h (the overlay's texture coordinates)
 } P;
 
 // The per-frame tables (pi_engine.c T_*), 32-bit words.

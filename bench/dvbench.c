@@ -50,6 +50,13 @@
  *     --implicit-sync    per picture: does the output dmabuf carry an implicit
  *                        fence (what KMS waits on without a sync_file), busy
  *                        right after the render is submitted, idle after?
+ *     --overlay WxH      composite a synthetic subtitle (two lines, white and
+ *                        yellow, outlined, the second over a translucent box)
+ *                        drawn at WxH into every picture (pi_overlay_import)
+ *     --overlay-bottom-up  its rows stored bottom first (as a GL framebuffer)
+ *     --overlay-check    then each picture again without the overlay, and the
+ *                        overlaid output compared with a CPU reference of the
+ *                        composite over it (the planner's overlay colour)
  *     --hash             print a hash of every output picture
  *     --dump DIR         write each output as DIR/pi-N.bgra
  *     --json FILE        machine-readable summary
@@ -73,6 +80,7 @@
 #include "source.h"
 #include "alloc.h"
 #include "pi_engine.h"
+#include "dvvk_plan.h"
 #include <errno.h>
 #include <libavutil/dovi_meta.h>
 #include <math.h>
@@ -228,12 +236,101 @@ static const AVFrame *rpu_frame(const struct dv_picture *q)
     return q->el && !av_frame_get_side_data(q->bl, AV_FRAME_DATA_DOVI_METADATA) ? q->el : NULL;
 }
 
+/* ---- the synthetic overlay (--overlay) --------------------------------------- */
+
+static struct {
+    uint32_t w, h, stride, rect[4];
+    int bottom_up, on;
+    struct dv_dmabuf buf;
+    uint8_t *rgba;   /* top-down premultiplied B, G, R, A: the CPU reference's */
+    struct pi_overlay *ov;
+} g_ov;
+
+static double clamp01(double v) { return v < 0 ? 0 : v > 1 ? 1 : v; }
+
+/* A glyph-like stroke shape's distance (pixels) at (x, y) from the glyph
+ * cell's centre, cell size s: a ring, a bar, a slash, by kind. */
+static double glyph_distance(int kind, double x, double y, double s)
+{
+    if (kind == 0)
+        return fabs(sqrt(x * x + y * y) - 0.3 * s);
+    if (kind == 1)
+        return fmax(fabs(x) - 0.0 * s, fabs(y) - 0.38 * s);
+    double d = fabs(0.92 * x - 0.39 * y);   /* a slanted line */
+    return fmax(d, fabs(y) - 0.38 * s);
+}
+
+static int overlay_make(uint32_t w, uint32_t h, int bottom_up)
+{
+    g_ov.w = w;
+    g_ov.h = h;
+    g_ov.stride = (w * 4 + 63) & ~63u;
+    g_ov.bottom_up = bottom_up;
+    if (dv_dmabuf_alloc(&g_ov.buf, (size_t)g_ov.stride * h) || !(g_ov.rgba = calloc((size_t)w * h, 4)))
+        return -1;
+    uint32_t x0 = w, y0 = h, x1 = 0, y1 = 0;
+    double line = h * 0.05, cell = line * 0.62, stroke = line * 0.11, edge = line * 0.06;
+    for (int l = 0; l < 2; l++) {
+        double cy = h * (l ? 0.905 : 0.835);
+        int n = 34 - 8 * l;
+        double left = w * 0.5 - n * cell * 0.5;
+        int bx0 = (int)(left - cell * 0.5), bx1 = (int)(left + n * cell + cell * 0.5);
+        int by0 = (int)(cy - line * 0.7), by1 = (int)(cy + line * 0.7);
+        for (int y = by0; y < by1; y++)
+            for (int x = bx0; x < bx1; x++) {
+                if (x < 0 || y < 0 || x >= (int)w || y >= (int)h)
+                    continue;
+                int g = (int)floor((x - left) / cell);
+                double gx = x + 0.5 - (left + (g + 0.5) * cell), gy = y + 0.5 - cy;
+                double fill = 0, outline = 0;
+                if (g >= 0 && g < n && (g % 7) != 3) {   /* every 7th a space */
+                    double d = glyph_distance((g * 5 + l) % 3, gx, gy, line);
+                    fill = clamp01(stroke * 0.5 - d + 0.5);
+                    outline = clamp01(stroke * 0.5 + edge - d + 0.5);
+                }
+                double box = l ? 96.0 / 255 : 0;   /* the second line's translucent box */
+                double r = fill, gg = fill, b = l ? 0 : fill;   /* white / yellow over the black outline */
+                double a = outline + box * (1 - outline);
+                uint8_t *p = g_ov.rgba + ((size_t)y * w + x) * 4;
+                p[0] = (uint8_t)lround(b * 255);
+                p[1] = (uint8_t)lround(gg * 255);
+                p[2] = (uint8_t)lround(r * 255);
+                p[3] = (uint8_t)lround(a * 255);
+                if (p[3]) {
+                    x0 = (uint32_t)x < x0 ? (uint32_t)x : x0;
+                    y0 = (uint32_t)y < y0 ? (uint32_t)y : y0;
+                    x1 = (uint32_t)x + 1 > x1 ? (uint32_t)x + 1 : x1;
+                    y1 = (uint32_t)y + 1 > y1 ? (uint32_t)y + 1 : y1;
+                }
+            }
+    }
+    uint32_t r[4] = {x0, y0, x1, y1};
+    memcpy(g_ov.rect, r, sizeof(r));
+    dv_dmabuf_cpu(&g_ov.buf, 1, 1);
+    for (uint32_t y = 0; y < h; y++)
+        memcpy(g_ov.buf.map + (size_t)(bottom_up ? h - 1 - y : y) * g_ov.stride, g_ov.rgba + (size_t)y * w * 4, w * 4);
+    dv_dmabuf_cpu(&g_ov.buf, 0, 1);
+    int rc = pi_overlay_import(g_pi, g_ov.buf.fd, w, h, g_ov.stride, g_ov.buf.size, &g_ov.ov);
+    if (rc) {
+        fprintf(stderr, "pi: overlay import: %s\n", pi_strerror(rc));
+        return -1;
+    }
+    g_ov.on = 1;
+    printf("overlay: %ux%u%s, drawn in x %u..%u, y %u..%u\n", w, h, bottom_up ? " bottom-up" : "", x0, x1, y0, y1);
+    return 0;
+}
+
 /* acquire_fd: taken; release_fd: NULL, or the render's sync_file (-1 none). */
 static int render_fenced(const struct dv_picture *q, double pts, struct out_buf *o, int acquire_fd, int *release_fd)
 {
     struct pi_frame f = {.bl = q->bl, .el = g_fel ? q->el : NULL, .rpu_frame = rpu_frame(q),
                          .chroma_top_left = pi_chroma_top_left(q->bl, g_profile), .pts_us = (int64_t)(pts * 1e6),
-                         .acquire_fd = acquire_fd};
+                         .acquire_fd = acquire_fd, .overlay_fd = -1};
+    if (g_ov.on) {
+        f.overlay = g_ov.ov;
+        memcpy(f.overlay_rect, g_ov.rect, sizeof(f.overlay_rect));
+        f.overlay_bottom_up = g_ov.bottom_up;
+    }
     int rc = pi_render(g_pi, &f, o->out, release_fd);
     static int reported;
     if (rc && !reported++)
@@ -245,6 +342,156 @@ static int render_fenced(const struct dv_picture *q, double pts, struct out_buf 
 static int render(const struct dv_picture *q, double pts, struct out_buf *o)
 {
     return render_fenced(q, pts, o, -1, NULL);
+}
+
+/* ---- --overlay-check: the composite against a CPU reference ------------------ */
+
+/* The engine's overlay colour (po_overlay.frag) in double, from the
+ * planner's coefficients c: premultiplied (Y, Cb, Cr) codes / 4096 and
+ * alpha, each as the RGBA16 UNORM target stores it. */
+static void ref_codes(const float *c, const uint8_t *bgra, double out[4])
+{
+    memset(out, 0, 4 * sizeof(double));
+    if (!bgra[3])
+        return;
+    double s[3], lin[3], lms[3], src[3], pq[3];
+    for (int i = 0; i < 3; i++) {
+        s[i] = fmin((double)bgra[2 - i] / bgra[3], 1.0);
+        lin[i] = (s[i] <= 0.04045 ? s[i] / 12.92 : pow((s[i] + 0.055) / 1.055, 2.4)) * (c[30] / 10000.0);
+    }
+    for (int i = 0; i < 3; i++)
+        lms[i] = c[18 + 3 * i] * lin[0] + c[19 + 3 * i] * lin[1] + c[20 + 3 * i] * lin[2];
+    for (int i = 0; i < 3; i++) {
+        src[i] = clamp01(c[9 + 3 * i] * lms[0] + c[10 + 3 * i] * lms[1] + c[11 + 3 * i] * lms[2]);
+        double pw = pow(src[i], 2610.0 / 16384.0);
+        pq[i] = pow((3424.0 / 4096.0 + 2413.0 / 128.0 * pw) / (1.0 + 2392.0 / 128.0 * pw), 2523.0 / 32.0);
+    }
+    double a = bgra[3] / 255.0;
+    for (int i = 0; i < 3; i++) {
+        double code = (c[3 * i] * pq[0] + c[3 * i + 1] * pq[1] + c[3 * i + 2] * pq[2] + c[27 + i]) * 4096.0;
+        code = code < 0 ? 0 : code > 4095 ? 4095 : code;
+        out[i] = round(clamp01(code * a / 4096.0) * 65535) / 65535;
+    }
+    out[3] = round(a * 65535) / 65535;
+}
+
+/* Bilinear, clamped to the edge, at texture coordinates (u, v). */
+static void ref_sample(const double *t, uint32_t w, uint32_t h, double u, double v, double out[4])
+{
+    double tx = u * w - 0.5, ty = v * h - 0.5, fx = tx - floor(tx), fy = ty - floor(ty);
+    int x0 = (int)floor(tx), y0 = (int)floor(ty);
+    int xs[2] = {x0 < 0 ? 0 : x0 >= (int)w ? (int)w - 1 : x0, x0 + 1 < 0 ? 0 : x0 + 1 >= (int)w ? (int)w - 1 : x0 + 1};
+    int ys[2] = {y0 < 0 ? 0 : y0 >= (int)h ? (int)h - 1 : y0, y0 + 1 < 0 ? 0 : y0 + 1 >= (int)h ? (int)h - 1 : y0 + 1};
+    for (int k = 0; k < 4; k++) {
+        const double *a = t + ((size_t)ys[0] * w + xs[0]) * 4, *b = t + ((size_t)ys[0] * w + xs[1]) * 4,
+                     *c = t + ((size_t)ys[1] * w + xs[0]) * 4, *d = t + ((size_t)ys[1] * w + xs[1]) * 4;
+        out[k] = (a[k] * (1 - fx) + b[k] * fx) * (1 - fy) + (c[k] * (1 - fx) + d[k] * fx) * fy;
+    }
+}
+
+static uint32_t ref_over(uint32_t v, double premultiplied, double a)
+{
+    if (a <= 0)
+        return v;
+    double r = floor(v * (1 - a) + premultiplied * 4096 + 0.5);
+    return r > 4095 ? 4095 : (uint32_t)r;
+}
+
+static uint32_t ref_chroma(uint32_t c, const double *l, const double *m, const double *r, int k)
+{
+    double coverage = (l[3] + 2 * m[3] + r[3]) * 0.25;
+    if (coverage <= 0)
+        return c;
+    double v = floor(c * (1 - coverage) + (l[k] + 2 * m[k] + r[k]) * 1024 + 0.5);
+    return v > 4095 ? 4095 : (uint32_t)v;
+}
+
+static void unpack(const uint8_t *p, uint32_t *yy, uint32_t *c)
+{
+    *yy = (uint32_t)p[1] << 4 | (p[0] & 15u);
+    *c = (uint32_t)p[2] << 4 | p[0] >> 4;
+}
+
+/* Picture q with the overlay into a, without into b; the overlay's
+ * composite over b by the reference against a. 0 within tolerance. */
+static int overlay_check(const struct dv_picture *q, int i, double pts, const struct pi_options *po,
+                         struct out_buf *a, struct out_buf *b)
+{
+    g_ov.on = 1;
+    int ok = render(q, pts, a) && pi_output_wait(g_pi, a->out) == 0;
+    g_ov.on = 0;
+    ok = ok && render(q, pts, b) && pi_output_wait(g_pi, b->out) == 0;
+    g_ov.on = 1;
+    if (!ok)
+        return -1;
+    /* the planner's overlay colour for this picture, as the engine plans it */
+    const AVFrame *meta = rpu_frame(q) ? rpu_frame(q) : q->bl;
+    const AVFrameSideData *dovi = av_frame_get_side_data(meta, AV_FRAME_DATA_DOVI_METADATA);
+    const AVFrameSideData *rpu = av_frame_get_side_data(meta, AV_FRAME_DATA_DOVI_RPU_BUFFER);
+    uint32_t W = a->w, H = a->h;
+    dvvk_plan_in in = {.width = W, .height = H, .dw = W, .dh = H,
+                       .chroma_top_left = (uint32_t)pi_chroma_top_left(q->bl, g_profile),
+                       .has_el = g_fel && q->el, .el_scaler = po->el_upscale == PI_EL_ANNEX_B ? 1u : 2u, .fel = 1,
+                       .refresh = 1, .white_nits = 203.0, .cb1_contract = po->filters == PI_FILTERS_CB1, .overlay = 1};
+    static const double rgb[9] = {.6274, .3293, .0433, .0691, .9195, .0114, .0164, .0880, .8956};
+    static const double lms[9] = {7222, 8771, 390, 2654, 12430, 1300, 0, 422, 15962};
+    for (int r = 0; r < 3; r++)
+        for (int col = 0; col < 3; col++)
+            for (int k = 0; k < 3; k++)
+                in.rgb_to_lms[3 * r + col] += lms[3 * r + k] * rgb[3 * k + col] / 16384.0;
+    dvvk_plan *plan = malloc(sizeof(*plan));
+    dvvk_plan_state *state = dvvk_plan_state_new();
+    int st = plan && state && dovi ? dvvk_plan_frame_state_rpu(&in, NULL, state, dovi->data, dovi->size,
+                                                               rpu ? rpu->data : NULL, rpu ? rpu->size : 0, plan)
+                                   : -1;
+    if (st) {
+        fprintf(stderr, "overlay check: the planner refuses the picture with an overlay (%d)\n", st);
+        free(plan);
+        dvvk_plan_state_free(state);
+        return -1;
+    }
+    uint32_t ow = g_ov.w, oh = g_ov.h, prow = (plan->packet_count * 3072 + W - 1) / W;
+    double *t = calloc((size_t)ow * oh * 4, sizeof(double));
+    for (uint32_t y = 0; y < oh; y++)
+        for (uint32_t x = 0; x < ow; x++)
+            ref_codes(plan->gui_coeff, g_ov.rgba + ((size_t)y * ow + x) * 4, t + ((size_t)y * ow + x) * 4);
+    dv_dmabuf_cpu(&a->buf, 1, 0);
+    dv_dmabuf_cpu(&b->buf, 1, 0);
+    uint32_t max_y = 0, max_c = 0, over2 = 0, touched = 0;
+    for (uint32_t y = 0; y < H; y++)
+        for (uint32_t x = 0; x < W; x += 2) {
+            double v = (y + 0.5) / H, s[3][4];
+            for (int k = 0; k < 3; k++)
+                ref_sample(t, ow, oh, (x + k - 0.5) / W, v, s[k]);
+            for (int k = 0; k < 2; k++) {
+                const uint8_t *pa = a->buf.map + (size_t)y * a->stride + (x + k) * 4,
+                              *pb = b->buf.map + (size_t)y * b->stride + (x + k) * 4;
+                uint32_t ya, ca, yb, cb;
+                unpack(pa, &ya, &ca);
+                unpack(pb, &yb, &cb);
+                uint32_t yr = ref_over(yb, s[1 + k][0], s[1 + k][3]), cr = ref_chroma(cb, s[0], s[1], s[2], 1 + k);
+                if (y < prow)   /* the packets' bits in the chroma LSBs */
+                    ca >>= 1, cr >>= 1;
+                uint32_t dy = ya > yr ? ya - yr : yr - ya, dc = ca > cr ? ca - cr : cr - ca;
+                max_y = dy > max_y ? dy : max_y;
+                max_c = dc > max_c ? dc : max_c;
+                over2 += dy > 2 || dc > 2;
+                touched += yr != yb || cr != (y < prow ? cb >> 1 : cb);
+            }
+        }
+    dv_dmabuf_cpu(&a->buf, 0, 0);
+    dv_dmabuf_cpu(&b->buf, 0, 0);
+    /* the engine's own weights at 1:1 and 2x; else the sampler's filter, whose
+     * 8-bit weights move a sharp edge's pixels by up to 1/256 of the step */
+    int exact = (g_ov.w == W && g_ov.h == H) || (2 * g_ov.w == W && 2 * g_ov.h == H);
+    uint32_t tolerance = exact ? 1 : 16;
+    printf("overlay check %03d: %u pixels composited; against the reference: luma within %u, chroma within %u "
+           "codes, %u pixels beyond 2 (%s: within %u)\n", i, touched, max_y, max_c, over2,
+           exact ? "exact weights" : "the sampler's filter", tolerance);
+    free(t);
+    free(plan);
+    dvvk_plan_state_free(state);
+    return touched && max_y <= tolerance && max_c <= tolerance ? 0 : 1;
 }
 
 /* A sync_file signalled (timeout 0: now, -1: waits). */
@@ -436,6 +683,7 @@ static void usage(void)
                     "               [--el-upscale bilinear|annexb|bicubic|lanczos]\n"
                     "               [--filters cb1|phase] [--mmr exact|split|exact64|float] [--device NAME]\n"
                     "               [--pipeline-cache FILE] [--throughput S] [--play S] [--hash] [--dump DIR]\n"
+                    "               [--overlay WxH [--overlay-bottom-up] [--overlay-check]]\n"
                     "               [--json FILE] [--measure LIST] FILE\n"
                     "       dvbench --probe [--device NAME]\n");
 }
@@ -1285,7 +1533,8 @@ static int probe(struct pi_options *po)
 int main(int argc, char **argv)
 {
     struct dv_source_options so = {.kind = DV_SOURCE_SW};
-    int frames = 48, warmup = 8, hash = 0, probe_only = 0, frames_set = 0;
+    int frames = 48, warmup = 8, hash = 0, probe_only = 0, frames_set = 0, ov_bottom_up = 0, ov_check = 0;
+    unsigned ovw = 0, ovh = 0;
     double throughput = 0, play_seconds = 0;
     const char *file = NULL, *dump = NULL, *json = NULL;
     struct pi_options po;
@@ -1369,6 +1618,14 @@ int main(int argc, char **argv)
             ok = to_seconds(a, v, &play_seconds), i++;
         else if (!strcmp(a, "--hash"))
             hash = 1;
+        else if (!strcmp(a, "--overlay") && takes) {
+            if (sscanf(v, "%ux%u", &ovw, &ovh) != 2 || ovw < 2 || ovh < 2 || ovw > 7680 || ovh > 4320)
+                ok = bad_value(a, v);
+            i++;
+        } else if (!strcmp(a, "--overlay-bottom-up"))
+            ov_bottom_up = 1;
+        else if (!strcmp(a, "--overlay-check"))
+            ov_check = 1;
         else if (!strcmp(a, "--dump") && takes)
             dump = argv[++i];
         else if (!strcmp(a, "--json") && takes)
@@ -1488,6 +1745,8 @@ int main(int argc, char **argv)
         }
     const char *filters = po.filters == PI_FILTERS_CB1 ? "cb1" : "phase";
     printf("engine: %s, filters %s\n", pi_engine_describe(g_pi), filters);
+    if (ovw && overlay_make(ovw, ovh, ov_bottom_up))
+        return 1;
 
     /* 3. Per picture, synchronous. */
     int status = 0, failed = 0, timed = 0;
@@ -1539,6 +1798,15 @@ int main(int argc, char **argv)
             printf("; GPU passes (PI_PROFILE): P1 chroma %.2f, P2 4:2:2 + pack %.2f ms", pass_sum[0] / s.n,
                    pass_sum[1] / s.n);
         printf("\n");
+    }
+    if (ov_check && g_ov.on) {
+        int bad = 0;
+        for (int i = 0; i < count && i < 4; i++)
+            bad |= overlay_check(&pics[i], i, i * period, &po, &out[0], &out[1]) != 0;
+        if (bad) {
+            printf("overlay check FAILED\n");
+            status = 1;
+        }
     }
     if (g_kms) {
         struct kms k;
@@ -1653,6 +1921,8 @@ int main(int argc, char **argv)
         dv_picture_free(&pics[i]);
     for (unsigned i = 0; i < 3; i++)
         out_free(g_pi, &out[i]);
+    if (g_ov.ov)
+        pi_overlay_release(g_pi, g_ov.ov);
     pi_stream_close(g_pi);
     pi_engine_destroy(g_pi);
     dv_source_close(src);

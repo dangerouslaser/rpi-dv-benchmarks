@@ -20,6 +20,7 @@
 //     bit packing.
 // The block shares the chroma rows (both output rows' phases from one set
 // of fetches) and the EL rows k-1 .. k+1 (two gathers for all four pixels).
+// OVERLAY: then the overlay (subtitles) over it, in the source's signal.
 #include "common.glsl"
 
 layout(binding = 7) uniform usampler2D chroma420;   // pass 1: cw x ch, (Cb, Cr)
@@ -41,6 +42,13 @@ layout(constant_id = 6) const uint FULL422 = 0;
 // 2 bicubic (Catmull-Rom: Annex B's vertical, the horizontal -1 9 9 -1 / 16),
 // 3 Lanczos-3 (6-tap vertical and horizontal, / 1024).
 layout(constant_id = 7) const uint ELUP = 0;
+// The overlay pass's (PO) premultiplied codes composited over the block,
+// where P.orect says it may touch, sampled bilinearly at the output's
+// pixels: 1 the sampler's filter (any scale), 2 its exact weights at half
+// the output's size, 3 at the output's size (the filter's 8-bit weights and
+// coordinates would mix a neighbour into a texel centre).
+layout(constant_id = 8) const uint OVERLAY = 0;
+layout(binding = 16) uniform sampler2D overlay_codes;   // PO: (Y, Cb, Cr) x alpha / 4096, alpha
 
 uint packet_byte(uint i) { return (P.packets[i >> 4][(i >> 2) & 3u] >> (8u * (i & 3u))) & 255u; }
 
@@ -193,6 +201,70 @@ uvec4 el_lanczos(int px, int k)
     return uvec4(uint(even.x), uint(odd.x), uint(even.y), uint(odd.y));
 }
 
+uint over(uint v, float premultiplied, float a)
+{
+    return a > 0.0 ? uint(min(floor(float(v) * (1.0 - a) + premultiplied * 4096.0 + 0.5), 4095.0)) : v;
+}
+
+// One output row's chroma pair (Cb, Cr) under the overlay samples l, m, r at
+// x - 1, x, x + 1 (x even): yblod's 1:2:1 coverage filter.
+uvec2 over_chroma(uvec2 c, vec4 l, vec4 m, vec4 r)
+{
+    float coverage = (l.a + 2.0 * m.a + r.a) * 0.25;
+    if (coverage <= 0.0)
+        return c;
+    vec2 add = (l.yz + 2.0 * m.yz + r.yz) * 1024.0;
+    return uvec2(min(floor(vec2(c) * (1.0 - coverage) + add + 0.5), vec2(4095.0)));
+}
+
+// yblod's overlay blend (source_tunnel.cl SOURCE_OVERLAY) for the 2 x 2
+// block at (x, y): each pixel's luma under its own sample, each row's
+// chroma pair under the samples at x - 1, x, x + 1.
+vec4 code_at(int cx, int cy)
+{
+    return texelFetch(overlay_codes, clamp(ivec2(cx, cy), ivec2(0), ivec2(P.osrc.xy) - 1), 0);
+}
+
+void overlay(uint x, uint y, inout uvec4 yy, inout uvec4 c)
+{
+    if (x + 1u < P.orect.x || x >= P.orect.z || y + 1u < P.orect.y || y >= P.orect.w)
+        return;
+    vec4 l0, m0, r0, l1, m1, r1;   // rows y, y + 1 at x - 1, x, x + 1
+    if (OVERLAY == 3u) {
+        int ix = int(x), iy = int(y);
+        l0 = code_at(ix - 1, iy), m0 = code_at(ix, iy), r0 = code_at(ix + 1, iy);
+        l1 = code_at(ix - 1, iy + 1), m1 = code_at(ix, iy + 1), r1 = code_at(ix + 1, iy + 1);
+    } else if (OVERLAY == 2u) {
+        // texel coordinates: x - 1, x, x + 1 at px - 3/4, px - 1/4, px + 1/4; rows k -+ 1/4
+        int px = int(x >> 1), k = int(y >> 1);
+        vec4 a0 = code_at(px - 1, k - 1), a1 = code_at(px, k - 1), a2 = code_at(px + 1, k - 1),
+             b0 = code_at(px - 1, k), b1 = code_at(px, k), b2 = code_at(px + 1, k),
+             d0 = code_at(px - 1, k + 1), d1 = code_at(px, k + 1), d2 = code_at(px + 1, k + 1);
+        vec4 t0 = 0.25 * a0 + 0.75 * b0, t1 = 0.25 * a1 + 0.75 * b1, t2 = 0.25 * a2 + 0.75 * b2;   // row y
+        vec4 s0 = 0.75 * b0 + 0.25 * d0, s1 = 0.75 * b1 + 0.25 * d1, s2 = 0.75 * b2 + 0.25 * d2;   // row y + 1
+        l0 = 0.75 * t0 + 0.25 * t1, m0 = 0.25 * t0 + 0.75 * t1, r0 = 0.75 * t1 + 0.25 * t2;
+        l1 = 0.75 * s0 + 0.25 * s1, m1 = 0.25 * s0 + 0.75 * s1, r1 = 0.75 * s1 + 0.25 * s2;
+    } else {
+        float u = (float(x) + 0.5) * P.oinv.x, v0 = (float(y) + 0.5) * P.oinv.y, v1 = v0 + P.oinv.y;
+        l0 = textureLod(overlay_codes, vec2(u - P.oinv.x, v0), 0.0);
+        m0 = textureLod(overlay_codes, vec2(u, v0), 0.0);
+        r0 = textureLod(overlay_codes, vec2(u + P.oinv.x, v0), 0.0);
+        l1 = textureLod(overlay_codes, vec2(u - P.oinv.x, v1), 0.0);
+        m1 = textureLod(overlay_codes, vec2(u, v1), 0.0);
+        r1 = textureLod(overlay_codes, vec2(u + P.oinv.x, v1), 0.0);
+    }
+    yy = uvec4(over(yy.x, m0.x, m0.a), over(yy.y, r0.x, r0.a), over(yy.z, m1.x, m1.a), over(yy.w, r1.x, r1.a));
+    c = uvec4(over_chroma(c.xy, l0, m0, r0), over_chroma(c.zw, l1, m1, r1));
+}
+
+void pack_block(uint x, uint y, uvec4 yy, uvec4 c, out uvec2 top, out uvec2 bottom)
+{
+    if (OVERLAY != 0u)
+        overlay(x, y, yy, c);
+    top = uvec2(finish(x, y, yy.x, c.x), finish(x + 1u, y, yy.y, c.y));
+    bottom = uvec2(finish(x, y + 1u, yy.z, c.z), finish(x + 1u, y + 1u, yy.w, c.w));
+}
+
 // A 2 x 2 block at (x, y): its luma from BL samples b and EL e, chroma c
 // (Cb, Cr, Cb, Cr), the letterbox's black outside the active area, packed.
 void block(uint x, uint y, uvec4 b, uvec4 e, uvec4 c, out uvec2 top, out uvec2 bottom)
@@ -205,8 +277,7 @@ void block(uint x, uint y, uvec4 b, uvec4 e, uvec4 c, out uvec2 top, out uvec2 b
         yy = mix(yy, uvec4(P.black.x), black);
         c = mix(c, uvec4(P.black.y, P.black.z, P.black.y, P.black.z), black);
     }
-    top = uvec2(finish(x, y, yy.x, c.x), finish(x + 1u, y, yy.y, c.y));
-    bottom = uvec2(finish(x, y + 1u, yy.z, c.z), finish(x + 1u, y + 1u, yy.w, c.w));
+    pack_block(x, y, yy, c, top, bottom);
 }
 
 void main()
@@ -219,13 +290,11 @@ void main()
     }
 
     // BARS: the pipeline drawn over the letterbox's bars (rows wholly outside
-    // the active area): black and the metadata packets, nothing fetched; pass
-    // 1 didn't reconstruct these rows. A separate pipeline, so the main one's
-    // code is untouched by it.
+    // the active area): black and the metadata packets (and the overlay),
+    // nothing else fetched; pass 1 didn't reconstruct these rows. A separate
+    // pipeline, so the main one's code is untouched by it.
     if (BARS != 0u) {
-        uint by = P.black.x, bcb = P.black.y, bcr = P.black.z;
-        o_even = uvec2(finish(x, y0, by, bcb), finish(x + 1u, y0, by, bcr));
-        o_odd = uvec2(finish(x, y0 + 1u, by, bcb), finish(x + 1u, y0 + 1u, by, bcr));
+        pack_block(x, y0, uvec4(P.black.x), P.black.yzyz, o_even, o_odd);
         return;
     }
 
