@@ -285,8 +285,8 @@ Each kind of access takes a different hardware path:
     **~18 ms of GPU per frame, 57.7 fps, before any DV processing** (5.0 ms of it
     the detile). [P] mesa e2f05fca
   - **Vulkan**: no SAND import. The only routes are importing the dma-buf as a
-    buffer and de-SANDing in the shader (the engine reads it as an `R32UI`
-    texel buffer), or a copy.
+    buffer and de-SANDing in the shader (the engine reads it as `R32UI` and
+    `RG32UI` texel buffers), or a copy.
 - **HDMI output:** vc4's HDMI connector has `Broadcast RGB`, `max bpc`,
   `Colorspace` and `HDR_OUTPUT_METADATA`. For standard Dolby Vision the
   engine's tunnel frame goes out as 8-bit full-range RGB with a Dolby Vision

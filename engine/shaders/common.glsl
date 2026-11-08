@@ -38,6 +38,9 @@ layout(binding = 2) uniform usamplerBuffer tables64;   // the same buffer as RG3
 const int T_MAP = 0, T_RES = 1024, T_CMAP = 4096, T_LUTF = 6144, T_LUT64 = 12288, T_SINGLE = 24576,
           T_WIDE = 27648;
 
+// The BL luma SAND as RG32UI (word pairs: sand_even2).
+layout(binding = 13) uniform usamplerBuffer bl_y2;
+
 int edge(int p, uint n) { return clamp(p, 0, int(n) - 1); }
 
 // n / 3 without an integer divider (V3D has none): exact for n < 2^20.
@@ -49,6 +52,20 @@ int sand_index(uint base, uint colh, uint w, uint row)
 {
     uint b = w * 4u;
     return int(base + ((b & 127u) >> 2) + row * 32u + (b >> 7) * 32u * colh);
+}
+
+// Samples 2q, 2q + 1 of a SAND row, from the plane's RG32UI view (word
+// pairs; base even): both are in the aligned word pair 2m, 2m + 1 (samples
+// 6m .. 6m+5, m = q / 3), so one 8-byte fetch, never split over two pairs or
+// two columns.
+uvec2 sand_even2(usamplerBuffer pairs, uint base, uint colh, uint q, uint row)
+{
+    uint m = div3(q), s = q - 3u * m;   // sample 2q = 6m + 2s
+    uvec2 a = texelFetch(pairs, sand_index(base, colh, 2u * m, row) >> 1).rg;
+    // 2q: word 0 bits 0, 20 (s 0, 1), word 1 bits 10 (s 2); 2q + 1: word 0
+    // bits 10 (s 0), word 1 bits 0, 20 (s 1, 2)
+    return uvec2((s == 2u ? a.y : a.x) >> (s == 0u ? 0u : s == 1u ? 20u : 10u),
+                 (s != 0u ? a.y : a.x) >> (s == 0u ? 10u : s == 1u ? 0u : 20u)) & 1023u;
 }
 
 // a + b, mod 2^64 (lo, hi words)

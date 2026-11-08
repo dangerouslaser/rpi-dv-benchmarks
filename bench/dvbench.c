@@ -55,7 +55,7 @@
  *     --json FILE        machine-readable summary
  *     --measure LIST     measurement switches, comma-separated: all_rows,
  *                        draw_bars, piece_general, mark, copy_output,
- *                        force_wide, el_out (pi_options.measure; as the PI_*
+ *                        force_wide, el_out, no_quad (pi_options.measure; as the PI_*
  *                        below)
  *     --probe            only check the dmabuf allocation, the device and an
  *                        output import (3840x2160); exit 0 if they work
@@ -478,7 +478,8 @@ static const struct {
              {"mark", "PI_MARK", PI_MEASURE_MARK},
              {"copy_output", "PI_COPY_OUTPUT", PI_MEASURE_COPY_OUTPUT},
              {"force_wide", "PI_FORCE_WIDE", PI_MEASURE_FORCE_WIDE},
-             {"el_out", "PI_EL_OUT", PI_MEASURE_EL_OUT}};
+             {"el_out", "PI_EL_OUT", PI_MEASURE_EL_OUT},
+             {"no_quad", "PI_NO_QUAD", PI_MEASURE_NO_QUAD}};
 enum { NKNOBS = sizeof(knobs) / sizeof(knobs[0]) };
 
 static int measure_list(const char *opt, const char *v, unsigned *out)

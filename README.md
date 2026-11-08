@@ -16,13 +16,16 @@ the kernel's `Dolby Vision` connector property (`patches/linux/`), Kodi's
 renderer, EL decoder and Dolby Vision settings (`patches/kodi/`), and the
 LibreELEC package and options (`patches/libreelec/`).
 
-| Film, Pi 5 at stock clocks (dvbench) | Per picture | Real time at 23.976 fps |
-|---|---|---|
-| 1917: UHD Blu-ray, Profile 7.6 FEL, MMR, exact | 33.0 ms | 4 × 120 s with display fences: 1 late frame (0.8 ms) |
-| Dune (2021): Profile 7.6 MEL | 16.1 ms | 60 s, 0 late |
-| Profile 8.1 with MMR chroma | 26–28 ms | 8 s, 0 late |
-| Sol Levante (Dolby's samples): Profiles 5, 8.1 | 18.3 ms; 1080p 4.7 ms | 90 s, 0 late |
-| Sol Levante: Profile 8.4 (HLG base) | 30.8 ms | the whole film, 1 late frame |
+| Stream, Pi 5 at stock clocks (dvbench, LibreELEC 13) | GPU time per picture |
+|---|---|
+| 1917: UHD Blu-ray, Profile 7.6 FEL, MMR, exact (2.39:1) | 29.1 ms |
+| Profile 7 FEL with MMR, every row (as a full-height film) | 38.0 ms |
+| Profile 7 MEL (Gemini Man, The Matrix) | 13.8–17.4 ms |
+| Profile 8.1 with MMR chroma | 23.7 ms |
+| Sol Levante (Dolby's samples): Profiles 5, 8.1 | 16.1 ms; 1080p 4.0 ms |
+| Sol Levante: Profile 8.4 (HLG base) | 27.0–32.5 ms |
+
+24p allows 41.7 ms a picture.
 
 The design, its routes, MMR modes and measurements are in
 [docs/ENGINE.md](docs/ENGINE.md). The Pi 5 GPU and its Vulkan driver are in

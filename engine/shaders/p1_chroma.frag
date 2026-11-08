@@ -1,6 +1,8 @@
 #version 450
 // SPDX-License-Identifier: GPL-2.0-or-later
 #extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_quad : require
+#extension GL_KHR_shader_subgroup_shuffle : require
 // Pass 1, one fragment per 4:2:0 chroma sample (cx, k), cw x ch:
 //   - the reconstructed chroma (12-bit Cb, Cr): BL chroma phase, the luma
 //     guide, the EL chroma (phase, 64/192 vertical, bilinear or Annex B's
@@ -404,15 +406,22 @@ uvec2 mmr(uvec3 s0, uvec3 s1, bool both, ivec2 r)
 }
 
 // ---- the luma guide and route 3 ----------------------------------------------
-// One row's [1 2 1] / 4 of the BL luma at pixels 2cx-1 .. 2cx+1 (the first clamped).
+// One row's [1 2 1] / 4 of the BL luma at pixels 2cx-1 .. 2cx+1 (the first
+// clamped). Pixels 2cx, 2cx+1 are in the aligned word pair m = cx / 3 (one
+// 8-byte fetch, sand_even2); so is 2cx-1, but at cx = 3m: there it is the
+// previous word's last sample (pixel 0 itself at cx 0).
 uint guide_row(uint cx, uint y)
 {
-    uint n = cx != 0u ? 2u * cx - 1u : 0u, w = div3(n), sub = n - 3u * w;
-    uint wa = word(bl_y, P.bl.x, P.bl.z, w, y);
-    uint wb = sub != 0u ? word(bl_y, P.bl.x, P.bl.z, w + 1u, y) : wa;   /* pixel 2cx + 1 exists */
-    uvec3 t = cx != 0u ? uvec3(pick(wa, wb, sub), pick(wa, wb, sub + 1u), pick(wa, wb, sub + 2u))
-                       : uvec3(pick(wa, wb, 0u), pick(wa, wb, 0u), pick(wa, wb, 1u));
-    return (t.x + 2u * t.y + t.z + 2u) >> 2;
+    uint m = div3(cx), s = cx - 3u * m, w = 2u * m;
+    uvec2 a = texelFetch(bl_y2, sand_index(P.bl.x, P.bl.z, w, y) >> 1).rg;
+    uint p0 = (s == 2u ? a.y : a.x) >> (s == 0u ? 0u : s == 1u ? 20u : 10u);   // 2cx
+    uint p1 = (s != 0u ? a.y : a.x) >> (s == 0u ? 10u : s == 1u ? 0u : 20u);   // 2cx + 1
+    uint pm;                                                                    // 2cx - 1
+    if (s == 0u)
+        pm = cx != 0u ? word(bl_y, P.bl.x, P.bl.z, w - 1u, y) >> 20 : a.x;
+    else
+        pm = s == 1u ? a.x >> 10 : a.y;
+    return ((pm & 1023u) + 2u * (p0 & 1023u) + (p1 & 1023u) + 2u) >> 2;
 }
 
 // Route 3's chroma (12-bit Cb, Cr) of input (guide, Cb, Cr).
@@ -475,14 +484,13 @@ void main()
             // the EL chroma at (cx, k): co-sited horizontally, bilinear (or
             // Annex B's 8-tap) between
             uvec2 e;
-            if (ELUP != 0u && (cx & 1u) != 0u)
-                e = el_horizontal(cx >> 1, k);
-            else if (ELUP != 0u)
-                e = uvec2(min(evc(int(cx >> 1), k), ivec2(1023)));
-            else {
-                uvec4 ev = el_vertical(cx >> 1, k);
+            if (ELUP == 0u) {
+                uvec4 ev = QUAD != 0u ? el_vertical_quad(cx >> 1, k) : el_vertical(cx >> 1, k);
                 e = min((cx & 1u) != 0u ? (ev.xy + ev.zw + 1u) >> 1 : ev.xy, uvec2(1023u));
-            }
+            } else if (ELUP != 0u && (cx & 1u) != 0u)
+                e = el_horizontal(cx >> 1, k);
+            else
+                e = uvec2(min(evc(int(cx >> 1), k), ivec2(1023)));
 
             ivec2 r = ivec2(int(texelFetch(tables, T_RES + 1024 + int(e.x)).r), int(texelFetch(tables, T_RES + 2048 + int(e.y)).r));
             uvec3 s = uvec3(guide, bp.x, bp.y);

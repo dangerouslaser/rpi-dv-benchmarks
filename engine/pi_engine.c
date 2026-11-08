@@ -87,15 +87,17 @@ static const struct {
     {10, VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER},   /* tables, RGBA32UI */
     {11, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER},         /* route 3: dv_single_reshape */
     {12, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER}, /* P0's EL chroma, filtered vertically */
+    {13, VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER},   /* BL luma, RG32UI (word pairs) */
+    {14, VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER},   /* BL chroma, RG32UI */
 };
 enum { NB = sizeof(bindings) / sizeof(bindings[0]) };
 
-/* Specialisation keys: P1's constant ids 0..14, and K1_PRE, which selects P0's
- * shader (its METHOD and ELUP are P1's ids); P2's 1..7. */
+/* Specialisation keys: P1's constant ids 0..15, and K1_PRE, which selects P0's
+ * shader (its METHOD, ELUP and QUAD are P1's ids); P2's 1..7. */
 enum { K1_MODE, K1_METHOD, K1_DUAL, K1_KIND0, K1_KIND1, K1_ORDER0, K1_ORDER1, K1_SINGLE, K1_PIECE, K1_ORDER2,
-       K1_FAST, K1_MARK, K1_GUARD, K1_ELUP, K1_ELOUT, K1_PRE, K1_N };
+       K1_FAST, K1_MARK, K1_GUARD, K1_ELUP, K1_ELOUT, K1_QUAD, K1_PRE, K1_N };
 enum { K2_ANNEXB, K2_TOP_LEFT, K2_ABLATE, K2_BARS, K2_SINGLE, K2_FULL422, K2_ELUP, K2_N };
-enum { MAX_SPEC = 16, KEY_MAX = K1_N };
+enum { MAX_SPEC = 17, KEY_MAX = K1_N };
 _Static_assert((int)K1_N <= (int)MAX_SPEC && (int)K2_N + 1 <= (int)MAX_SPEC, "a specialisation map fits its entries");
 
 /* yblod's dv_single_reshape (single_reshape.h), as the planner fills
@@ -129,7 +131,7 @@ struct import {
     ino_t ino;
     VkBuffer buf;
     VkDeviceMemory mem;
-    VkBufferView view;
+    VkBufferView view, view64;   /* R32UI, RG32UI */
     uint64_t last_used;   /* the render serial that last read it */
     int refs;             /* in-flight renders reading it */
     struct import *next;
@@ -217,6 +219,7 @@ struct pi_engine {
     PFN_vkGetSemaphoreFdKHR get_sem_fd;
     PFN_vkGetFenceFdKHR get_fence_fd;
     int modifiers, foreign, sem_fd, fence_fd, profile;
+    int quad;   /* fragment shaders have subgroup quad operations */
     double ts_period;
     VkSampler sampler;
     VkDescriptorSetLayout dsl;
@@ -313,12 +316,13 @@ static const char *mode_name(enum pi_mmr_mode m);
 /* pi_engine_describe's string, from the current options. */
 static void describe(struct pi_engine *e)
 {
-    snprintf(e->name, sizeof(e->name), "%s, MMR %s, output %s%s", e->device, mode_name(e->o.mmr),
+    snprintf(e->name, sizeof(e->name), "%s, MMR %s, output %s%s%s", e->device, mode_name(e->o.mmr),
              e->modifiers ? "rendered in place" : "copied",
              e->o.el_upscale == PI_EL_ANNEX_B   ? ", EL Annex B"
              : e->o.el_upscale == PI_EL_BICUBIC ? ", EL bicubic"
              : e->o.el_upscale == PI_EL_LANCZOS ? ", EL Lanczos"
-                                                : "");
+                                                : "",
+             e->quad && !(e->o.measure & PI_MEASURE_NO_QUAD) ? "" : ", no quad sharing");
 }
 
 static const char *mode_name(enum pi_mmr_mode m)
@@ -448,12 +452,13 @@ static off_t dmabuf_size(int fd)
 static void import_free(struct pi_engine *e, struct import *i)
 {
     vkDestroyBufferView(e->dev, i->view, NULL);
+    vkDestroyBufferView(e->dev, i->view64, NULL);
     vkDestroyBuffer(e->dev, i->buf, NULL);
     vkFreeMemory(e->dev, i->mem, NULL);
     free(i);
 }
 
-/* A decoder dmabuf as an R32UI texel buffer, once per buffer. */
+/* A decoder dmabuf as R32UI and RG32UI texel buffers, once per buffer. */
 static struct import *import_dmabuf(struct pi_engine *e, int fd)
 {
     struct stat st;
@@ -491,6 +496,9 @@ static struct import *import_dmabuf(struct pi_engine *e, int fd)
     VkBufferViewCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO, .buffer = i->buf,
                                  .format = VK_FORMAT_R32_UINT, .range = VK_WHOLE_SIZE};
     if (vkCreateBufferView(e->dev, &vi, NULL, &i->view) != VK_SUCCESS)
+        goto fail;
+    vi.format = VK_FORMAT_R32G32_UINT;
+    if (vkCreateBufferView(e->dev, &vi, NULL, &i->view64) != VK_SUCCESS)
         goto fail;
     i->next = e->imports;
     e->imports = i;
@@ -917,6 +925,13 @@ static int create_device(struct pi_engine *e)
         return rc;
     vkGetPhysicalDeviceMemoryProperties(e->phys, &e->mp);
     e->ts_period = props.limits.timestampPeriod;
+    if (props.apiVersion >= VK_API_VERSION_1_1) {
+        VkPhysicalDeviceSubgroupProperties sg = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
+        VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &sg};
+        vkGetPhysicalDeviceProperties2(e->phys, &p2);
+        e->quad = (sg.supportedStages & VK_SHADER_STAGE_FRAGMENT_BIT) &&
+                  (sg.supportedOperations & VK_SUBGROUP_FEATURE_QUAD_BIT);
+    }
     const char *exts[8];
     uint32_t next;
     if ((rc = device_extensions(e, &props, exts, &next)))
@@ -1819,7 +1834,8 @@ static int frame_ok(struct pi_engine *e, const AVFrame *f)
     }
     for (int p = 0; p < 2; p++) {
         const AVDRMPlaneDescriptor *pl = &d->layers[0].planes[p];
-        if (pl->object_index < 0 || pl->object_index >= d->nb_objects || pl->offset < 0 || (pl->offset & 3) ||
+        /* 8-byte aligned: the BL planes are also read as word pairs */
+        if (pl->object_index < 0 || pl->object_index >= d->nb_objects || pl->offset < 0 || (pl->offset & 7) ||
             d->objects[pl->object_index].fd < 0)
             return 0;
     }
@@ -1831,7 +1847,7 @@ static int frame_ok(struct pi_engine *e, const AVFrame *f)
 static int bind_inputs(struct pi_engine *e, struct ctx *c, const AVFrame *bl, const AVFrame *el, struct params *q)
 {
     const AVFrame *f[2] = {bl, el};
-    VkBufferView views[4];
+    VkBufferView views[6];
     for (int l = 0; l < 2; l++) {
         const AVDRMFrameDescriptor *d = (const void *)f[l]->data[0];   /* frame_ok checked it */
         const AVDRMLayerDescriptor *ly = &d->layers[0];
@@ -1862,13 +1878,15 @@ static int bind_inputs(struct pi_engine *e, struct ctx *c, const AVFrame *bl, co
         o[2] = column ? column : (uint32_t)ly->planes[0].pitch;
         o[3] = column ? column : (uint32_t)ly->planes[1].pitch;
     }
-    VkWriteDescriptorSet wr[4];
-    for (int i = 0; i < 4; i++)
+    views[4] = c->in[0]->view64;   /* the BL planes as word pairs */
+    views[5] = c->in[1]->view64;
+    VkWriteDescriptorSet wr[6];
+    for (int i = 0; i < 6; i++)
         wr[i] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = c->ds,
-                                       .dstBinding = 3u + (uint32_t)i, .descriptorCount = 1,
+                                       .dstBinding = i < 4 ? 3u + (uint32_t)i : 9u + (uint32_t)i, .descriptorCount = 1,
                                        .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER,
                                        .pTexelBufferView = &views[i]};
-    vkUpdateDescriptorSets(e->dev, 4, wr, 0, NULL);
+    vkUpdateDescriptorSets(e->dev, 6, wr, 0, NULL);
     return 0;
 }
 
@@ -1924,6 +1942,7 @@ static void keys(const struct pi_engine *e, const dvvk_plan *p, uint32_t k1[K1_N
                   : e->o.el_upscale == PI_EL_LANCZOS      ? 3u
                                                           : 0u;
     k1[K1_ELOUT] = (e->o.measure & PI_MEASURE_EL_OUT) != 0;
+    k1[K1_QUAD] = e->quad && !(e->o.measure & PI_MEASURE_NO_QUAD);
     if (k1[K1_MODE] == PI_MMR_SPLIT || k1[K1_MODE] == PI_MMR_EXACT)
         k1[K1_GUARD] = rt->guard;
     memset(k2, 0, K2_N * 4);
@@ -2247,7 +2266,8 @@ int pi_render(struct pi_engine *e, const struct pi_frame *f, struct pi_output *o
     keys(e, p, k1, k2);
     VkPipeline p1 = build(e, 0, k1), p2 = build(e, 1, k2), pb = build(e, 1, kb), p0 = VK_NULL_HANDLE;
     if (k1[K1_ELUP]) {   /* P0: only the EL selectors matter */
-        uint32_t k0[K1_N] = {[K1_METHOD] = k1[K1_METHOD], [K1_ELUP] = k1[K1_ELUP], [K1_PRE] = 1};
+        uint32_t k0[K1_N] = {[K1_METHOD] = k1[K1_METHOD], [K1_ELUP] = k1[K1_ELUP], [K1_QUAD] = k1[K1_QUAD],
+                             [K1_PRE] = 1};
         p0 = build(e, 0, k0);
     }
     if (!p1 || !p2 || !pb || (k1[K1_ELUP] && !p0)) {

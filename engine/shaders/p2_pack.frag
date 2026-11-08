@@ -22,7 +22,6 @@
 // of fetches) and the EL rows k-1 .. k+1 (two gathers for all four pixels).
 #include "common.glsl"
 
-layout(binding = 3) uniform usamplerBuffer bl_y;
 layout(binding = 7) uniform usampler2D chroma420;   // pass 1: cw x ch, (Cb, Cr)
 layout(binding = 8) uniform usampler2D el_luma;     // pass 1: cw x ch, clamp to edge
 layout(location = 0) out uvec2 o_even;   // row 2k:   pixels 2px, 2px+1
@@ -45,25 +44,13 @@ layout(constant_id = 7) const uint ELUP = 0;
 
 uint packet_byte(uint i) { return (P.packets[i >> 4][(i >> 2) & 3u] >> (8u * (i & 3u))) & 255u; }
 
-// BL luma samples x, x + 1 of rows y0, y0 + 1 (one word a row unless x is a
-// word's last): (row y0 x, x+1, row y0+1 x, x+1). The rows' words are 32
-// apart (a 128-byte column row).
-uvec4 bl_block(uint x, uint y0)
+// BL luma samples x, x + 1 of rows y0, y0 + 1, x = 2px: (row y0 x, x+1, row
+// y0+1 x, x+1), one 8-byte fetch a row.
+uvec4 bl_block(uint px, uint y0)
 {
     if ((ABLATE & 8u) != 0u)
-        return uvec4(x, x + 1u, x + y0, x) & 1023u;
-    // x + 1 < w: a word's last sample's neighbour is in the row's next word
-    uint w = div3(x), sub = x - 3u * w, b = w * 4u;
-    int i = sand_index(P.bl.x, P.bl.z, w, y0);
-    uint a0 = texelFetch(bl_y, i).r, a1 = texelFetch(bl_y, i + 32).r;
-    uvec4 v;
-    if (sub == 2u) {
-        // the next word: the next in the column, or the next column's first
-        int j = ((b + 4u) & 127u) != 0u ? i + 1 : i - 31 + int(32u * P.bl.z);
-        v = uvec4(a0 >> 20, texelFetch(bl_y, j).r, a1 >> 20, texelFetch(bl_y, j + 32).r);
-    } else
-        v = uvec4(a0 >> (10u * sub), a0 >> (10u * sub + 10u), a1 >> (10u * sub), a1 >> (10u * sub + 10u));
-    return v & 1023u;
+        return uvec4(px, px + 1u, px + y0, px) & 1023u;
+    return uvec4(sand_even2(bl_y2, P.bl.x, P.bl.z, px, y0), sand_even2(bl_y2, P.bl.x, P.bl.z, px, y0 + 1u));
 }
 
 uint luma(uint base, uint e)
@@ -276,5 +263,5 @@ void main()
         vec2 at = vec2(float(px + 1u), float(k)) * P.inv.xy;   // rows k-1, k
         el = el_block(textureGather(el_luma, at, 0), textureGather(el_luma, at + vec2(0.0, P.inv.y), 0));
     }
-    block(x, y0, bl_block(x, y0), el, uvec4(e, d), o_even, o_odd);
+    block(x, y0, bl_block(px, y0), el, uvec4(e, d), o_even, o_odd);
 }

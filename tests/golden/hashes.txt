@@ -180,3 +180,21 @@ DV FEL Power Rangers Credits Test.mkv | --el-upscale lanczos --filters yblod | 0
 DV FEL Power Rangers Credits Test.mkv | --el-upscale lanczos --filters yblod | 003 | e9f5a6b5a0b2d07a
 DV FEL Power Rangers Credits Test.mkv | --el-upscale lanczos --filters yblod | 004 | 577e815fda2ac4bd
 DV FEL Power Rangers Credits Test.mkv | --el-upscale lanczos --filters yblod | 005 | a99c3241e12ac670
+DV FEL Power Rangers Credits Test.mkv | --filters yblod --measure no_quad | 000 | 3f10d3b8a5e2fd45
+DV FEL Power Rangers Credits Test.mkv | --filters yblod --measure no_quad | 001 | c076676ba3064a26
+DV FEL Power Rangers Credits Test.mkv | --filters yblod --measure no_quad | 002 | 0ffc2e0eb148d7f3
+DV FEL Power Rangers Credits Test.mkv | --filters yblod --measure no_quad | 003 | 56cd32046d78ca3a
+DV FEL Power Rangers Credits Test.mkv | --filters yblod --measure no_quad | 004 | 928dccebcd802b8f
+DV FEL Power Rangers Credits Test.mkv | --filters yblod --measure no_quad | 005 | 3b3ea56bcb0f756a
+DV FEL Power Rangers Credits Test.mkv | --el-upscale bicubic --measure no_quad | 000 | adbae1a5311ddc8f
+DV FEL Power Rangers Credits Test.mkv | --el-upscale bicubic --measure no_quad | 001 | b3ca11a878a9be98
+DV FEL Power Rangers Credits Test.mkv | --el-upscale bicubic --measure no_quad | 002 | 54bfe8911bd8589f
+DV FEL Power Rangers Credits Test.mkv | --el-upscale bicubic --measure no_quad | 003 | 12dd0f5fd9b30432
+DV FEL Power Rangers Credits Test.mkv | --el-upscale bicubic --measure no_quad | 004 | cf2de9c1724dfa61
+DV FEL Power Rangers Credits Test.mkv | --el-upscale bicubic --measure no_quad | 005 | 69515e5822ed0c58
+DV FEL Power Rangers Credits Test.mkv | --el-upscale lanczos --filters yblod --measure no_quad | 000 | 9280629640e47a0f
+DV FEL Power Rangers Credits Test.mkv | --el-upscale lanczos --filters yblod --measure no_quad | 001 | dfc82726da609bac
+DV FEL Power Rangers Credits Test.mkv | --el-upscale lanczos --filters yblod --measure no_quad | 002 | 4dba2f06aff4ce47
+DV FEL Power Rangers Credits Test.mkv | --el-upscale lanczos --filters yblod --measure no_quad | 003 | e9f5a6b5a0b2d07a
+DV FEL Power Rangers Credits Test.mkv | --el-upscale lanczos --filters yblod --measure no_quad | 004 | 577e815fda2ac4bd
+DV FEL Power Rangers Credits Test.mkv | --el-upscale lanczos --filters yblod --measure no_quad | 005 | a99c3241e12ac670

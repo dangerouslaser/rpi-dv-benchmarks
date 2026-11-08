@@ -91,6 +91,7 @@ enum {
     PI_MEASURE_COPY_OUTPUT = 16,  /* render into own images and copy (no DRM format modifiers) */
     PI_MEASURE_FORCE_WIDE = 32,   /* compute 64-bit LUT MMRs as MMR128 (the 128-bit path's test) */
     PI_MEASURE_EL_OUT = 64,       /* pass 1 writes the upscaled EL chroma as its chroma (the EL upscale's test) */
+    PI_MEASURE_NO_QUAD = 128,     /* no subgroup quad sharing (the path of devices without it) */
 };
 
 struct pi_options {

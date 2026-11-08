@@ -4,6 +4,7 @@
 // per frame for the sharper EL upscales.
 layout(binding = 4) uniform usamplerBuffer bl_c;
 layout(binding = 6) uniform usamplerBuffer el_c;
+layout(binding = 14) uniform usamplerBuffer bl_c2;   // the BL chroma as RG32UI: word pairs
 // The chroma phase method (the stream's selector).
 layout(constant_id = 1) const uint METHOD = 2;
 // The EL upscale (pi_engine.h enum pi_el_upscale): 0 bilinear, 1 CCM
@@ -11,6 +12,9 @@ layout(constant_id = 1) const uint METHOD = 2;
 // (Catmull-Rom: the vertical 4-tap, the horizontal -1 9 9 -1 / 16), 3
 // Lanczos-3 (6-tap vertical and horizontal, / 1024).
 layout(constant_id = 13) const uint ELUP = 0;
+// The device has subgroup quad operations in fragment shaders: el_vertical_quad
+// shares the EL chroma rows across each 2 x 2 fragment quad.
+layout(constant_id = 15) const uint QUAD = 0;
 
 // ---- SAND reads ------------------------------------------------------------
 // Every read stays in its row: a word is read only when it holds a sample
@@ -27,13 +31,6 @@ uint sand1(usamplerBuffer buf, uint base, uint colh, uint n, uint row)
     uint w = div3(n);
     return (word(buf, base, colh, w, row) >> (10u * (n - 3u * w))) & 1023u;
 }
-// samples n, n+1 (one word unless n is a word's last); n + 1 must exist
-uvec2 sand2(usamplerBuffer buf, uint base, uint colh, uint n, uint row)
-{
-    uint w = div3(n), sub = n - 3u * w, a = word(buf, base, colh, w, row);
-    uint b = sub == 2u ? word(buf, base, colh, w + 1u, row) : a;
-    return uvec2(pick(a, b, sub), pick(a, b, sub + 1u));
-}
 // samples n .. n+3 (two words: n + 3 is in the second); n + 3 must exist
 uvec4 sand4(usamplerBuffer buf, uint base, uint colh, uint n, uint row)
 {
@@ -41,7 +38,7 @@ uvec4 sand4(usamplerBuffer buf, uint base, uint colh, uint n, uint row)
     uint a = word(buf, base, colh, w, row), b = word(buf, base, colh, w + 1u, row);
     return uvec4(pick(a, b, sub), pick(a, b, sub + 1u), pick(a, b, sub + 2u), pick(a, b, sub + 3u));
 }
-uvec2 bl_chroma(uint cx, uint row) { return sand2(bl_c, P.bl.y, P.bl.w, 2u * cx, row); }
+uvec2 bl_chroma(uint cx, uint row) { return sand_even2(bl_c2, P.bl.y, P.bl.w, cx, row); }
 
 // (Cb, Cr) of chroma column x and of x + 1 (clamped to the plane: the last
 // column's pair is read with its left neighbour, in the plane)
@@ -103,3 +100,41 @@ uvec4 el_vertical(uint ex, uint k)
     return res;
 }
 
+// ---- el_vertical, shared by a 2 x 2 fragment quad ---------------------------
+// The quad's four fragments read the same EL chroma column pair X, X + 1 and,
+// their rows k being 2yy and 2yy + 1, together 3 (64/192), 5 (Catmull-Rom)
+// or 7 (Lanczos-3) EL chroma rows: each lane phases one or two of them and
+// takes the others from its neighbours (gl_SubgroupInvocationID's quad: four
+// consecutive lanes, the horizontal pairs lane ^ 1).
+ivec4 quad_row(uint x, int row) { return ivec4(phase(true, x, row, P.el_size.y)); }
+
+// el_vertical(x, k) for the quad sharing column pair x (and k >> 1).
+uvec4 el_vertical_quad(uint x, uint k)
+{
+    int yy = int(k >> 1);
+    uint odd = k & 1u, id = gl_SubgroupInvocationID, lane = id & 3u, qb = id & ~3u;
+    uvec4 res;
+    if (ELUP == 3u) {   // rows yy-3 .. yy+3: lane l phases yy-3+l and yy+1+l
+        ivec4 s0 = quad_row(x, yy - 3 + int(lane)), s1 = quad_row(x, yy + 1 + int(lane));
+        // tap t: row yy-3 + odd + t, of lane (odd + t) & 3, its row (odd + t) >> 2
+        ivec4 x3 = subgroupShuffle(s0, qb | 3u), y3 = subgroupShuffle(s1, qb);
+        ivec4 a = subgroupShuffle(s0, qb | odd), b = subgroupShuffle(s0, qb | (odd + 1u)),
+              c = subgroupShuffle(s0, qb | (odd + 2u)), d = odd != 0u ? y3 : x3,
+              f = subgroupShuffle(s1, qb | odd), g = subgroupShuffle(s1, qb | (odd + 1u));
+        ivec4 s = odd == 0u ? 8 * a - 70 * b + 277 * c + 914 * d - 136 * f + 31 * g
+                            : 31 * a - 136 * b + 914 * c + 277 * d - 70 * f + 8 * g;
+        res = uvec4(max((s + 512) >> 10, ivec4(0)));
+    } else if (ELUP == 2u) {   // rows yy-2 .. yy+2: lane l phases yy-2+l, every lane yy+2
+        ivec4 s0 = quad_row(x, yy - 2 + int(lane)), s1 = quad_row(x, yy + 2);
+        ivec4 x3 = subgroupShuffle(s0, qb | 3u);
+        ivec4 a = subgroupShuffle(s0, qb | odd), b = subgroupShuffle(s0, qb | (odd + 1u)),
+              c = subgroupShuffle(s0, qb | (odd + 2u)), d = odd != 0u ? s1 : x3;
+        ivec4 s = odd == 0u ? -3 * a + 29 * b + 111 * c - 9 * d : -9 * a + 111 * b + 29 * c - 3 * d;
+        res = uvec4(max((s + 64) >> 7, ivec4(0)));
+    } else {   // rows yy-1 .. yy+1: the left lanes phase their other row, the right ones yy
+        bool right = (uint(gl_FragCoord.x) & 1u) != 0u;   // lane ^ 1 is the fragment beside
+        ivec4 v = quad_row(x, right ? yy : odd != 0u ? yy + 1 : yy - 1), h = subgroupQuadSwapHorizontal(v);
+        res = uvec4((192 * (right ? v : h) + 64 * (right ? h : v) + 128) >> 8);
+    }
+    return res;
+}

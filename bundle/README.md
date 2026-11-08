@@ -89,7 +89,8 @@ bin/dvbench --help    # the option list
   doesn't take.
 - `--mmr exact|split|exact64|float` selects the MMR mode.
 - `--el-upscale bilinear|bicubic|annexb|lanczos` selects the FEL's EL
-  upscale (bilinear is the default and the only one real time at 4K).
+  upscale (bilinear is the default; the others fit 4K24 only on letterboxed
+  films).
 - `--kms-play S` plays S seconds on the HDMI output as Dolby Vision (the
   kernel's `Dolby Vision` property, `patches/linux/`).
 - `--probe` checks the dmabuf allocator, the Vulkan device and an output

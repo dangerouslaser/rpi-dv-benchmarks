@@ -33,7 +33,12 @@ P2  w/2 × h/2   one fragment per 2×2 output block: 4:2:2 vertical filter,
   runs as one V3D render job: two per frame, three with P0. There are no compute dispatches; v3dv makes
   every dispatch its own kernel job with a cache flush (`pi5/V3DV.md` §2).
 - **Inputs are the decoder's own buffers.** They are read as `R32UI` texel
-  buffers, with no detile copy.
+  buffers, with no detile copy, and the BL's planes also as `RG32UI` (word
+  pairs: rule 7 below).
+- **Neighbouring fragments share work.** A 2×2 quad of P0 or P1 fragments
+  reads overlapping EL chroma rows: each lane computes one or two and takes
+  the rest from the other lanes (subgroup quad operations, rule 9). Devices
+  without them take the per-fragment path.
 - **The output is the scanout buffer.** P2 renders straight into the linear
   dmabuf. It needs one row of slack: `stride × (height + 1)` bytes.
 - **Letterbox rows cost almost nothing.** P1 renders only the planner's row
@@ -242,49 +247,56 @@ MMR is a 3-variable polynomial of up to 3rd order. Computed exactly it needs
 
 | Mode | How | Exact | 1917 |
 |---|---|---|---|
-| `exact`, the default | Float, with a per-sample error bound (see below). Samples whose bound straddles a 12-bit step take `split`. | yes | 33.0 ms |
-| `split` | The 64-bit sum's low 32 bits from wrapping 32-bit integer multiply-adds, its high 32 bits from a float sum: `H = round(y − L / 2³²)`. The CPU bounds float's error for the frame's largest magnitudes: 32 × 2⁻²⁴ × Σ max\|terms\| < 0.5 (1917: 0.01; Sol Levante 8.4: up to 0.46). A frame over it checks each sample's own magnitudes instead, and takes `exact64` where that fails too (the guard, about 2 ms). | yes | 32.9 ms |
-| `exact64` | yblod's emulated 64-bit (`umulExtended`) | yes | 53.1 ms |
-| `float` | 32-bit float | within 2 codes, about 0.001% of samples | 30.8 ms |
+| `exact`, the default | Float, with a per-sample error bound (see below). Samples whose bound straddles a 12-bit step take `split`. | yes | 29.1 ms |
+| `split` | The 64-bit sum's low 32 bits from wrapping 32-bit integer multiply-adds, its high 32 bits from a float sum: `H = round(y − L / 2³²)`. The CPU bounds float's error for the frame's largest magnitudes: 32 × 2⁻²⁴ × Σ max\|terms\| < 0.5 (1917: 0.01; Sol Levante 8.4: up to 0.46). A frame over it checks each sample's own magnitudes instead, and takes `exact64` where that fails too (the guard, about 2 ms). | yes | 28.5 ms |
+| `exact64` | yblod's emulated 64-bit (`umulExtended`) | yes | 49.1 ms |
+| `float` | 32-bit float | within 2 codes, about 0.001% of samples | 28.4 ms |
 
 **The `exact` bound.** Vulkan's add and multiply are correctly rounded, so
 the float value lies within 20 × 2⁻²⁴ × Σ|terms| of the exact one, with the
 feature powers computed exactly. About 4.6% of 1917's chroma samples fall
 inside that bound of a 12-bit step and take the exact path.
 
+**`exact` or `split`** depends on the content: on the DV FEL test clips
+`exact` is 0.7 ms faster (1.0 ms with every row), on 1917 and the 8.1 MMR
+cut `split` by 0.6–0.7 ms, and on Sol Levante 8.4's later scenes, where
+more samples fall back, `split` by 4.6 ms (27.9 against 32.5 ms).
+
 ## Performance
 
-Raspberry Pi 5, stock 1150 MHz GPU, no cooler, Raspberry Pi OS trixie
-(kernel 6.18.60, Mesa 26.2.6), hardware decode, read over SMB, bilinear EL
-upscale:
+Raspberry Pi 5, stock 1150 MHz GPU, no cooler, LibreELEC 13 (kernel
+6.18.60, Mesa 26.2.5), hardware decode from local storage, bilinear EL
+upscale, MMR `exact`. GPU time per picture (P0 + P1 + P2); 24p allows
+41.7 ms:
 
-| Film | Route | Per picture | 24p real time |
-|---|---|---|---|
-| 1917 (UHD BD, P7.6 FEL, MMR, 2.39:1) | dual, `exact` | 33.0 ms (30.3 fps) | 120 s with sync_file fences, 0–1 late (≤ 0.8 ms); 73 °C, no throttling |
-| Dune (2021) (UHD BD, P7.6 MEL) | single | 16.1 ms (65 fps) | 60 s, 0 late |
-| Profile 8.1 MMR cuts (1917, test clips) | piecewise | 26.1–27.9 ms | 8 s, 0 late |
-| DV FEL test clips (polynomial chroma) | dual | 29.0 ms (35 fps) | — |
-| Sol Levante (Dolby's samples), Profile 5 | single | 18.4 ms (54 fps) | 90 s, 0 late |
-| Sol Levante, Profile 8.1 | single | 18.3 ms (55 fps) | 90 s, 0 late |
-| Sol Levante, Profile 8.4 (HLG base) | piecewise, `exact` | 30.8 ms (32 fps); 43.5–53.4 ms with `--filters phase` | whole film (263 s, 6,314 pictures), 1 late (1.9 ms), 68 °C, no throttling |
-| Sol Levante 1080p, Profiles 5 and 8.1 | single | 4.7 ms (212 fps) | 60 s, 0 late |
+| Stream | Route | Per picture |
+|---|---|---|
+| 1917 (UHD BD, P7.6 FEL, MMR, 2.39:1) | dual | 29.1 ms (34 fps) |
+| Gladiator (UHD BD, P7 FEL, MMR, 2.40:1) | dual | 28.6 ms |
+| DV FEL test clips (MMR, 2.40:1) | dual | 27.8 ms |
+| the same, every row (`PI_ALL_ROWS=1`, as a full-height film) | dual | 38.0 ms |
+| Trainspotting (UHD BD, P7 FEL, polynomial chroma, full height) | dual | 23.2 ms |
+| DV FEL CMV4.0 test (polynomial chroma, dual track) | dual | 23.0 ms |
+| Gemini Man (UHD BD, P7 MEL, 1.85:1) | single | 17.4 ms |
+| The Matrix (UHD BD, P7 MEL, 2.40:1) | single | 13.8 ms |
+| Profile 8.1 MMR cut of 1917 | piecewise | 23.7 ms |
+| Sol Levante (Dolby's samples), Profiles 5 and 8.1 | single | 16.1 ms |
+| Sol Levante, Profile 8.4 (HLG base) | piecewise | 27.0–32.5 ms; 41.5 ms with `--filters phase` |
+| Sol Levante 1080p, Profiles 5 and 8.1 | single | 4.0 ms |
 
-LibreELEC 13 (the same kernel, Mesa 26.2.5) measures the same: 4K FEL
-31–34 ms on the letterboxed test clips.
-
-**The EL upscale's cost** (4K FEL, GPU time per picture, P0 + P1 + P2,
-LibreELEC 13; 24p allows 41.7 ms):
+**The EL upscale's cost** (4K FEL, the same measure):
 
 | Clip | `bilinear` | `bicubic` | `annexb` | `lanczos` |
 |---|---|---|---|---|
-| Power Rangers credits (2.40:1) | 31.0 ms | 37.8 ms | 41.4 ms | 42.2 ms |
-| the same, every row (`PI_ALL_ROWS=1`, as a 16:9 film) | 42.0 ms | 48.3 ms | 52.2 ms | 53.2 ms |
-| DV FEL CMV4.0 test (dual track) | 25.3 ms | 30.7 ms | 35.3 ms | 36.4 ms |
+| DV FEL test clip, Power Rangers credits (MMR, 2.40:1) | 27.8 ms | 35.0 ms | 38.7 ms | 39.6 ms |
+| the same, every row | 38.0 ms | 46.5 ms | 49.3 ms | 50.6 ms |
+| Trainspotting (polynomial chroma, full height) | 23.2 ms | 29.1 ms | 33.8 ms | 34.7 ms |
+| DV FEL CMV4.0 test (polynomial chroma, dual track) | 23.0 ms | 28.9 ms | 33.5 ms | 34.4 ms |
 
-P0 takes the EL chroma's share down to 3.7–5.6 ms over bilinear (P0 + P1 on
-the first clip: 21.2 ms bicubic, 23.1 ms Lanczos, against 17.5 ms bilinear);
-the rest is P2's EL luma, whose gathers already share the vertical filter's
-rows across each 2×2 block. A luma pre-pass of the same kind (P0L: the
+P0 leaves the sharper upscales' EL chroma 4.2–5.8 ms over bilinear's (P0 +
+P1 on the first clip: 19.4 ms bicubic, 19.7 ms Annex B, 21.0 ms Lanczos,
+against 15.2 ms bilinear); the rest is P2's EL luma, whose gathers already
+share the vertical filter's rows across each 2×2 block. A luma pre-pass of the same kind (P0L: the
 vertical filter at every EL column and output row, 1920 × 2160) measured
 slower for bicubic and Lanczos and at most 2.5 ms faster for Annex B: its
 4 M fragments cost about what P2's gathers save.
@@ -324,7 +336,27 @@ clocks; don't rely on an overclock.
 6. **Fetch-bound and ALU-bound passes behave differently.** Below the fetch
    limit, time ≈ pixels × executed instructions × 1.6 × 10⁻¹¹ s at 1150 MHz.
    An empty 4K pass costs about 4 ms.
-7. **Measured and dropped:**
+7. **Read SAND as aligned word pairs.** Two samples from an even one, 2q and
+   2q + 1, are always in one aligned 8-byte word pair (samples 6m .. 6m+5,
+   never across a 128-byte column): an `RG32UI` view of the plane reads them
+   in one fetch, with no branch for a word's end (`sand_even2`). P2's BL
+   luma, P1's BL chroma and its luma guide each took about 1 ms off 4K FEL.
+   The planes must be 8-byte aligned (`frame_ok`).
+8. **Don't add divergent fetches.** A fetch only some lanes of a 16-lane
+   batch need costs every batch both paths. Reading a chroma sample quad
+   (four samples from an even one) as a word pair, plus the next word for
+   one column in three, was 0.5–5.7 ms slower than the two word reads.
+9. **Share between fragments by subgroup quad operations, not memory.**
+   V3D 7.1 has a lane shuffle: a 2×2 quad's lanes compute the EL chroma rows
+   they share once (−0.5 ms bilinear, −2.7 ms with `--filters phase`). A
+   byte a pass stores for the next to load costs about 0.3–0.45 ms at 4K:
+   P1 writing the BL luma block it decodes for P2 (8 bytes a sample) cost
+   more than P2's reads it replaced.
+10. **Threads aren't the limit.** Float MMR compiles P1 to 4 threads, `exact`
+    to 2, 0.75 ms apart. Rewriting P2's Annex B filter to need fewer
+    registers didn't reach 4 threads (the compiler schedules its own order),
+    and bicubic's P2 at 4 threads ran slower.
+11. **Measured and dropped:**
    - tiled output plus a copy (+17 ms)
    - double-buffered tiles (no change)
    - `textureGather` for the 4:2:2 rows (slower)
@@ -332,6 +364,9 @@ clocks; don't rely on an overclock.
      shrinks the tiles)
    - texel-buffer views at word offsets (v3dv's offset alignment is
      64 bytes)
+   - bilinear's EL chroma through P0 (+2 ms: the pass costs more than it
+     saves)
+   - the BL luma block from P1 to P2 (rule 9)
 
 ## Measuring
 
@@ -348,7 +383,7 @@ pass only, for measurement) stubs out its parts:
 | 1 | luma tables |
 | 2 | EL gathers |
 | 4 | chroma rows |
-| 8 | SAND reads |
+| 8 | BL luma reads |
 | 16 | the whole pass's work |
 | 32 | tunnel packing |
 | 64 | 4:2:2 filter |
@@ -367,6 +402,7 @@ reads no environment. `--measure` takes the same names, comma-separated.
 | `PI_COPY_OUTPUT=1` | `copy_output` | render to an image and copy it to the dmabuf, as on devices without linear DRM-modifier attachments (lavapipe) |
 | `PI_FORCE_WIDE=1` | `force_wide` | compute 64-bit LUT MMRs in the 128-bit path |
 | `PI_EL_OUT=1` | `el_out` | the dual route's pass 1 writes the upscaled EL chroma as its chroma (with `PI_ABLATE=33`: the EL upscale's test) |
+| `PI_NO_QUAD=1` | `no_quad` | no subgroup quad sharing: the path of devices without it (the golden cases check both) |
 | `PI_DEVICE=NAME` | | Vulkan device (as `dvbench --device`) |
 | `DVBENCH_ALLOC=udmabuf\|cma\|system` | | the bench's dmabuf allocator (default: the first that works, in the order udmabuf, system, cma: CMA is the Pi decoder's) |
 | `DVBENCH_DV_VSIF=hdmi\|dolby` | | `--kms-play`'s `Dolby Vision` value: the HDMI VSIF (default) or Dolby's |
@@ -404,13 +440,13 @@ On the Pi itself, `V3D_DEBUG=shaderdb` prints the compiler's statistics,
   planner refuses it (`PI_E_UNSUPPORTED_PLAN`), so a player can't show a
   FEL stream's base layer alone through the engine.
 - **The sharper EL upscales** (`bicubic`, `annexb`, `lanczos`) fit 4K24 FEL
-  only where the film is letterboxed, by GPU time: bicubic with margin,
-  Annex B and Lanczos at the limit; on a full-height 16:9 film none of them
-  does (Performance).
-- **`--filters phase` on single-layer MMR** isn't real time at 24p: it
-  reshapes both output rows' chroma, twice pass 1's MMR. Profile 8.4 takes
-  43–53 ms per picture, an 8.1 MMR cut of 1917 66 ms. With the default
-  filters both are real time (31 and 27 ms).
+  with MMR chroma only where the film is letterboxed, by GPU time: bicubic
+  with margin, Annex B and Lanczos with 2–3 ms to spare; on a full-height
+  film with MMR chroma none of them does (Performance).
+- **`--filters phase` on single-layer MMR** isn't reliably real time at 24p:
+  it reshapes both output rows' chroma, twice pass 1's MMR. Profile 8.4's
+  opening takes 41.5 ms per picture, an 8.1 MMR cut of 1917 52 ms. With the
+  default filters both are real time (27–33 and 24 ms).
 - **Coverage:** Profiles 5, 8.1 and 8.4 are checked on Dolby's Sol Levante
   samples (`DolbyLaboratories/dolby-vision-contents`), identical to yblod's
   engine at 4 points through the film (8.4 with `--filters phase`; under
