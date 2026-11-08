@@ -15,6 +15,8 @@ with `git am`.
 | `0006` pi-dv-engine: update to 0.2.0 | `PKG_VERSION` / `PKG_SHA256` of the 0.2.0 tarball. |
 | `0007` pi-dv-engine: update to 0.3.0 | `PKG_VERSION` / `PKG_SHA256` of the 0.3.0 tarball: `libpi_engine.so.2`, the overlay input. |
 | `0008` RPi5: kodi: composite subtitles into the Dolby Vision signal | `../kodi/0007` as `projects/RPi/devices/RPi5/patches/kodi/0007-…`. |
+| `0009` ffmpeg: rpi: H.264 MVC multiview decoding | `packages/multimedia/ffmpeg/patches/rpi/0003-…`: Dom Cobley's H.264 MVC series ([FFmpeg pull request 24303](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24303)), with the master h264 changes it builds on, backported to 9.0.2; FATE tests left out. The h264 decoder outputs the dependent view when asked to (`view_ids`). |
+| `0010` RPi5: kodi: stereoscopic 3D playback | `projects/RPi/devices/RPi5/patches/kodi/0008–0046`: Dom Cobley's stereoscopic 3D series ([popcornmix/xbmc `fix-stereoscopic-3d-gbm-upstream`](https://github.com/popcornmix/xbmc/tree/fix-stereoscopic-3d-gbm-upstream)) on `../kodi/0001–0007`: HDMI frame-packed and half / full side-by-side and top-and-bottom modes with an eye per video plane, H.264 MVC and MV-HEVC to two views, Blu-ray 3D, 3D subtitles at the disc's depth. Each patch keeps its author; where one met the Dolby Vision patches, its message says how. |
 
 **Building:** `make image` as usual (`PROJECT=RPi DEVICE=RPi5 ARCH=aarch64`).
 The engine tarball downloads from the release. To build an engine version
