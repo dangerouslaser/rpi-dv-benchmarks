@@ -94,6 +94,7 @@ static const struct {
     {6, VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER},    /* EL chroma */
     {7, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER},  /* P1's chroma */
     {8, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER},  /* P1's EL luma */
+    {9, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER},  /* P1's EL luma, filtered vertically (Annex B) */
     {10, VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER},   /* tables, RGBA32UI */
     {11, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER},         /* route 3: dv_single_reshape */
     {12, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER}, /* P0's EL chroma, filtered vertically */
@@ -110,6 +111,10 @@ enum { K1_MODE, K1_METHOD, K1_DUAL, K1_KIND0, K1_KIND1, K1_ORDER0, K1_ORDER1, K1
        K1_FAST, K1_MARK, K1_GUARD, K1_ELUP, K1_ELOUT, K1_QUAD, K1_PRE, K1_N };
 enum { K2_ANNEXB, K2_TOP_LEFT, K2_ABLATE, K2_BARS, K2_SINGLE, K2_FULL422, K2_ELUP, K2_OVERLAY, K2_INTERIOR, K2_N };
 enum { MAX_SPEC = 17, KEY_MAX = K1_N };
+/* EL upscales whose vertical filter P1 does (the vertical pairs): Annex B.
+ * Bicubic's 2 column pairs are cheaper filtered in P2, and Lanczos-3's
+ * 6-tap costs P1 about what it saves P2. */
+#define EL_PAIRS(elup) ((elup) == 1u)
 _Static_assert((int)K1_N <= (int)MAX_SPEC && (int)K2_N + 1 <= (int)MAX_SPEC, "a specialisation map fits its entries");
 
 /* yblod's dv_single_reshape (single_reshape.h), as the planner fills
@@ -178,6 +183,11 @@ struct ctx {
     struct image elv;     /* P0's target: the EL chroma's vertical filter, ew x ch (Annex B, bicubic, Lanczos) */
     VkFramebuffer fb0;
     int elv_read;         /* elv is in SHADER_READ_ONLY_OPTIMAL (P0 has run, or the transition below) */
+    /* P1's targets with the Annex B EL upscale: its EL luma filtered
+     * vertically, (even row, odd row) per EL column and row */
+    struct image elp;
+    VkFramebuffer fbp;
+    int elp_read;         /* elp is in SHADER_READ_ONLY_OPTIMAL */
     VkBuffer tables, ubo, reshape;
     VkDeviceMemory tables_mem, ubo_mem, reshape_mem;
     uint32_t *tmap;
@@ -253,6 +263,7 @@ struct pi_engine {
     VkRenderPass rp[4];   /* P1, P2, P0, PO */
     VkExtent2D gran[4];   /* their render area granularity (V3D's tile) */
     VkRenderPass rp1_luma; /* P1 storing its chroma only: the single-layer routes' (P2 reads no EL luma) */
+    VkRenderPass rp1_pair; /* P1 with the Annex B EL upscale: its EL luma target RG16UI (the vertical pairs) */
     VkPipelineCache cache;
 
     pthread_mutex_t lock;   /* the variants and the prewarm queue */
@@ -695,7 +706,8 @@ static VkPipeline build(struct pi_engine *e, int p2, const uint32_t *key)
     int pre = !p2 && key[K1_PRE];   /* P0: its own shader and one-target pass, keyed with P1's selectors */
     if (p2 ? pipeline(e, spv_p2, sizeof(spv_p2), e->rp[1], key, n, 1, 2, &made)
          : pre ? pipeline(e, spv_p0, sizeof(spv_p0), e->rp[2], key, n, 0, 1, &made)
-               : pipeline(e, spv_p1, sizeof(spv_p1), e->rp[0], key, n, 0, 2, &made))
+               : pipeline(e, spv_p1, sizeof(spv_p1), EL_PAIRS(key[K1_ELUP]) ? e->rp1_pair : e->rp[0], key, n, 0, 2,
+                          &made))
         return VK_NULL_HANDLE;
     pthread_mutex_lock(&e->lock);
     p = find_locked(s, key, n);   /* the other thread may have made it meanwhile */
@@ -1159,10 +1171,11 @@ static int create(struct pi_engine *e)
     VkDescriptorPoolCreateInfo dpi = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
                                       .maxSets = PI_FRAMES_IN_FLIGHT, .poolSizeCount = NB, .pPoolSizes = sizes};
     VKC(e, vkCreateDescriptorPool(e->dev, &dpi, NULL, &e->dpool));
-    const VkFormat f1[2] = {VK_FORMAT_R16G16_UINT, VK_FORMAT_R16_UINT},
+    const VkFormat f1[2] = {VK_FORMAT_R16G16_UINT, VK_FORMAT_R16_UINT}, fp[2] = {VK_FORMAT_R16G16_UINT, VK_FORMAT_R16G16_UINT},
                    f2[2] = {VK_FORMAT_R32G32_UINT, VK_FORMAT_R32G32_UINT}, fo = VK_FORMAT_R16G16B16A16_UNORM;
     if ((rc = render_pass(e, 2, f1, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 0, 3, &e->rp[0])) ||
         (rc = render_pass(e, 2, f1, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 0, 1, &e->rp1_luma)) ||
+        (rc = render_pass(e, 2, fp, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 0, 3, &e->rp1_pair)) ||
         (rc = render_pass(e, 1, f1, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 0, 1, &e->rp[2])) ||
         (rc = render_pass(e, 1, &fo, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 0, 1, &e->rp[3])) ||
         (rc = render_pass(e, 2, f2, e->modifiers ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, 1,
@@ -1170,6 +1183,10 @@ static int create(struct pi_engine *e)
         return rc;
     for (int i = 0; i < 4; i++)
         vkGetRenderAreaGranularity(e->dev, e->rp[i], &e->gran[i]);
+    VkExtent2D gp;   /* P1's twin with the wider target: the larger tile */
+    vkGetRenderAreaGranularity(e->dev, e->rp1_pair, &gp);
+    e->gran[0].width = gp.width > e->gran[0].width ? gp.width : e->gran[0].width;
+    e->gran[0].height = gp.height > e->gran[0].height ? gp.height : e->gran[0].height;
     cache_load(e);
     for (int k = 0; k < PI_FRAMES_IN_FLIGHT; k++)
         if ((rc = create_ctx(e, &e->c[k])))
@@ -1354,11 +1371,13 @@ static void stream_images_destroy(struct pi_engine *e)
         struct ctx *c = &e->c[k];
         vkDestroyFramebuffer(e->dev, c->fb, NULL);
         vkDestroyFramebuffer(e->dev, c->fb0, NULL);
-        c->fb = c->fb0 = VK_NULL_HANDLE;
+        vkDestroyFramebuffer(e->dev, c->fbp, NULL);
+        c->fb = c->fb0 = c->fbp = VK_NULL_HANDLE;
         image_destroy(e, &c->c420);
         image_destroy(e, &c->ely);
         image_destroy(e, &c->elv);
-        c->elv_read = 0;
+        image_destroy(e, &c->elp);
+        c->elv_read = c->elp_read = 0;
     }
 }
 
@@ -1405,7 +1424,8 @@ int pi_stream_open(struct pi_engine *e, const struct pi_stream_info *info)
             int rc;
             if ((rc = image(e, &c->c420, VK_FORMAT_R16G16_UINT, cw, ch, rt)) ||
                 (rc = image(e, &c->ely, VK_FORMAT_R16_UINT, cw, ch, rt)) ||
-                (rc = image(e, &c->elv, VK_FORMAT_R16G16_UINT, cw / 2, ch, rt))) {
+                (rc = image(e, &c->elv, VK_FORMAT_R16G16_UINT, cw / 2, ch, rt)) ||
+                (rc = image(e, &c->elp, VK_FORMAT_R16G16_UINT, cw, ch, rt))) {
                 stream_images_destroy(e);
                 e->w = e->h = 0;
                 return rc;
@@ -1419,16 +1439,23 @@ int pi_stream_open(struct pi_engine *e, const struct pi_stream_info *info)
                                            .attachmentCount = 1, .pAttachments = &c->elv.view, .width = cw / 2,
                                            .height = ch, .layers = 1};
             VKC(e, vkCreateFramebuffer(e->dev, &fb0, NULL, &c->fb0));
-            VkDescriptorImageInfo ii[3] = {{e->sampler, c->c420.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+            VkImageView vp[2] = {c->c420.view, c->elp.view};
+            VkFramebufferCreateInfo fbp = {.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+                                           .renderPass = e->rp1_pair, .attachmentCount = 2, .pAttachments = vp,
+                                           .width = cw, .height = ch, .layers = 1};
+            VKC(e, vkCreateFramebuffer(e->dev, &fbp, NULL, &c->fbp));
+            VkDescriptorImageInfo ii[4] = {{e->sampler, c->c420.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
                                            {e->sampler, c->ely.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
-                                           {e->sampler, c->elv.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}};
-            VkWriteDescriptorSet wr[3];
-            for (int i = 0; i < 3; i++)
+                                           {e->sampler, c->elv.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+                                           {e->sampler, c->elp.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}};
+            const uint32_t to[4] = {7, 8, 12, 9};
+            VkWriteDescriptorSet wr[4];
+            for (int i = 0; i < 4; i++)
                 wr[i] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = c->ds,
-                                               .dstBinding = i < 2 ? 7u + (uint32_t)i : 12u, .descriptorCount = 1,
+                                               .dstBinding = to[i], .descriptorCount = 1,
                                                .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                                                .pImageInfo = &ii[i]};
-            vkUpdateDescriptorSets(e->dev, 3, wr, 0, NULL);
+            vkUpdateDescriptorSets(e->dev, 4, wr, 0, NULL);
         }
     }
     e->open = 1;
@@ -1707,6 +1734,7 @@ void pi_engine_destroy(struct pi_engine *e)
         vkDestroyRenderPass(e->dev, e->rp[2], NULL);
         vkDestroyRenderPass(e->dev, e->rp[3], NULL);
         vkDestroyRenderPass(e->dev, e->rp1_luma, NULL);
+        vkDestroyRenderPass(e->dev, e->rp1_pair, NULL);
         vkDestroyDescriptorPool(e->dev, e->dpool, NULL);   /* frees the sets */
         vkDestroyPipelineLayout(e->dev, e->pl, NULL);
         vkDestroyDescriptorSetLayout(e->dev, e->dsl, NULL);
@@ -2292,7 +2320,7 @@ struct overlay_pass {
  * 4:2:2 layout's): P1 doesn't store it. */
 static int record(struct pi_engine *e, struct ctx *c, const dvvk_plan *p, struct pi_output *o, VkPipeline p0,
                   VkPipeline p1, VkPipeline p2, VkPipeline p2i, VkPipeline pb, const struct overlay_pass *ov,
-                  int el_unread)
+                  int el_unread, int el_pairs)
 {
     uint32_t w = e->w, h = e->h, cw = w / 2, ch = h / 2;
     VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -2341,6 +2369,20 @@ static int record(struct pi_engine *e, struct ctx *c, const dvvk_plan *p, struct
                              NULL, 0, NULL, 1, &ib);
         c->elv_read = 1;
     }
+    if (!el_pairs && !c->elp_read) {
+        /* likewise P2 and the vertical pairs' target, which only the Annex B
+         * upscale's P1 writes */
+        VkImageMemoryBarrier ib = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                                   .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+                                   .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+                                   .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                   .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                   .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .image = c->elp.img,
+                                   .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+        vkCmdPipelineBarrier(c->cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0,
+                             NULL, 0, NULL, 1, &ib);
+        c->elp_read = 1;
+    }
     /* and only over the active area's columns (a pillarbox), with a margin
      * for P2's EL reads, even (P1's quads) */
     uint32_t cx0 = 0, cx1 = cw;
@@ -2350,7 +2392,11 @@ static int record(struct pi_engine *e, struct ctx *c, const dvvk_plan *p, struct
         cx1 = cx1 < cw ? cx1 : cw;
     }
     struct band b1 = {p1, c0, crows, cx0, cx1 - cx0};
-    pass(e, c, 0, el_unread ? e->rp1_luma : e->rp[0], c->fb, cw, ch, cx0, cx1, c0, crows, &b1, 1, NULL);
+    if (el_pairs) {   /* Annex B: P1 writes the EL luma's vertical pairs */
+        pass(e, c, 0, e->rp1_pair, c->fbp, cw, ch, cx0, cx1, c0, crows, &b1, 1, NULL);
+        c->elp_read = 1;
+    } else
+        pass(e, c, 0, el_unread ? e->rp1_luma : e->rp[0], c->fb, cw, ch, cx0, cx1, c0, crows, &b1, 1, NULL);
     /* PO: the overlay's rectangles as the source's signal, for P2 */
     int overlay = ov->n > 0;
     if (overlay) {
@@ -2787,7 +2833,7 @@ int pi_render(struct pi_engine *e, const struct pi_frame *f, struct pi_output *o
 
     /* record and submit */
     e->serial++;
-    if ((rc = record(e, c, p, o, p0, p1, p2, p2i, pb, &op, k2[K2_SINGLE] && !k2[K2_FULL422])))
+    if ((rc = record(e, c, p, o, p0, p1, p2, p2i, pb, &op, k2[K2_SINGLE] && !k2[K2_FULL422], EL_PAIRS(k1[K1_ELUP]))))
         goto release;
     rc = submit(e, c, acquire_fd, drawn_fd, release_fd);
     acquire_fd = drawn_fd = -1;   /* submit takes them */

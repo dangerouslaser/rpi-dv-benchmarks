@@ -25,6 +25,7 @@
 
 layout(binding = 7) uniform usampler2D chroma420;   // pass 1: cw x ch, (Cb, Cr)
 layout(binding = 8) uniform usampler2D el_luma;     // pass 1: cw x ch, clamp to edge
+layout(binding = 9) uniform usampler2D el_pairs;    // pass 1, Annex B: the EL luma filtered vertically
 layout(location = 0) out uvec2 o_even;   // row 2k:   pixels 2px, 2px+1
 layout(location = 1) out uvec2 o_odd;    // row 2k+1
 layout(constant_id = 1) const uint ANNEXB = 1;
@@ -136,11 +137,22 @@ uvec4 el_block(uvec4 gu, uvec4 gd)
     return min(uvec4(ve.x, (ve.x + ve.y + 1u) >> 1, vd.x, (vd.x + vd.y + 1u) >> 1), uvec4(1023u));
 }
 
-// Annex B's vertical 4-tap (dv_annex_b_scale2x) at EL columns c0, c0 + 1:
+// Annex B's vertical filter's (even row, odd row) at EL columns c0, c0 + 1,
+// from pass 1, clamped to the edge as the reference does.
+ivec4 el_vpair(int c0, int k)
+{
+    int last = int(P.size.z) - 1;
+    uvec2 a = texelFetch(el_pairs, ivec2(clamp(c0, 0, last), k), 0).rg,
+          b = texelFetch(el_pairs, ivec2(clamp(c0 + 1, 0, last), k), 0).rg;
+    return ivec4(a.x, a.y, b.x, b.y);
+}
+
+// Bicubic's vertical 4-tap (Annex B's, dv_annex_b_scale2x) at EL columns c0, c0 + 1,
+// from pass 1's raw EL luma:
 // (even row, odd row) of each, from EL rows k-2 .. k+2: even -3 29 111 -9
 // over k-2 .. k+1, odd -9 111 29 -3 over k-1 .. k+2, / 128, floored at 0.
 // Three gathers (the sampler clamps to the edge, as the reference does).
-ivec4 el_vpair(int c0, int k)
+ivec4 el_vpair_raw(int c0, int k)
 {
     vec2 at = vec2(float(c0 + 1), float(k - 1)) * P.inv.xy;   // columns c0, c0 + 1; rows k-2, k-1
     ivec4 a = ivec4(textureGather(el_luma, at, 0)), b = ivec4(textureGather(el_luma, at + vec2(0.0, 2.0 * P.inv.y), 0)),
@@ -170,7 +182,7 @@ uvec4 el_annexb(int px, int k)
 // column.
 uvec4 el_bicubic(int px, int k)
 {
-    ivec4 q1 = el_vpair(px - 1, k), q2 = el_vpair(px + 1, k);
+    ivec4 q1 = el_vpair_raw(px - 1, k), q2 = el_vpair_raw(px + 1, k);
     ivec2 h = -q1.xy + 9 * (q1.zw + q2.xy) - q2.zw;
     ivec2 odd = clamp((h + 8) >> 4, ivec2(0), ivec2(1023));
     ivec2 even = min(q1.zw, ivec2(1023));

@@ -22,7 +22,7 @@ layout(binding = 5) uniform usamplerBuffer el_y;
 layout(binding = 10) uniform usamplerBuffer tables128;   // the tables as RGBA32UI
 layout(binding = 12) uniform usampler2D el_cv;          // P0: the EL chroma's vertical filter (ELUP != 0)
 layout(location = 0) out uvec2 o_chroma;
-layout(location = 1) out uint o_el;
+layout(location = 1) out uvec2 o_el;   // R16UI (.x), or RG16UI: Annex B's vertical pairs
 
 // The chroma MMR (pi_engine.h enum pi_mmr_mode): 0 float; 2 exact in emulated
 // 64-bit (yblod's); 3 exact, the low word in integers and the high word from
@@ -463,20 +463,34 @@ uvec2 row422(uint cx, uint k, uint r)
     return reshape_chroma(guide_row(cx, row), chroma);
 }
 
+// Annex B's EL luma at column cx filtered vertically, for rows 2k (even) and
+// 2k+1 (odd) of the output: even -3 29 111 -9 over k-2 .. k+1, odd
+// mirrored over k-1 .. k+2, / 128, floored at 0, rows clamped to the edge.
+// Pass 2 takes the horizontal filter.
+uint el_row(uint cx, int row) { return sand1(el_y, P.el.x, P.el.z, cx, uint(clamp(row, 0, int(P.size.w) - 1))); }
+uvec2 el_pair(uint cx, uint k)
+{
+    int kk = int(k);
+    int r0 = int(el_row(cx, kk - 2)), r1 = int(el_row(cx, kk - 1)), r2 = int(el_row(cx, kk)),
+        r3 = int(el_row(cx, kk + 1)), r4 = int(el_row(cx, kk + 2));
+    ivec2 v = ivec2((-3 * r0 + 29 * r1 + 111 * r2 - 9 * r3 + 64) >> 7, (-9 * r1 + 111 * r2 + 29 * r3 - 3 * r4 + 64) >> 7);
+    return uvec2(max(v, ivec2(0)));
+}
+
 void main()
 {
     uint cx = uint(gl_FragCoord.x), k = uint(gl_FragCoord.y);
     if (SINGLE != 0u) {
         uvec2 c = min(bl_chroma(cx, k), uvec2(1023u));
         o_chroma = uvec2(texelFetch(tables, T_SINGLE + 1024 + int(c.x)).r, texelFetch(tables, T_SINGLE + 2048 + int(c.y)).r);
-        o_el = 0u;
+        o_el = uvec2(0u);
     } else if (PIECE == 2u) {
         // 48 bits: Cb, Cr of row 2k, then of row 2k+1, 12 bits each
         uvec2 a = row422(cx, k, 0u), b = row422(cx, k, 1u);
         o_chroma = uvec2(a.x | ((a.y & 15u) << 12), (a.y >> 4) | ((b.x & 255u) << 8));
-        o_el = (b.x >> 8) | (b.y << 4);
+        o_el = uvec2((b.x >> 8) | (b.y << 4), 0u);
     } else {
-        o_el = PIECE != 0u ? 0u : sand1(el_y, P.el.x, P.el.z, cx, k);
+        o_el = PIECE != 0u ? uvec2(0u) : ELUP == 1u ? el_pair(cx, k) : uvec2(sand1(el_y, P.el.x, P.el.z, cx, k), 0u);
 
         // the luma guide: [1 2 1] / 4 on each of the block's rows (pixels
         // 2cx-1 .. 2cx+1, the first clamped), rows averaged
