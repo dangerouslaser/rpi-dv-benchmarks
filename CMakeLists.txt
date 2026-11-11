@@ -9,7 +9,7 @@
 # engine/planner/LICENSE. FFmpeg here is built --enable-gpl --enable-version3,
 # so binaries linking it (dvbench, the bundle) are GPLv3 as a whole.
 cmake_minimum_required(VERSION 3.22)
-project(pi-dv-engine VERSION 0.4.2 LANGUAGES C)
+project(pi-dv-engine VERSION 0.5.0 LANGUAGES C)
 option(PI_BUILD_BENCH "Build dvbench (needs libdrm)" OFF)
 option(PI_SHARED "Build libpi_engine as a shared library (else static, with libdv_planner)" ON)
 include(GNUInstallDirs)
