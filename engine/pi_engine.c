@@ -251,6 +251,7 @@ struct pi_engine {
     VkPipelineLayout pl;
     VkDescriptorPool dpool;
     VkRenderPass rp[4];   /* P1, P2, P0, PO */
+    VkExtent2D gran[4];   /* their render area granularity (V3D's tile) */
     VkPipelineCache cache;
 
     pthread_mutex_t lock;   /* the variants and the prewarm queue */
@@ -1162,6 +1163,8 @@ static int create(struct pi_engine *e)
         (rc = render_pass(e, 2, f2, e->modifiers ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, 1,
                           &e->rp[1])))
         return rc;
+    for (int i = 0; i < 4; i++)
+        vkGetRenderAreaGranularity(e->dev, e->rp[i], &e->gran[i]);
     cache_load(e);
     for (int k = 0; k < PI_FRAMES_IN_FLIGHT; k++)
         if ((rc = create_ctx(e, &e->c[k])))
@@ -2147,8 +2150,23 @@ struct band {
     uint32_t x0, cols;   /* columns x0 .. x0 + cols - 1; cols 0: all */
 };
 
+/* An area of a w x h target grown to whole tiles of render pass i: v3dv
+ * loads every tile of a pass whose area isn't (to keep the pixels outside
+ * it), even with DONT_CARE. The tiles grown into are stored undefined
+ * outside the scissors: nothing reads them. */
+static VkRect2D tile_area(const struct pi_engine *e, int i, uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1,
+                          uint32_t w, uint32_t h)
+{
+    uint32_t gw = e->gran[i].width ? e->gran[i].width : 1, gh = e->gran[i].height ? e->gran[i].height : 1;
+    x0 = x0 / gw * gw, y0 = y0 / gh * gh;
+    x1 = (x1 + gw - 1) / gw * gw, y1 = (y1 + gh - 1) / gh * gh;
+    x1 = x1 < w ? x1 : w, y1 = y1 < h ? y1 : h;
+    return (VkRect2D){{(int32_t)x0, (int32_t)y0}, {x1 - x0, y1 - y0}};
+}
+
 /* Pass i over rows y0 .. y0 + rows - 1 of its w x h target (the render area:
- * stored tiles), as bands of rows each with its pipeline. */
+ * stored tiles, grown to whole ones), as bands of rows each with its
+ * pipeline and scissor. */
 static void pass(struct pi_engine *e, struct ctx *c, int i, VkFramebuffer fb, uint32_t w, uint32_t h, uint32_t y0,
                  uint32_t rows, const struct band *b, int n, const VkClearValue *clear)
 {
@@ -2157,7 +2175,7 @@ static void pass(struct pi_engine *e, struct ctx *c, int i, VkFramebuffer fb, ui
     if (clear)
         cv[0] = cv[1] = *clear;
     VkRenderPassBeginInfo rbi = {.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, .renderPass = e->rp[i],
-                                 .framebuffer = fb, .renderArea = {{0, (int32_t)y0}, {w, rows}},
+                                 .framebuffer = fb, .renderArea = tile_area(e, i, 0, y0, w, y0 + rows, w, h),
                                  .clearValueCount = clear ? 2 : 0, .pClearValues = clear ? cv : NULL};
     vkCmdBeginRenderPass(c->cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
     vkCmdBindDescriptorSets(c->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, e->pl, 0, 1, &c->ds, 0, NULL);
@@ -2320,7 +2338,8 @@ static int record(struct pi_engine *e, struct ctx *c, const dvvk_plan *p, struct
         const uint32_t *ob = ov->bound;
         VkRenderPassBeginInfo rbi = {.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, .renderPass = e->rp[3],
                                      .framebuffer = e->codes_fb,
-                                     .renderArea = {{(int32_t)ob[0], (int32_t)ob[1]}, {ob[2] - ob[0], ob[3] - ob[1]}}};
+                                     .renderArea = tile_area(e, 3, ob[0], ob[1], ob[2], ob[3], e->codes_w,
+                                                             e->codes_h)};
         vkCmdBeginRenderPass(c->cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
         vkCmdBindDescriptorSets(c->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, e->pl, 0, 1, &c->ds, 0, NULL);
         VkViewport vp = {0, 0, (float)e->codes_w, (float)e->codes_h, 0, 1};

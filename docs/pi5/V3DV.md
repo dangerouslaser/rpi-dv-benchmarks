@@ -134,8 +134,15 @@ commands in a ring. On v3dv, **every dispatch is a kernel job**.
   | 64 | 32×16 |
 - Integer, 32-bit float and 16-bit unorm/snorm targets use the TLB's
   32-bit-per-channel path; everything else uses F16. [S] compiler/nir_to_vir.c:1953-1985
-- `loadOp=LOAD` costs a per-tile read; `CLEAR` and `DONT_CARE` don't. A render
-  area that isn't tile-aligned turns clears into draws.
+- `loadOp=LOAD` costs a per-tile read; `CLEAR` and `DONT_CARE` don't, but only
+  for a render area aligned to the tiles (`vkGetRenderAreaGranularity`). A stored
+  attachment whose area isn't aligned is loaded, to keep the pixels outside the
+  area, and in every tile of the job, not only the edge ones (the loads go in the
+  generic tile list); a clear becomes a draw. [S] vulkan/v3dv_pass.c:462,
+  vulkan/v3dv_cmd_buffer.c:1576, vulkan/v3dvx_cmd_buffer.c:721. The engine grows
+  its render areas to whole tiles and keeps the scissors exact: a letterboxed
+  film's pass 1 (2.39:1: chroma rows from 132, 4 into a 32-row tile) saved
+  0.6–1.5 ms. `V3D_DEBUG=perf` reports an unaligned area.
 - Double-buffered tiles (which hide store latency) are off by default (`V3D_DEBUG=db`). [S] vulkan/v3dv_cmd_buffer.c:1620-1632
 - **Things that split a render job** [S] vulkan/v3dv_cmd_buffer.c:3331-3466,4196-4201:
   - a barrier inside a render pass
