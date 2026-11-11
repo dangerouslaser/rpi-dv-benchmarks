@@ -252,6 +252,7 @@ struct pi_engine {
     VkDescriptorPool dpool;
     VkRenderPass rp[4];   /* P1, P2, P0, PO */
     VkExtent2D gran[4];   /* their render area granularity (V3D's tile) */
+    VkRenderPass rp1_luma; /* P1 storing its chroma only: the single-layer routes' (P2 reads no EL luma) */
     VkPipelineCache cache;
 
     pthread_mutex_t lock;   /* the variants and the prewarm queue */
@@ -573,15 +574,18 @@ static void imports_release(struct pi_engine *e)
     e->nimports = 0;
 }
 
+/* Attachment i is stored if bit i of store is set (else DONT_CARE: a twin
+ * that is render-pass compatible with the one storing all). */
 static int render_pass(struct pi_engine *e, int n, const VkFormat *formats, VkImageLayout final, int clear,
-                       VkRenderPass *rp)
+                       unsigned store, VkRenderPass *rp)
 {
     VkAttachmentDescription a[2];
     VkAttachmentReference ref[2];
     for (int i = 0; i < n; i++) {
         a[i] = (VkAttachmentDescription){.format = formats[i], .samples = VK_SAMPLE_COUNT_1_BIT,
                                          .loadOp = clear ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_DONT_CARE,
-                                         .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+                                         .storeOp = (store >> i) & 1 ? VK_ATTACHMENT_STORE_OP_STORE
+                                                                     : VK_ATTACHMENT_STORE_OP_DONT_CARE,
                                          .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
                                          .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
                                          .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED, .finalLayout = final};
@@ -1157,11 +1161,12 @@ static int create(struct pi_engine *e)
     VKC(e, vkCreateDescriptorPool(e->dev, &dpi, NULL, &e->dpool));
     const VkFormat f1[2] = {VK_FORMAT_R16G16_UINT, VK_FORMAT_R16_UINT},
                    f2[2] = {VK_FORMAT_R32G32_UINT, VK_FORMAT_R32G32_UINT}, fo = VK_FORMAT_R16G16B16A16_UNORM;
-    if ((rc = render_pass(e, 2, f1, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 0, &e->rp[0])) ||
-        (rc = render_pass(e, 1, f1, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 0, &e->rp[2])) ||
-        (rc = render_pass(e, 1, &fo, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 0, &e->rp[3])) ||
+    if ((rc = render_pass(e, 2, f1, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 0, 3, &e->rp[0])) ||
+        (rc = render_pass(e, 2, f1, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 0, 1, &e->rp1_luma)) ||
+        (rc = render_pass(e, 1, f1, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 0, 1, &e->rp[2])) ||
+        (rc = render_pass(e, 1, &fo, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 0, 1, &e->rp[3])) ||
         (rc = render_pass(e, 2, f2, e->modifiers ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, 1,
-                          &e->rp[1])))
+                          3, &e->rp[1])))
         return rc;
     for (int i = 0; i < 4; i++)
         vkGetRenderAreaGranularity(e->dev, e->rp[i], &e->gran[i]);
@@ -1701,6 +1706,7 @@ void pi_engine_destroy(struct pi_engine *e)
         vkDestroyRenderPass(e->dev, e->rp[1], NULL);
         vkDestroyRenderPass(e->dev, e->rp[2], NULL);
         vkDestroyRenderPass(e->dev, e->rp[3], NULL);
+        vkDestroyRenderPass(e->dev, e->rp1_luma, NULL);
         vkDestroyDescriptorPool(e->dev, e->dpool, NULL);   /* frees the sets */
         vkDestroyPipelineLayout(e->dev, e->pl, NULL);
         vkDestroyDescriptorSetLayout(e->dev, e->dsl, NULL);
@@ -2166,15 +2172,15 @@ static VkRect2D tile_area(const struct pi_engine *e, int i, uint32_t x0, uint32_
 
 /* Pass i over rows y0 .. y0 + rows - 1 of its w x h target (the render area:
  * stored tiles, grown to whole ones), as bands of rows each with its
- * pipeline and scissor. */
-static void pass(struct pi_engine *e, struct ctx *c, int i, VkFramebuffer fb, uint32_t w, uint32_t h, uint32_t y0,
-                 uint32_t rows, const struct band *b, int n, const VkClearValue *clear)
+ * pipeline and scissor; rp: render pass i or a compatible twin. */
+static void pass(struct pi_engine *e, struct ctx *c, int i, VkRenderPass rp, VkFramebuffer fb, uint32_t w, uint32_t h,
+                 uint32_t y0, uint32_t rows, const struct band *b, int n, const VkClearValue *clear)
 {
     VkClearValue cv[2];
     memset(cv, 0, sizeof(cv));
     if (clear)
         cv[0] = cv[1] = *clear;
-    VkRenderPassBeginInfo rbi = {.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, .renderPass = e->rp[i],
+    VkRenderPassBeginInfo rbi = {.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, .renderPass = rp,
                                  .framebuffer = fb, .renderArea = tile_area(e, i, 0, y0, w, y0 + rows, w, h),
                                  .clearValueCount = clear ? 2 : 0, .pClearValues = clear ? cv : NULL};
     vkCmdBeginRenderPass(c->cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
@@ -2280,8 +2286,10 @@ struct overlay_pass {
     VkPipeline p2, bars;
 };
 
+/* el_unread: P2 reads no EL luma (the single-layer routes but the full-height
+ * 4:2:2 layout's): P1 doesn't store it. */
 static int record(struct pi_engine *e, struct ctx *c, const dvvk_plan *p, struct pi_output *o, VkPipeline p0,
-                  VkPipeline p1, VkPipeline p2, VkPipeline pb, const struct overlay_pass *ov)
+                  VkPipeline p1, VkPipeline p2, VkPipeline pb, const struct overlay_pass *ov, int el_unread)
 {
     uint32_t w = e->w, h = e->h, cw = w / 2, ch = h / 2;
     VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -2314,7 +2322,7 @@ static int record(struct pi_engine *e, struct ctx *c, const dvvk_plan *p, struct
     }
     if (p0) {   /* P0: the EL chroma's vertical filter, over the same rows */
         struct band b0 = {p0, c0, crows, 0, 0};
-        pass(e, c, 2, c->fb0, cw / 2, ch, c0, crows, &b0, 1, NULL);
+        pass(e, c, 2, e->rp[2], c->fb0, cw / 2, ch, c0, crows, &b0, 1, NULL);
         c->elv_read = 1;
     } else if (!c->elv_read) {
         /* P1 binds P0's image whether or not it reads it: give it the layout
@@ -2331,7 +2339,7 @@ static int record(struct pi_engine *e, struct ctx *c, const dvvk_plan *p, struct
         c->elv_read = 1;
     }
     struct band b1 = {p1, c0, crows, 0, 0};
-    pass(e, c, 0, c->fb, cw, ch, c0, crows, &b1, 1, NULL);
+    pass(e, c, 0, el_unread ? e->rp1_luma : e->rp[0], c->fb, cw, ch, c0, crows, &b1, 1, NULL);
     /* PO: the overlay's rectangles as the source's signal, for P2 */
     int overlay = ov->n > 0;
     if (overlay) {
@@ -2397,7 +2405,7 @@ static int record(struct pi_engine *e, struct ctx *c, const dvvk_plan *p, struct
     for (int l = 0; l < 2; l++)
         black.color.uint32[l] = PI_PACK(p->black[0], l ? p->black[2] : p->black[1]);
     black.color.uint32[2] = black.color.uint32[3] = 0;
-    pass(e, c, 1, o->fb, cw, ch, 0, ch, b, nb, &black);
+    pass(e, c, 1, e->rp[1], o->fb, cw, ch, 0, ch, b, nb, &black);
     if (o->copy_buf)
         for (int half = 0; half < 2; half++) {
             VkBufferImageCopy cp = {.bufferOffset = (VkDeviceSize)half * o->stride, .bufferRowLength = o->stride / 4,
@@ -2729,7 +2737,7 @@ int pi_render(struct pi_engine *e, const struct pi_frame *f, struct pi_output *o
 
     /* record and submit */
     e->serial++;
-    if ((rc = record(e, c, p, o, p0, p1, p2, pb, &op)))
+    if ((rc = record(e, c, p, o, p0, p1, p2, pb, &op, k2[K2_SINGLE] && !k2[K2_FULL422])))
         goto release;
     rc = submit(e, c, acquire_fd, drawn_fd, release_fd);
     acquire_fd = drawn_fd = -1;   /* submit takes them */
