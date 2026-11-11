@@ -190,7 +190,13 @@ struct pi_frame {
      * two). */
     uint32_t overlay_rect[PI_OVERLAY_RECTS][4];
     int overlay_bottom_up;        /* the overlay's rows are stored bottom first (a GL framebuffer) */
-    int overlay_fd;               /* with an overlay: a sync_file it is drawn by; -1 none. Taken. */
+    /* With an overlay: a sync_file it is drawn by; -1 none. Taken. The same
+     * overlay passed again with the same rectangles, row order and drawing
+     * (this sync_file or a copy of it) is taken as unchanged: its conversion
+     * is reused, and from its second picture on the picture under its opaque
+     * areas is neither reconstructed nor read. An overlay drawn again comes
+     * with the new drawing's sync_file. */
+    int overlay_fd;
 };
 /* Plans and renders f into out. out is of the stream's width and its
  * height or taller: a taller one (a stream cropped to the picture, such as

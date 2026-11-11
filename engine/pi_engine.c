@@ -20,6 +20,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <libavutil/hwcontext_drm.h>
+#include <linux/sync_file.h>
 #include <math.h>
 #include <poll.h>
 #include <pthread.h>
@@ -29,6 +30,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -51,6 +53,9 @@ static const uint32_t spv_p2[] =
     ;
 static const uint32_t spv_po[] =
 #include "shaders/po_overlay.frag.h"
+    ;
+static const uint32_t spv_pm[] =
+#include "shaders/pm_opaque.frag.h"
     ;
 
 /* ---- layouts shared with the shaders --------------------------------------- */
@@ -261,6 +266,7 @@ struct pi_engine {
     VkPipelineLayout pl;
     VkDescriptorPool dpool;
     VkRenderPass rp[4];   /* P1, P2, P0, PO */
+    VkRenderPass rp_cells; /* PM: its cells, cleared */
     VkExtent2D gran[4];   /* their render area granularity (V3D's tile) */
     VkRenderPass rp1_luma; /* P1 storing its chroma only: the single-layer routes' (P2 reads no EL luma) */
     VkRenderPass rp1_pair; /* P1 with the Annex B EL upscale: its EL luma target RG16UI (the vertical pairs) */
@@ -289,6 +295,42 @@ struct pi_engine {
     uint32_t codes_w, codes_h;
     int codes_read;          /* in SHADER_READ_ONLY_OPTIMAL */
     VkPipeline po;
+    /* PM's target, a cell per 4 x 4 of P2's blocks (shared like PO's); its
+     * pipelines by the sampling (OVERLAY 2, 3) */
+    struct image cells;
+    VkFramebuffer cells_fb;
+    uint32_t cells_w, cells_h;
+    VkPipeline pm[4];
+    /* PM's cells read back (host-visible, cells_w x cells_h bytes) by the
+     * render that ran it (its context and serial; current: of the overlay
+     * last converted); from them, once that render is done, the areas P1
+     * draws (its quads, x0, y0, x1, y1) and P2's opaque blocks, while that
+     * overlay stays */
+    VkBuffer cells_buf;
+    VkDeviceMemory cells_mem;
+    uint8_t *cells_map;
+    int cells_ctx;
+    uint64_t cells_serial;
+    int cells_current;
+    int cells_scanned;       /* looked at (pm_found) */
+    int p1_parsed, p1_n, p2_n;   /* P1's areas and P2's opaque blocks: parsed, how many (-1: too many) */
+    uint32_t p1_area[64][4];
+    uint32_t p2_opaque[64][4];   /* P2's blocks under opaque cells, x0, y0, x1, y1: by rows of cells alike */
+    /* PM is run where it may find something: the overlay's areas other than
+     * at its last run (pm_rect, pm_n), its last run found opaque cells, or
+     * after 16 conversions without it */
+    uint32_t pm_rect[PI_OVERLAY_RECTS][4], pm_n;
+    int pm_found, pm_skips;
+    int pm_ran;              /* PM has run for the overlay last converted */
+    /* the overlay PO last converted: one passed again unchanged (the same
+     * buffer, areas, row order, output size, colour and drawing) reuses it */
+    struct overlay_key {
+        const struct pi_overlay *ov;
+        uint32_t rect[PI_OVERLAY_RECTS][4], n, bottom_up, ow, oh;
+        float oc[31];
+        char fence[32];   /* the drawing's sync_file's name: its fence's context and seqno */
+    } okey;
+    int okey_valid;
     int overlay_before;      /* the last frame had an overlay (the planner's overlay edge) */
 
     dvvk_plan_state *state;
@@ -1109,6 +1151,50 @@ static void codes_destroy(struct pi_engine *e)
     e->codes_w = e->codes_h = 0;
 }
 
+static void cells_destroy(struct pi_engine *e)
+{
+    vkDestroyBuffer(e->dev, e->cells_buf, NULL);
+    vkFreeMemory(e->dev, e->cells_mem, NULL);   /* unmaps */
+    e->cells_buf = VK_NULL_HANDLE;
+    e->cells_mem = VK_NULL_HANDLE;
+    e->cells_map = NULL;
+    e->cells_serial = 0;
+    e->cells_current = 0;
+    vkDestroyFramebuffer(e->dev, e->cells_fb, NULL);
+    e->cells_fb = VK_NULL_HANDLE;
+    image_destroy(e, &e->cells);
+    e->cells_w = e->cells_h = 0;
+}
+
+/* PM's target, w x h cells, and its read back */
+static int cells_size(struct pi_engine *e, uint32_t w, uint32_t h)
+{
+    if (e->cells_w == w && e->cells_h == h)
+        return 0;
+    retire_all(e);
+    cells_destroy(e);
+    e->okey_valid = 0;
+    int rc = image(e, &e->cells, VK_FORMAT_R8_UINT, w, h,
+                   VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+    if (rc) {
+        cells_destroy(e);
+        return rc;
+    }
+    VkFramebufferCreateInfo fbi = {.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, .renderPass = e->rp_cells,
+                                   .attachmentCount = 1, .pAttachments = &e->cells.view, .width = w, .height = h,
+                                   .layers = 1};
+    VKC(e, vkCreateFramebuffer(e->dev, &fbi, NULL, &e->cells_fb));
+    rc = host_buffer(e, ((VkDeviceSize)w * h + 63) & ~(VkDeviceSize)63, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                         &e->cells_buf, &e->cells_mem, (void **)&e->cells_map);
+    if (rc) {
+        cells_destroy(e);
+        return rc;
+    }
+    e->cells_w = w;
+    e->cells_h = h;
+    return 0;
+}
+
 /* PO's target at the overlay's size (w x h), and every context's binding of
  * it. */
 static int codes_size(struct pi_engine *e, uint32_t w, uint32_t h)
@@ -1117,6 +1203,7 @@ static int codes_size(struct pi_engine *e, uint32_t w, uint32_t h)
         return 0;
     retire_all(e);
     codes_destroy(e);
+    e->okey_valid = 0;
     int rc = image(e, &e->codes, VK_FORMAT_R16G16B16A16_UNORM, w, h,
                    VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
     if (rc) {
@@ -1172,14 +1259,16 @@ static int create(struct pi_engine *e)
                                       .maxSets = PI_FRAMES_IN_FLIGHT, .poolSizeCount = NB, .pPoolSizes = sizes};
     VKC(e, vkCreateDescriptorPool(e->dev, &dpi, NULL, &e->dpool));
     const VkFormat f1[2] = {VK_FORMAT_R16G16_UINT, VK_FORMAT_R16_UINT}, fp[2] = {VK_FORMAT_R16G16_UINT, VK_FORMAT_R16G16_UINT},
-                   f2[2] = {VK_FORMAT_R32G32_UINT, VK_FORMAT_R32G32_UINT}, fo = VK_FORMAT_R16G16B16A16_UNORM;
+                   f2[2] = {VK_FORMAT_R32G32_UINT, VK_FORMAT_R32G32_UINT}, fo = VK_FORMAT_R16G16B16A16_UNORM,
+                   fm = VK_FORMAT_R8_UINT;
     if ((rc = render_pass(e, 2, f1, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 0, 3, &e->rp[0])) ||
         (rc = render_pass(e, 2, f1, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 0, 1, &e->rp1_luma)) ||
         (rc = render_pass(e, 2, fp, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 0, 3, &e->rp1_pair)) ||
         (rc = render_pass(e, 1, f1, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 0, 1, &e->rp[2])) ||
         (rc = render_pass(e, 1, &fo, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 0, 1, &e->rp[3])) ||
         (rc = render_pass(e, 2, f2, e->modifiers ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, 1,
-                          3, &e->rp[1])))
+                          3, &e->rp[1])) ||
+        (rc = render_pass(e, 1, &fm, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 1, 1, &e->rp_cells)))
         return rc;
     for (int i = 0; i < 4; i++)
         vkGetRenderAreaGranularity(e->dev, e->rp[i], &e->gran[i]);
@@ -1411,6 +1500,7 @@ int pi_stream_open(struct pi_engine *e, const struct pi_stream_info *info)
     for (int k = 0; k < PI_FRAMES_IN_FLIGHT; k++)
         e->c[k].tables_serial = 0;
     e->first = 1;
+    e->pm_found = 1;
     e->overlay_before = 0;
     e->profile_dv = info->profile;
     if (info->width != e->w || info->height != e->h || !e->c[0].fb) {
@@ -1621,9 +1711,11 @@ int pi_overlay_import(struct pi_engine *e, int fd, uint32_t width, uint32_t heig
         logf_(e, PI_LOG_ERROR, "overlay dmabuf has %lld bytes, not %llu", (long long)real, (unsigned long long)size);
         return PI_E_INVALID;
     }
-    if (!e->po) {   /* PO: one variant */
+    if (!e->po) {   /* PO: one variant; PM: one per exact sampling */
         uint32_t none = 0;
         int rc = pipeline(e, spv_po, sizeof(spv_po), e->rp[3], &none, 0, 0, 1, &e->po);
+        for (uint32_t mode = 2; mode <= 3 && !rc; mode++)
+            rc = pipeline(e, spv_pm, sizeof(spv_pm), e->rp_cells, &mode, 1, 0, 1, &e->pm[mode]);
         if (rc)
             return rc;
     }
@@ -1701,7 +1793,10 @@ void pi_engine_destroy(struct pi_engine *e)
             overlay_destroy(e, o);
         }
         codes_destroy(e);
+        cells_destroy(e);
         vkDestroyPipeline(e->dev, e->po, NULL);
+        for (int m = 0; m < 4; m++)
+            vkDestroyPipeline(e->dev, e->pm[m], NULL);
         stream_images_destroy(e);
         for (int k = 0; k < PI_FRAMES_IN_FLIGHT; k++) {
             struct ctx *c = &e->c[k];
@@ -1735,6 +1830,7 @@ void pi_engine_destroy(struct pi_engine *e)
         vkDestroyRenderPass(e->dev, e->rp[3], NULL);
         vkDestroyRenderPass(e->dev, e->rp1_luma, NULL);
         vkDestroyRenderPass(e->dev, e->rp1_pair, NULL);
+        vkDestroyRenderPass(e->dev, e->rp_cells, NULL);
         vkDestroyDescriptorPool(e->dev, e->dpool, NULL);   /* frees the sets */
         vkDestroyPipelineLayout(e->dev, e->pl, NULL);
         vkDestroyDescriptorSetLayout(e->dev, e->dsl, NULL);
@@ -2314,7 +2410,188 @@ struct overlay_pass {
     int n;
     uint32_t area[PI_OVERLAY_RECTS][4], orect[PI_OVERLAY_RECTS][4], bound[4];
     VkPipeline p2, bars;
+    /* PM's (at exact sampling only; run at the overlay's first reuse: an
+     * overlay redrawn for every picture would never be skipped) and its
+     * cells per rectangle: those wholly in its blocks, x0, y0, x1, y1;
+     * converted: the overlay is the last one converted (PO not run again) */
+    VkPipeline pm;
+    uint32_t cells[PI_OVERLAY_RECTS][4];
+    int converted;
 };
+
+/* Runs of fewer than MIN_RUN cells in a row of n set cleared: their bands
+ * would cost more than they save (a subtitle's opaque outline). */
+enum { MIN_RUN = 4 };
+static void drop_short_runs(uint8_t *row, uint32_t n)
+{
+    for (uint32_t x = 0; x < n;) {
+        uint32_t x1 = x;
+        while (x1 < n && row[x1])
+            x1++;
+        if (x1 > x && x1 - x < MIN_RUN)
+            memset(row + x, 0, x1 - x);
+        x = x1 > x ? x1 : x + 1;
+    }
+}
+
+/* PM's cells read back -> P2's blocks under opaque cells (composited over
+ * black: the overlay's alone), and the areas P1 draws, of its w x h (the
+ * picture from P2's block row py): all but the quads in cells that are opaque
+ * with their eight neighbours (every block within four of theirs is: P2 reads
+ * nothing of them; past the edge a neighbour is its edge cell, no blocks
+ * there), rows rounded inward to whole quads. Both by rows of cells alike,
+ * short runs left out; P2's past 64 left out too, P1's past 64: none (-1),
+ * no skip. */
+static void opaque_areas(struct pi_engine *e, uint32_t py, uint32_t w, uint32_t h)
+{
+    uint32_t W = e->cells_w, H = e->cells_h;
+    uint8_t *skip = malloc((size_t)W * H), *opaque = malloc((size_t)W * H);
+    if (!skip || !opaque) {
+        free(skip);
+        free(opaque);
+        e->p1_n = e->p2_n = -1;
+        return;
+    }
+    memcpy(opaque, e->cells_map, (size_t)W * H);
+    for (uint32_t cy = 0; cy < H; cy++)
+        drop_short_runs(opaque + (size_t)cy * W, W);
+    for (uint32_t cy = 0; cy < H; cy++)
+        for (uint32_t cx = 0; cx < W; cx++) {
+            uint8_t all = 1;
+            for (int j = -1; j <= 1; j++)
+                for (int i = -1; i <= 1; i++) {
+                    int64_t x = (int64_t)cx + i, y = (int64_t)cy + j;
+                    x = x < 0 ? 0 : x >= W ? W - 1 : x;
+                    y = y < 0 ? 0 : y >= H ? H - 1 : y;
+                    all &= opaque[(size_t)y * W + (size_t)x] != 0;
+                }
+            skip[(size_t)cy * W + cx] = all;
+        }
+    for (uint32_t cy = 0; cy < H; cy++)
+        drop_short_runs(skip + (size_t)cy * W, W);
+    int n = 0, over = 0, n2 = 0;
+#define AREA(t, m, a, b, c, d)                                                                                         \
+    do {                                                                                                               \
+        if ((m) < 64)                                                                                                  \
+            t[m][0] = (a), t[m][1] = (b), t[m][2] = (c), t[m][3] = (d), (m)++;                                         \
+        else                                                                                                           \
+            over = 1;                                                                                                  \
+    } while (0)
+    /* P2's: runs of opaque cells, by rows of cells alike */
+    for (uint32_t cy = 0; cy < H;) {
+        const uint8_t *row = opaque + (size_t)cy * W;
+        uint32_t cy1 = cy + 1;
+        while (cy1 < H && !memcmp(opaque + (size_t)cy1 * W, row, W))
+            cy1++;
+        for (uint32_t cx = 0; cx < W;) {
+            if (!row[cx]) {
+                cx++;
+                continue;
+            }
+            uint32_t cx1 = cx;
+            while (cx1 < W && row[cx1])
+                cx1++;
+            AREA(e->p2_opaque, n2, 4 * cx, 4 * cy, 4 * cx1, 4 * cy1);
+            cx = cx1;
+        }
+        cy = cy1;
+    }
+    e->p2_n = n2;   /* any of them: skipping fewer is the same picture */
+    over = 0;
+    /* P1's: all but the skipped runs */
+    uint32_t y = 0;   /* drawn up to row y */
+    for (uint32_t cy = 0; cy < H;) {
+        const uint8_t *row = skip + (size_t)cy * W;
+        uint32_t cy1 = cy + 1;
+        while (cy1 < H && !memcmp(skip + (size_t)cy1 * W, row, W))
+            cy1++;
+        int64_t k0 = (int64_t)4 * cy - py, k1 = (int64_t)4 * cy1 - py;
+        k0 = k0 < 0 ? 0 : (k0 + 1) & ~(int64_t)1;
+        k1 = (k1 > (int64_t)h ? (int64_t)h : k1) & ~(int64_t)1;
+        if (memchr(row, 1, W) && k1 > k0) {
+            if ((uint32_t)k0 > y)
+                AREA(e->p1_area, n, 0, y, w, (uint32_t)k0);
+            uint32_t x = 0;
+            for (uint32_t cx = 0; cx < W;) {
+                if (!row[cx]) {
+                    cx++;
+                    continue;
+                }
+                uint32_t cx1 = cx;
+                while (cx1 < W && row[cx1])
+                    cx1++;
+                if (4 * cx > x)
+                    AREA(e->p1_area, n, x, (uint32_t)k0, 4 * cx < w ? 4 * cx : w, (uint32_t)k1);
+                x = 4 * cx1 < w ? 4 * cx1 : w;
+                cx = cx1;
+            }
+            if (x < w)
+                AREA(e->p1_area, n, x, (uint32_t)k0, w, (uint32_t)k1);
+            y = (uint32_t)k1;
+        }
+        cy = cy1;
+    }
+    if (y < h)
+        AREA(e->p1_area, n, 0, y, w, h);
+#undef AREA
+    free(skip);
+    free(opaque);
+    e->p1_n = over ? -1 : n;
+}
+
+/* P2's bands with the overlay's composite (`over`) split where the blocks
+ * are under opaque cells (e->p2_opaque, in rows of cells alike, columns
+ * ascending): there `opaque` (the overlay over black) draws instead. b: nb
+ * bands, cw block columns; into out, at most cap; 0: too many. */
+static int split_opaque(const struct pi_engine *e, const struct band *b, int nb, VkPipeline over, VkPipeline opaque,
+                        uint32_t cw, struct band *out, int cap)
+{
+    int n = 0;
+#define ADD(p, y0, y1, x0, x1)                                                                                         \
+    do {                                                                                                               \
+        if ((y1) > (y0) && (x1) > (x0)) {                                                                              \
+            if (n == cap)                                                                                              \
+                return 0;                                                                                              \
+            out[n++] = (struct band){p, y0, (y1) - (y0), x0, (x1) - (x0)};                                             \
+        }                                                                                                              \
+    } while (0)
+    for (int k = 0; k < nb; k++) {
+        if (b[k].p != over || !b[k].rows) {
+            if (n == cap)
+                return 0;
+            out[n++] = b[k];
+            continue;
+        }
+        uint32_t y0 = b[k].y0, y1 = y0 + b[k].rows, x0 = b[k].x0, x1 = b[k].cols ? x0 + b[k].cols : cw;
+        uint32_t y = y0;   /* split up to row y */
+        for (int i = 0; i < e->p2_n;) {
+            const uint32_t *g = e->p2_opaque[i];
+            int i1 = i;   /* the runs of g's rows */
+            while (i1 < e->p2_n && e->p2_opaque[i1][1] == g[1] && e->p2_opaque[i1][3] == g[3])
+                i1++;
+            uint32_t gy0 = g[1] > y ? g[1] : y, gy1 = g[3] < y1 ? g[3] : y1;
+            if (gy1 > gy0) {
+                ADD(over, y, gy0, x0, x1);
+                uint32_t x = x0;
+                for (int r = i; r < i1; r++) {
+                    uint32_t rx0 = e->p2_opaque[r][0] > x ? e->p2_opaque[r][0] : x;
+                    uint32_t rx1 = e->p2_opaque[r][2] < x1 ? e->p2_opaque[r][2] : x1;
+                    if (rx1 <= rx0)
+                        continue;
+                    ADD(over, gy0, gy1, x, rx0);
+                    ADD(opaque, gy0, gy1, rx0, rx1);
+                    x = rx1;
+                }
+                ADD(over, gy0, gy1, x, x1);
+                y = gy1;
+            }
+            i = i1;
+        }
+        ADD(over, y, y1, x0, x1);
+    }
+#undef ADD
+    return n;
+}
 
 /* el_unread: P2 reads no EL luma (the single-layer routes but the full-height
  * 4:2:2 layout's): P1 doesn't store it. */
@@ -2344,6 +2621,7 @@ static int record(struct pi_engine *e, struct ctx *c, const dvvk_plan *p, struct
                              VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 1, &mb, 0,
                              NULL, 0, NULL);
     }
+    int overlay = ov->n > 0;
     /* Pass 1 only over the letterbox's row window (yblod's, with the margin the
      * filters need; 8-aligned): pass 2 reads no chroma or EL outside it, and
      * writes black there itself. */
@@ -2393,15 +2671,26 @@ static int record(struct pi_engine *e, struct ctx *c, const dvvk_plan *p, struct
         cx1 = (p->active[2] + 1) / 2 + 8 < cw ? ((p->active[2] + 1) / 2 + 9) & ~1u : cw;
         cx1 = cx1 < cw ? cx1 : cw;
     }
-    struct band b1 = {p1, c0, crows, cx0, cx1 - cx0};
+    struct band b1[64] = {{p1, c0, crows, cx0, cx1 - cx0}};
+    int nb1 = 1;
+    if (overlay && ov->converted && e->p1_parsed && e->p1_n >= 0) {   /* the overlay's opaque cells left out */
+        nb1 = 0;
+        for (int i = 0; i < e->p1_n; i++) {
+            const uint32_t *a = e->p1_area[i];
+            uint32_t x0 = a[0] > cx0 ? a[0] : cx0, x1 = a[2] < cx1 ? a[2] : cx1;
+            uint32_t y0 = a[1] > c0 ? a[1] : c0, y1 = a[3] < c0 + crows ? a[3] : c0 + crows;
+            if (x1 > x0 && y1 > y0)
+                b1[nb1++] = (struct band){p1, y0, y1 - y0, x0, x1 - x0};
+        }
+    }
     if (el_pairs) {   /* Annex B: P1 writes the EL luma's vertical pairs */
-        pass(e, c, 0, e->rp1_pair, c->fbp, cw, ch, cx0, cx1, c0, crows, &b1, 1, NULL);
+        pass(e, c, 0, e->rp1_pair, c->fbp, cw, ch, cx0, cx1, c0, crows, b1, nb1, NULL);
         c->elp_read = 1;
     } else
-        pass(e, c, 0, el_unread ? e->rp1_luma : e->rp[0], c->fb, cw, ch, cx0, cx1, c0, crows, &b1, 1, NULL);
-    /* PO: the overlay's rectangles as the source's signal, for P2 */
-    int overlay = ov->n > 0;
-    if (overlay) {
+        pass(e, c, 0, el_unread ? e->rp1_luma : e->rp[0], c->fb, cw, ch, cx0, cx1, c0, crows, b1, nb1, NULL);
+    /* PO: the overlay's rectangles as the source's signal, for P2; not again
+     * for the overlay last converted */
+    if (overlay && !ov->converted) {
         const uint32_t *ob = ov->bound;
         VkRenderPassBeginInfo rbi = {.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, .renderPass = e->rp[3],
                                      .framebuffer = e->codes_fb,
@@ -2420,7 +2709,63 @@ static int record(struct pi_engine *e, struct ctx *c, const dvvk_plan *p, struct
         }
         vkCmdEndRenderPass(c->cmd);
         e->codes_read = 1;
-    } else if (!e->codes_read) {
+        e->cells_current = 0;   /* none read back for this overlay until PM has run */
+        e->p1_parsed = 0;
+        e->pm_ran = 0;
+    }
+    /* PM, at the overlay's first reuse: its opaque cells, read back for P1's
+     * and P2's areas */
+    if (overlay && ov->pm) {
+        VkClearValue none = {0};
+        VkRenderPassBeginInfo rbi = {.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, .renderPass = e->rp_cells,
+                                     .framebuffer = e->cells_fb, .renderArea = {{0, 0}, {e->cells_w, e->cells_h}},
+                                     .clearValueCount = 1, .pClearValues = &none};
+        vkCmdBeginRenderPass(c->cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+        vkCmdBindDescriptorSets(c->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, e->pl, 0, 1, &c->ds, 0, NULL);
+        VkViewport vp = {0, 0, (float)e->cells_w, (float)e->cells_h, 0, 1};
+        vkCmdSetViewport(c->cmd, 0, 1, &vp);
+        vkCmdBindPipeline(c->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, ov->pm);
+        for (int i = 0; i < ov->n; i++) {
+            const uint32_t *cr = ov->cells[i];
+            if (cr[2] <= cr[0] || cr[3] <= cr[1])
+                continue;
+            VkRect2D sc = {{(int32_t)cr[0], (int32_t)cr[1]}, {cr[2] - cr[0], cr[3] - cr[1]}};
+            vkCmdSetScissor(c->cmd, 0, 1, &sc);
+            vkCmdDraw(c->cmd, 3, 1, 0, 0);
+        }
+        vkCmdEndRenderPass(c->cmd);
+
+        VkImageMemoryBarrier ib = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                                   .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                                   .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+                                   .oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                   .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                   .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                   .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .image = e->cells.img,
+                                   .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+        vkCmdPipelineBarrier(c->cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                             0, NULL, 0, NULL, 1, &ib);
+        VkBufferImageCopy cp = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                                .imageExtent = {e->cells_w, e->cells_h, 1}};
+        vkCmdCopyImageToBuffer(c->cmd, e->cells.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, e->cells_buf, 1, &cp);
+        ib.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        ib.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        ib.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        ib.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        VkBufferMemoryBarrier bb = {.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+                                    .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
+                                    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .buffer = e->cells_buf,
+                                    .size = VK_WHOLE_SIZE};
+        vkCmdPipelineBarrier(c->cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_HOST_BIT, 0, 0, NULL, 1, &bb, 1,
+                             &ib);
+        e->cells_ctx = (int)(c - e->c);
+        e->cells_serial = e->serial;
+        e->cells_current = 1;
+        e->cells_scanned = 0;
+        e->pm_ran = 1;
+    } else if (!overlay && !e->codes_read) {
         /* P2 binds PO's image whether or not it reads it: give it the layout
          * its descriptor names, once */
         VkImageMemoryBarrier ib = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
@@ -2499,7 +2844,16 @@ static int record(struct pi_engine *e, struct ctx *c, const dvvk_plan *p, struct
     for (int l = 0; l < 2; l++)
         black.color.uint32[l] = PI_PACK(p->black[0], l ? p->black[2] : p->black[1]);
     black.color.uint32[2] = black.color.uint32[3] = 0;
-    pass(e, c, 1, e->rp[1], o->fb, cw, och, 0, cw, 0, och, b, nb, &black);
+    /* under the overlay's opaque cells, the overlay over black: nothing of the
+     * picture read */
+    struct band bo[256];
+    int nbo = overlay && ov->converted && e->p1_parsed && e->p2_n > 0
+                  ? split_opaque(e, b, nb, ov->p2, ov->bars, cw, bo, (int)(sizeof(bo) / sizeof(bo[0])))
+                  : 0;
+    if (nbo)
+        pass(e, c, 1, e->rp[1], o->fb, cw, och, 0, cw, 0, och, bo, nbo, &black);
+    else
+        pass(e, c, 1, e->rp[1], o->fb, cw, och, 0, cw, 0, och, b, nb, &black);
     if (o->copy_buf)
         for (int half = 0; half < 2; half++) {
             VkBufferImageCopy cp = {.bufferOffset = (VkDeviceSize)half * o->stride, .bufferRowLength = o->stride / 4,
@@ -2731,7 +3085,7 @@ int pi_render(struct pi_engine *e, const struct pi_frame *f, struct pi_output *o
     struct ctx *c = &e->c[e->next];
     ctx_retire(e, c, 1);
     imports_trim(e);
-    uint32_t orc[PI_OVERLAY_RECTS][4];
+    uint32_t orc[PI_OVERLAY_RECTS][4] = {{0}};
     int norc = f->overlay ? overlay_rects(f, orc) : 0;
     struct pi_overlay *ov = norc ? f->overlay : NULL;
 
@@ -2772,7 +3126,7 @@ int pi_render(struct pi_engine *e, const struct pi_frame *f, struct pi_output *o
         logf_(e, PI_LOG_DEBUG, "route %u; active area x %u..%u, y %u..%u; row window %u..%u", p->route, p->active[0],
               p->active[2], p->active[1], p->active[3], p->row_first, p->row_last);
     prepare(e, p, f->el != NULL);
-    if (ov && (rc = codes_size(e, ov->w, ov->h)))
+    if (ov && ((rc = codes_size(e, ov->w, ov->h)) || (rc = cells_size(e, (o->w / 2 + 3) / 4, (o->h / 2 + 3) / 4))))
         goto out;
 
     /* inputs and tables */
@@ -2782,8 +3136,60 @@ int pi_render(struct pi_engine *e, const struct pi_frame *f, struct pi_output *o
         goto release;
     frame_params(e, p, f->el, oy, q);
     struct overlay_pass op = {0};
+    struct overlay_key okey;   /* this frame's overlay, recorded once submitted */
     if (ov) {
         overlay_params(o, f, orc, norc, p, q, &op);
+        /* PM's cells, at exact sampling (1:1, 2x): per rectangle those wholly
+         * in its blocks */
+        uint32_t mode = ov->w == o->w && ov->h == o->h ? 3u : 2 * ov->w == o->w && 2 * ov->h == o->h ? 2u : 1u;
+        uint32_t cw = o->w / 2, och = o->h / 2;
+        op.pm = mode > 1 ? e->pm[mode] : VK_NULL_HANDLE;
+        for (int i = 0; i < op.n; i++) {
+            const uint32_t *orect = op.orect[i];
+            uint32_t bx1 = (orect[2] + 1) / 2 < cw ? (orect[2] + 1) / 2 : cw;
+            uint32_t by1 = (orect[3] + 1) / 2 < och ? (orect[3] + 1) / 2 : och;
+            op.cells[i][0] = (orect[0] / 2 + 3) / 4, op.cells[i][1] = (orect[1] / 2 + 3) / 4;
+            op.cells[i][2] = bx1 / 4, op.cells[i][3] = by1 / 4;
+        }
+        /* the last overlay converted, unchanged: its drawing the same sync_file */
+        struct overlay_key k;
+        memset(&k, 0, sizeof(k));   /* compared whole */
+        k.ov = ov;
+        memcpy(k.rect, orc, sizeof(k.rect));
+        k.n = (uint32_t)norc;
+        k.bottom_up = f->overlay_bottom_up != 0;
+        k.ow = o->w;
+        k.oh = o->h;
+        memcpy(k.oc, q->oc, sizeof(k.oc));
+        struct sync_file_info si = {0};
+        if (drawn_fd >= 0 && !ioctl(drawn_fd, SYNC_IOC_FILE_INFO, &si))
+            memcpy(k.fence, si.name, sizeof(k.fence));
+        op.converted = e->okey_valid && !memcmp(&k, &e->okey, sizeof(k));
+        okey = k;
+        /* PM's last cells, once the render that read them back is done */
+        if (e->cells_serial && !e->cells_scanned) {
+            struct ctx *cc = &e->c[e->cells_ctx];
+            if (cc->serial != e->cells_serial || ctx_retire(e, cc, 0) == 0) {
+                e->pm_found = memchr(e->cells_map, 1, (size_t)e->cells_w * e->cells_h) != NULL;
+                e->cells_scanned = 1;
+            }
+        }
+        if (op.converted && e->cells_current && e->cells_scanned && !e->p1_parsed) {
+            opaque_areas(e, ((o->h - e->h) / 2 & ~1u) / 2, e->w / 2, e->h / 2);
+            e->p1_parsed = 1;
+        }
+        if (!op.converted || e->pm_ran)
+            op.pm = VK_NULL_HANDLE;
+        if (op.pm) {
+            if (e->pm_n == (uint32_t)norc && !memcmp(e->pm_rect, orc, sizeof(orc)) && !e->pm_found &&
+                ++e->pm_skips < 16)
+                op.pm = VK_NULL_HANDLE;   /* its cells cleared: nothing skipped */
+            else {
+                memcpy(e->pm_rect, orc, sizeof(orc));
+                e->pm_n = (uint32_t)norc;
+                e->pm_skips = 0;
+            }
+        }
         VkWriteDescriptorSet wr = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = c->ds, .dstBinding = 15,
                                    .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER,
                                    .pTexelBufferView = &ov->view};
@@ -2839,10 +3245,15 @@ int pi_render(struct pi_engine *e, const struct pi_frame *f, struct pi_output *o
     e->serial++;
     if ((rc = record(e, c, p, o, p0, p1, p2, p2i, pb, &op, k2[K2_SINGLE] && !k2[K2_FULL422], EL_PAIRS(k1[K1_ELUP]))))
         goto release;
+    e->okey_valid = 0;
     rc = submit(e, c, acquire_fd, drawn_fd, release_fd);
     acquire_fd = drawn_fd = -1;   /* submit takes them */
     if (rc)
         goto release;
+    if (ov) {
+        e->okey = okey;
+        e->okey_valid = 1;
+    }
     e->overlay_before = ov != NULL;
     c->ov = ov;
     c->busy = 1;

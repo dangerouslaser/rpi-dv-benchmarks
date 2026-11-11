@@ -26,9 +26,12 @@ P0  w/4 × h/2   (bicubic, Annex B and Lanczos EL upscales only) the EL
 P1  w/2 × h/2   chroma: BL chroma phase, luma guide, the EL chroma
                 upscaled, MMR / polynomial / piecewise chroma mapping + NLQ
                 residual → RG16UI chroma (12-bit), R16UI EL luma
-PO  overlay     (with an overlay only) the overlay's pixels in the area it
-                may cover, as the source's signal: (Y, Cb, Cr) codes ×
-                alpha, alpha → RGBA16
+PO  overlay     (with an overlay only, when it is new) the overlay's
+                pixels in the area it may cover, as the source's signal:
+                (Y, Cb, Cr) codes × alpha, alpha → RGBA16
+PM  cells       (at an overlay's first reuse, 1:1 and 2× only) a cell per
+                4×4 P2 blocks: 1 where every overlay pixel P2 composites
+                for them is opaque → R8UI, read back to the host
 P2  w/2 × h/2   one fragment per 2×2 output block: 4:2:2 vertical filter,
                 luma (mapping + the EL upscaled + NLQ), the overlay
                 composited (where it may touch), metadata bits, tunnel
@@ -119,6 +122,21 @@ player.
     a change either way refreshes the metadata.
   - **Lifetime:** the engine reads an overlay until the render's release
     sync_file signals. A player draws the next one into another buffer.
+  - **Reuse:** an overlay passed again unchanged (the same `pi_overlay`,
+    areas, row order, output size, colour and drawing: `overlay_fd`'s
+    sync_file, identified by its fence's name) isn't converted again: PO
+    runs only for a new one.
+  - **Opaque areas:** at its first reuse PM finds the cells where the
+    overlay is opaque over every sample P2 composites, and copies them to
+    the host. Once that render is done, and while the overlay stays, P2
+    draws those blocks with the bars' pipeline (the overlay over black: the
+    same codes, nothing of the picture read), and P1 leaves out the quads
+    whose every reader is such a block (cells opaque with their eight
+    neighbours: P2 reads four blocks either way), as bands of rows. Runs of
+    fewer than four cells are left out, and PM isn't run again for
+    unchanged areas where it found nothing (but every 16th conversion). An
+    overlay redrawn for every picture never gets this far, and costs what
+    it did.
   - **Refusal:** a source whose signal the planner can't express the
     overlay's colour in is rendered without the overlay, with one warning.
 - **Up to three renders in flight.** `pi_render` waits for the oldest beyond
@@ -349,9 +367,22 @@ measured slower for bicubic and Lanczos.
 **An overlay's cost** (DV FEL Power Rangers credits, a two-line subtitle
 drawn at 1920×1080, one line over a translucent box: 2316 × 316 output
 pixels): 25.2 → 27.0 ms per picture with the bilinear EL upscale, 31.9 →
-33.3 ms with Annex B, nearly all of it P2's composite: skipping PO while the
-overlay is unchanged measured no difference. Nothing while no overlay is
-shown.
+33.3 ms with Annex B, nearly all of it P2's composite. Nothing while no
+overlay is shown. A GUI's bars or an opaque panel, unchanged and when
+redrawn for every picture (`--overlay-bars`, `--overlay-panel`,
+`--overlay-redraw`):
+
+| Source | none | bars | bars, redrawn | panel | panel, redrawn |
+|---|---|---|---|---|---|
+| Power Rangers FEL | 25.2 ms | 30.8 ms | 33.6 ms | 18.8 ms | 46.1 ms |
+| Trainspotting FEL | 21.0 ms | 27.0 ms | 30.0 ms | 22.8 ms | 42.3 ms |
+| Gemini Man MEL | 12.8 ms | 18.9 ms | 21.6 ms | 20.0 ms | 33.9 ms |
+| Sol Levante P5 | 13.0 ms | 19.3 ms | 22.4 ms | 20.5 ms | 35.2 ms |
+
+The panel's composite takes P2 two threads per QPU (its registers), not
+four: P2 over it costs about three times the picture's own work; an
+overlay redrawn for every picture pays PO (1.5 ms for the bars, 6 ms for
+the panel) every time.
 
 Notes:
 - The HEVC decoder alone does 44–79 fps for BL and EL, over SMB.
@@ -464,7 +495,11 @@ white and yellow, the second over a translucent box) drawn at WxH into every
 picture, `--overlay-bottom-up` stores its rows bottom first,
 `--overlay-top` adds a line near the top as a second area, `--overlay-bars`
 a GUI's top and bottom bars (full width, a dark band fading out) as two
-areas, and `--overlay-check` renders each of the first pictures again without it and
+areas, `--overlay-panel` an opaque panel over most of the picture (x 40 ..
+1880, y 112 .. 940 of 1920 × 1080; the area all but the last rows),
+`--overlay-redraw` passes it as two imports of the buffer, alternately (the
+engine converts it for every picture), and `--overlay-check` renders each of
+the first pictures again without it and
 compares the overlaid output with a CPU reference of the composite over that
 (the planner's colour coefficients): within 1 code at 1:1 and 2×, 16 at
 other scales.

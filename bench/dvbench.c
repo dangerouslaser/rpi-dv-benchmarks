@@ -57,6 +57,13 @@
  *     --overlay-top      also a line near the top, as a second rectangle
  *     --overlay-bars     also a GUI's top and bottom bars (full width, fading), as two
  *                        rectangles
+ *     --overlay-panel    also an opaque panel over most of the picture (Kodi's
+ *                        Player information: x 40..1880, y 112..940 of 1920x1080),
+ *                        the area handed over that of a GUI's whole screen but its
+ *                        last rows
+ *     --overlay-redraw   the overlay as two imports of the buffer, alternated
+ *                        picture by picture: the engine converts it every time
+ *                        (a GUI redrawn for every picture)
  *     --overlay-check    then each picture again without the overlay, and the
  *                        overlaid output compared with a CPU reference of the
  *                        composite over it (the planner's overlay colour)
@@ -246,10 +253,11 @@ static const AVFrame *rpu_frame(const struct dv_picture *q)
 
 static struct {
     uint32_t w, h, stride, rect[4], top_rect[4];
-    int bottom_up, on, top, bars;
+    int bottom_up, on, top, bars, panel, redraw;
     struct dv_dmabuf buf;
     uint8_t *rgba;   /* top-down premultiplied B, G, R, A: the CPU reference's */
-    struct pi_overlay *ov;
+    struct pi_overlay *ov, *ov2;   /* ov2: --overlay-redraw's second import */
+    unsigned uses;
 } g_ov;
 
 static double clamp01(double v) { return v < 0 ? 0 : v > 1 ? 1 : v; }
@@ -327,6 +335,16 @@ static int overlay_make(uint32_t w, uint32_t h, int bottom_up)
         bounds[1][0] = 0, bounds[1][1] = 0, bounds[1][2] = w, bounds[1][3] = t1;
         g_ov.top = 1;
     }
+    if (g_ov.panel) {   /* opaque, dark grey: Player information's panel */
+        uint32_t x0 = w * 40 / 1920, x1 = w * 1880 / 1920, y0 = h * 112 / 1080, y1 = h * 940 / 1080;
+        for (uint32_t y = y0; y < y1; y++)
+            for (uint32_t x = x0; x < x1; x++) {
+                uint8_t *q = g_ov.rgba + ((size_t)y * w + x) * 4;
+                q[0] = 0x1c, q[1] = 0x19, q[2] = 0x16, q[3] = 255;
+            }
+        bounds[0][0] = 0, bounds[0][1] = 0, bounds[0][2] = w, bounds[0][3] = h * 1040 / 1080;
+        g_ov.top = 0;
+    }
     memcpy(g_ov.rect, bounds[0], sizeof(g_ov.rect));
     memcpy(g_ov.top_rect, bounds[1], sizeof(g_ov.top_rect));
     dv_dmabuf_cpu(&g_ov.buf, 1, 1);
@@ -334,6 +352,8 @@ static int overlay_make(uint32_t w, uint32_t h, int bottom_up)
         memcpy(g_ov.buf.map + (size_t)(bottom_up ? h - 1 - y : y) * g_ov.stride, g_ov.rgba + (size_t)y * w * 4, w * 4);
     dv_dmabuf_cpu(&g_ov.buf, 0, 1);
     int rc = pi_overlay_import(g_pi, g_ov.buf.fd, w, h, g_ov.stride, g_ov.buf.size, &g_ov.ov);
+    if (!rc && g_ov.redraw)
+        rc = pi_overlay_import(g_pi, g_ov.buf.fd, w, h, g_ov.stride, g_ov.buf.size, &g_ov.ov2);
     if (rc) {
         fprintf(stderr, "pi: overlay import: %s\n", pi_strerror(rc));
         return -1;
@@ -354,7 +374,7 @@ static int render_fenced(const struct dv_picture *q, double pts, struct out_buf 
                          .chroma_top_left = pi_chroma_top_left(q->bl, g_profile), .pts_us = (int64_t)(pts * 1e6),
                          .acquire_fd = acquire_fd, .overlay_fd = -1};
     if (g_ov.on) {
-        f.overlay = g_ov.ov;
+        f.overlay = g_ov.ov2 && g_ov.uses++ % 2 ? g_ov.ov2 : g_ov.ov;
         memcpy(f.overlay_rect[0], g_ov.rect, sizeof(f.overlay_rect[0]));
         if (g_ov.top)
             memcpy(f.overlay_rect[1], g_ov.top_rect, sizeof(f.overlay_rect[1]));
@@ -712,7 +732,7 @@ static void usage(void)
                     "               [--el-upscale bilinear|annexb|bicubic|lanczos]\n"
                     "               [--filters cb1|phase] [--mmr exact|split|exact64|float] [--device NAME]\n"
                     "               [--pipeline-cache FILE] [--throughput S] [--play S] [--hash] [--dump DIR] [--output-height H]\n"
-                    "               [--overlay WxH [--overlay-bottom-up] [--overlay-top] [--overlay-check]]\n"
+                    "               [--overlay WxH [--overlay-bottom-up] [--overlay-top] [--overlay-panel] [--overlay-redraw] [--overlay-check]]\n"
                     "               [--json FILE] [--measure LIST] FILE\n"
                     "       dvbench --probe [--device NAME]\n");
 }
@@ -1657,6 +1677,10 @@ int main(int argc, char **argv)
             g_ov.top = 1;
         else if (!strcmp(a, "--overlay-bars"))
             g_ov.bars = 1;
+        else if (!strcmp(a, "--overlay-panel"))
+            g_ov.panel = 1;
+        else if (!strcmp(a, "--overlay-redraw"))
+            g_ov.redraw = 1;
         else if (!strcmp(a, "--overlay-check"))
             ov_check = 1;
         else if (!strcmp(a, "--dump") && takes)
@@ -1963,8 +1987,8 @@ int main(int argc, char **argv)
         dv_picture_free(&pics[i]);
     for (unsigned i = 0; i < 3; i++)
         out_free(g_pi, &out[i]);
-    if (g_ov.ov)
-        pi_overlay_release(g_pi, g_ov.ov);
+    pi_overlay_release(g_pi, g_ov.ov);   /* NULL: nothing */
+    pi_overlay_release(g_pi, g_ov.ov2);
     pi_stream_close(g_pi);
     pi_engine_destroy(g_pi);
     dv_source_close(src);
