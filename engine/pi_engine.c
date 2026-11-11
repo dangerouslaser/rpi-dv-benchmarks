@@ -262,6 +262,7 @@ struct pi_engine {
     PFN_vkGetFenceFdKHR get_fence_fd;
     int modifiers, foreign, sem_fd, fence_fd, profile;
     int quad;   /* fragment shaders have subgroup quad operations */
+    int v3d;    /* the device is V3D (v3dv) */
     double ts_period;
     VkSampler sampler, bilinear;
     VkDescriptorSetLayout dsl;
@@ -542,6 +543,22 @@ static off_t dmabuf_size(int fd)
     return size;
 }
 
+/* Whether a texel buffer over a dmabuf of size bytes can be bound to it,
+ * given its requirement r. v3dv (Mesa 26.3 on) adds its transfer unit's
+ * read-ahead to every buffer's requirement, whatever the buffer's use, and
+ * a decoder's dmabuf ends with its picture: no room for it. Texel fetches
+ * stay inside the buffer and nothing transfers from it, so on V3D that
+ * padding (under a page) is left out: r becomes the dmabuf's size. */
+static int dmabuf_fits(const struct pi_engine *e, VkMemoryRequirements *r, VkDeviceSize size)
+{
+    if (r->size <= size)
+        return 1;
+    if (!e->v3d || r->size - size >= 4096)
+        return 0;
+    r->size = size;
+    return 1;
+}
+
 static void import_free(struct pi_engine *e, struct import *i)
 {
     vkDestroyBufferView(e->dev, i->view, NULL);
@@ -570,17 +587,16 @@ static struct import *import_dmabuf(struct pi_engine *e, int fd)
     i->ino = st.st_ino;
     VkExternalMemoryBufferCreateInfo ext = {.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
                                             .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT};
-    /* Texel-buffer use only: v3dv pads no read-ahead onto it (as it does
-     * for transfer / storage / uniform use), so the requirement is the
-     * dmabuf's own size. */
+    /* Texel-buffer use only: nothing that reads ahead of it (dmabuf_fits) */
     VkBufferCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .pNext = &ext, .size = (VkDeviceSize)size,
                              .usage = VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT};
     VkMemoryRequirements r;
     if (vkCreateBuffer(e->dev, &ci, NULL, &i->buf) != VK_SUCCESS)
         goto fail;
     vkGetBufferMemoryRequirements(e->dev, i->buf, &r);
-    if (r.size > (VkDeviceSize)size) {
-        logf_(e, PI_LOG_ERROR, "buffer needs %llu bytes, the dmabuf has %lld", (unsigned long long)r.size,
+    const VkDeviceSize needs = r.size;
+    if (!dmabuf_fits(e, &r, (VkDeviceSize)size)) {
+        logf_(e, PI_LOG_ERROR, "buffer needs %llu bytes, the dmabuf has %lld", (unsigned long long)needs,
               (long long)size);
         goto fail;
     }
@@ -1074,6 +1090,7 @@ static int create_device(struct pi_engine *e)
     if (!e->get_fd_props)
         return PI_E_VULKAN;
     snprintf(e->device, sizeof(e->device), "%s", props.deviceName);
+    e->v3d = strstr(props.deviceName, "V3D") != NULL;
     describe(e);
     return 0;
 }
@@ -1767,8 +1784,9 @@ int pi_overlay_import(struct pi_engine *e, int fd, uint32_t width, uint32_t heig
     if (vkCreateBuffer(e->dev, &ci, NULL, &o->buf) != VK_SUCCESS)
         goto fail;
     vkGetBufferMemoryRequirements(e->dev, o->buf, &r);
-    if (real > 0 && r.size > (VkDeviceSize)real) {
-        logf_(e, PI_LOG_ERROR, "overlay buffer needs %llu bytes, the dmabuf has %lld", (unsigned long long)r.size,
+    const VkDeviceSize needs = r.size;
+    if (real > 0 && !dmabuf_fits(e, &r, (VkDeviceSize)real)) {
+        logf_(e, PI_LOG_ERROR, "overlay buffer needs %llu bytes, the dmabuf has %lld", (unsigned long long)needs,
               (long long)real);
         rc = PI_E_INVALID;
         goto fail;

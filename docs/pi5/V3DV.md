@@ -194,6 +194,15 @@ Each kind of access takes a different hardware path:
   26.2, the TFU in main since Oct 2026. [S] gallium v3d_blit.c; [P] mesa e2f05fca
 - **YCbCr sampler conversion:** only 8-bit 4:2:0 (NV12 and 3-plane), OPTIMAL
   tiling only, no filtering. **No P010.** [S] vulkan/v3dvx_formats.c:292-302
+- **Buffer memory requirements:** up to 26.2 a buffer's requirement is its
+  size, with the TFU's read-ahead (64 bytes) added only for transfer, storage
+  and uniform use. From 26.3 it is added to every buffer, whatever its use
+  (256 bytes more for a texel buffer, by its alignment), and an import must
+  be that long. A decoder's dmabuf ends with its picture (the Pi's 4K luma
+  plane is 40 × 128 × 2160 bytes exactly), so the engine binds a texel buffer
+  to the dmabuf as it is (`dmabuf_fits`): texel fetches stay inside the
+  buffer, and nothing transfers from it.
+  [S] vulkan/v3dv_device.c get_buffer_memory_requirements (26.3.0)
 - **Host memory:** one memory type, DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT,
   **not cached**. [D] v3dv-vulkaninfo.txt:493-499
 
