@@ -24,6 +24,10 @@ with `git am`.
 | `0015` pi-dv-engine: update to 0.4.1 | `PKG_VERSION` / `PKG_SHA256` of the 0.4.1 tarball: faster, the same output and API (`libpi_engine.so.3`). |
 | `0016` pi-dv-engine: update to 0.4.2 | `PKG_VERSION` / `PKG_SHA256` of the 0.4.2 tarball: an output may be taller than the stream (the picture in its middle); the same API (`libpi_engine.so.3`). |
 | `0017` RPi5: kodi: Dolby Vision for streams cropped to the picture | `../kodi/0010` as `projects/RPi/devices/RPi5/patches/kodi/0053-…` (on the tree's 0001–0052). |
+| `0018` pi-dv-engine: update to 0.5.0 | `PKG_VERSION` / `PKG_SHA256` of the 0.5.0 tarball: the CM v4.0 and L2 options (`pi_engine_set_dm`), the picture under an overlay's opaque areas skipped, and decoder buffers bound under Mesa 26.3's v3dv, which 0.4.2 can't; the same `libpi_engine.so.3`. |
+| `0019` RPi5: kodi: Player information in Input, Processing and Output columns | `../kodi/0011` as `projects/RPi/devices/RPi5/patches/kodi/0054-…`. |
+| `0020` RPi5: kodi: Dolby Vision CM v4.0 metadata and L2 trim settings | `../kodi/0012` as `projects/RPi/devices/RPi5/patches/kodi/0055-…` (needs engine 0.5.0). |
+| `0021` RPi5: kodi: the stereoscopic 3D series on Kodi 22.0rc2 | For LibreELEC.tv from `01a57f984b` on, which builds Kodi 22.0rc2-Piers (and Mesa 26.3.0): refreshes the tree's `0017`, `0022` and `0023` and removes `0021`, which Kodi now does itself. The tree's other Kodi patches apply as they are. |
 
 **Building:** `make image` as usual (`PROJECT=RPi DEVICE=RPi5 ARCH=aarch64`).
 The engine tarball downloads from the release. To build an engine version

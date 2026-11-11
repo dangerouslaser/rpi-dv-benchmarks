@@ -1,0 +1,2137 @@
+From 64eb789ec3b820e3dce06bc3a561dfaca1a2a7f3 Mon Sep 17 00:00:00 2001
+From: Bryan Hoban <bryan.hoban@gmail.com>
+Date: Wed, 11 Nov 2026 12:53:03 -0500
+Subject: [PATCH] RPi5: kodi: Player information in Input, Processing and
+ Output columns
+
+Signed-off-by: Bryan Hoban <bryan.hoban@gmail.com>
+---
+ ...nformation-Input-Processing-and-Outp.patch | 2116 +++++++++++++++++
+ 1 file changed, 2116 insertions(+)
+ create mode 100644 projects/RPi/devices/RPi5/patches/kodi/0054-dialogs-Player-information-Input-Processing-and-Outp.patch
+
+diff --git a/projects/RPi/devices/RPi5/patches/kodi/0054-dialogs-Player-information-Input-Processing-and-Outp.patch b/projects/RPi/devices/RPi5/patches/kodi/0054-dialogs-Player-information-Input-Processing-and-Outp.patch
+new file mode 100644
+index 0000000000..ac791d8ca7
+--- /dev/null
++++ b/projects/RPi/devices/RPi5/patches/kodi/0054-dialogs-Player-information-Input-Processing-and-Outp.patch
+@@ -0,0 +1,2116 @@
++From f715da2035ba0c29e80e12a59a4318656403d25f Mon Sep 17 00:00:00 2001
++From: Bryan Hoban <bryan.hoban@gmail.com>
++Date: Wed, 11 Nov 2026 07:18:38 -0500
++Subject: [PATCH] [dialogs] Player information: Input, Processing and Output
++ columns
++
++Player information listed Kodi's player fields, so nothing showed what
++a Dolby Vision or HDR file carries, what the engine does with it, or
++what goes to the display. Redesign it, after the layout of the
++libreelec-x86-DV build's panel (CroqueMr/libreelec-x86-DV#92), in three
++columns: Input (the stream, its colour, its Dolby Vision configuration
++and RPU levels), Processing (the engine's reconstruction, chroma
++mapping, filters and GPU time, the static, RPU and HDR10+ metadata) and
++Output (the mode, VRR, the signal, the tunnel and its infoframe), with
++meters for the engine, CPU, memory, cache, drops and temperature.
++
++While the dialog is shown, the DRM PRIME renderer describes the picture
++on screen twice a second (CDataCacheCore::SetVideoPlayerInfo) and the
++dialog sets those as window properties. The engine profiles each render
++(three GPU timestamps) for its GPU time.
++
++Signed-off-by: Bryan Hoban <bryan.hoban@gmail.com>
++---
++ .../xml/DialogPlayerProcessInfo.xml           | 505 +++--------------
++ addons/skin.estuary/xml/Includes.xml          |   1 +
++ .../xml/Includes_PlayerProcessInfo.xml        | 530 ++++++++++++++++++
++ xbmc/cores/DataCacheCore.cpp                  |  46 ++
++ xbmc/cores/DataCacheCore.h                    |  21 +
++ .../DVDCodecs/Video/DVDVideoCodec.cpp         |   2 +
++ .../DVDCodecs/Video/DVDVideoCodec.h           |   2 +
++ .../DVDCodecs/Video/DVDVideoCodecDRMPRIME.cpp |   3 +
++ xbmc/cores/VideoPlayer/VideoPlayerVideo.cpp   |   3 +
++ .../VideoRenderers/HwDecRender/CMakeLists.txt |   6 +-
++ .../HwDecRender/DRMPRIMEPlayerInfo.cpp        | 324 +++++++++++
++ .../HwDecRender/DRMPRIMEPlayerInfo.h          |  33 ++
++ .../HwDecRender/DVTunnelDRMPRIME.cpp          |  97 ++++
++ .../HwDecRender/DVTunnelDRMPRIME.h            |  21 +
++ .../HwDecRender/RendererDRMPRIME.cpp          |  50 ++
++ .../HwDecRender/RendererDRMPRIME.h            |   6 +
++ xbmc/dialogs/GUIDialogPlayerProcessInfo.cpp   |  76 +++
++ xbmc/dialogs/GUIDialogPlayerProcessInfo.h     |  17 +
++ 18 files changed, 1323 insertions(+), 420 deletions(-)
++ create mode 100644 addons/skin.estuary/xml/Includes_PlayerProcessInfo.xml
++ create mode 100644 xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DRMPRIMEPlayerInfo.cpp
++ create mode 100644 xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DRMPRIMEPlayerInfo.h
++
++diff --git a/addons/skin.estuary/xml/DialogPlayerProcessInfo.xml b/addons/skin.estuary/xml/DialogPlayerProcessInfo.xml
++index c4f1c10ae..11caad157 100644
++--- a/addons/skin.estuary/xml/DialogPlayerProcessInfo.xml
+++++ b/addons/skin.estuary/xml/DialogPlayerProcessInfo.xml
++@@ -1,439 +1,108 @@
++ <?xml version="1.0" encoding="UTF-8"?>
++ <window>
++ 	<depth>DepthOSD</depth>
++-	<defaultcontrol always="true">5553</defaultcontrol>
++ 	<animation effect="fade" start="0" end="100" time="300">WindowOpen</animation>
++ 	<animation effect="fade" start="100" end="0" time="200">WindowClose</animation>
++-	<onunload>ClearProperty(PlayerInfoDialogFocus,Home)</onunload>
++ 	<controls>
++ 		<control type="group">
++-			<bottom>0</bottom>
++-			<height>250</height>
++-			<animation effect="slide" end="0,-20" time="150" condition="VideoPlayer.Content(LiveTV)">conditional</animation>
+++			<left>40</left>
+++			<top>112</top>
+++			<width>1840</width>
+++			<height>828</height>
+++			<!-- opaque: the video under a translucent panel makes it hard to read -->
++ 			<control type="image">
++-				<left>0</left>
++-				<width>100%</width>
++-				<top>-220</top>
++-				<height>330</height>
++-				<texture border="40">dialogs/dialog-bg-nobo.png</texture>
+++				<texture colordiffuse="FF16191C">colors/white.png</texture>
++ 			</control>
+++			<include content="PlayerInfoHeading">
+++				<param name="left" value="40"/>
+++				<param name="title" value="Input"/>
+++				<param name="primary" value="$VAR[PlayerInfoSourceFormat]"/>
+++				<param name="secondary" value="$VAR[PlayerInfoInputAudio]"/>
+++			</include>
+++			<include content="PlayerInfoHeading">
+++				<param name="left" value="640"/>
+++				<param name="title" value="Processing"/>
+++				<param name="primary" value="$VAR[PlayerInfoProcessing]"/>
+++				<param name="secondary" value="$VAR[PlayerInfoProcessingDetail]"/>
+++			</include>
+++			<include content="PlayerInfoHeading">
+++				<param name="left" value="1240"/>
+++				<param name="title" value="Output"/>
+++				<param name="primary" value="$VAR[PlayerInfoOutput]"/>
+++				<param name="secondary" value="$VAR[PlayerInfoOutputAudio]"/>
+++			</include>
++ 			<control type="grouplist">
++-				<left>50</left>
++-				<top>-204</top>
++-				<visible>String.IsEqual(Window(Home).Property(PlayerInfoDialogFocus),5551)</visible>
++-				<control type="label">
++-					<width>885</width>
++-					<height>50</height>
++-					<aligny>bottom</aligny>
++-					<label>$INFO[PVR.ActStreamServiceName,[COLOR button_focus]$LOCALIZE[19099]:[/COLOR] ]</label>
++-					<font>font14</font>
++-					<shadowcolor>black</shadowcolor>
++-				</control>
++-				<control type="label">
++-					<width>885</width>
++-					<height>50</height>
++-					<aligny>bottom</aligny>
++-					<label>$INFO[PVR.ActStreamProviderName,[COLOR button_focus]$LOCALIZE[19101]:[/COLOR] ]</label>
++-					<font>font14</font>
++-					<shadowcolor>black</shadowcolor>
++-				</control>
++-				<control type="label">
++-					<width>885</width>
++-					<height>50</height>
++-					<aligny>bottom</aligny>
++-					<label>$INFO[PVR.ActStreamClient,[COLOR button_focus]$LOCALIZE[19012]:[/COLOR] ]</label>
++-					<font>font14</font>
++-					<shadowcolor>black</shadowcolor>
++-				</control>
++-				<control type="label">
++-					<width>885</width>
++-					<height>50</height>
++-					<aligny>bottom</aligny>
++-					<label>$INFO[PVR.ActStreamDevice,[COLOR button_focus]$LOCALIZE[19006]:[/COLOR] ]</label>
++-					<font>font14</font>
++-					<shadowcolor>black</shadowcolor>
++-				</control>
++-				<control type="label">
++-					<width>885</width>
++-					<height>50</height>
++-					<aligny>bottom</aligny>
++-					<label>$INFO[PVR.ActStreamStatus,[COLOR button_focus]$LOCALIZE[19007]:[/COLOR] ]</label>
++-					<font>font14</font>
++-					<shadowcolor>black</shadowcolor>
++-				</control>
++-				<control type="label">
++-					<width>885</width>
++-					<height>50</height>
++-					<aligny>bottom</aligny>
++-					<label>$INFO[PVR.ActStreamEncryptionName,[COLOR button_focus]$LOCALIZE[19015]:[/COLOR] ]</label>
++-					<font>font14</font>
++-					<shadowcolor>black</shadowcolor>
++-				</control>
+++				<left>40</left>
+++				<top>146</top>
+++				<width>560</width>
+++				<height>584</height>
+++				<itemgap>0</itemgap>
+++				<include>PlayerInfoInput</include>
++ 			</control>
++ 			<control type="grouplist">
++-				<left>985</left>
++-				<top>-204</top>
++-				<visible>String.IsEqual(Window(Home).Property(PlayerInfoDialogFocus),5551)</visible>
++-				<usecontrolcoords>true</usecontrolcoords>
++-				<control type="label">
++-					<width>885</width>
++-					<height>50</height>
++-					<aligny>bottom</aligny>
++-					<label>$INFO[PVR.ActStreamBer,[COLOR button_focus]$LOCALIZE[19010]:[/COLOR] ]</label>
++-					<font>font14</font>
++-					<shadowcolor>black</shadowcolor>
++-				</control>
++-				<control type="label">
++-					<width>885</width>
++-					<height>50</height>
++-					<aligny>bottom</aligny>
++-					<label>$INFO[PVR.ActStreamUnc,[COLOR button_focus]$LOCALIZE[19011]:[/COLOR] ]</label>
++-					<font>font14</font>
++-					<shadowcolor>black</shadowcolor>
++-				</control>
++-				<control type="label">
++-					<width>885</width>
++-					<height>50</height>
++-					<aligny>bottom</aligny>
++-					<label>$INFO[PVR.ActStreamMux,[COLOR button_focus]$LOCALIZE[19100]:[/COLOR] ]</label>
++-					<font>font14</font>
++-					<shadowcolor>black</shadowcolor>
++-				</control>
++-				<control type="label">
++-					<width>885</width>
++-					<height>50</height>
++-					<aligny>bottom</aligny>
++-					<label>$INFO[PVR.ActStreamSignal,[COLOR button_focus]$LOCALIZE[19008]:[/COLOR] ]</label>
++-					<font>font14</font>
++-					<shadowcolor>black</shadowcolor>
++-				</control>
++-				<control type="progress">
++-					<top>5</top>
++-					<width>885</width>
++-					<height>18</height>
++-					<info>PVR.ActStreamProgrSignal</info>
++-				</control>
++-				<control type="label">
++-					<top>5</top>
++-					<width>885</width>
++-					<height>50</height>
++-					<aligny>bottom</aligny>
++-					<label>$INFO[PVR.ActStreamSNR,[COLOR button_focus]$LOCALIZE[19009]:[/COLOR] ]</label>
++-					<font>font14</font>
++-					<shadowcolor>black</shadowcolor>
++-				</control>
++-				<control type="progress">
++-					<top>0</top>
++-					<width>885</width>
++-					<height>18</height>
++-					<info>PVR.ActStreamProgrSNR</info>
++-				</control>
+++				<left>640</left>
+++				<top>146</top>
+++				<width>560</width>
+++				<height>584</height>
+++				<itemgap>0</itemgap>
+++				<include>PlayerInfoProcessingRows</include>
++ 			</control>
++ 			<control type="grouplist">
++-				<left>50</left>
++-				<top>-204</top>
++-				<visible>String.IsEqual(Window(Home).Property(PlayerInfoDialogFocus),5552)</visible>
++-				<control type="label">
++-					<width>885</width>
++-					<height>50</height>
++-					<aligny>bottom</aligny>
++-					<label>$VAR[VideoCodecVar,[COLOR button_focus]$LOCALIZE[31600]:[/COLOR] ]</label>
++-					<font>font14</font>
++-					<shadowcolor>black</shadowcolor>
++-					<visible>!String.IsEmpty(VideoPlayer.VideoCodec)</visible>
++-				</control>
++-				<control type="label">
++-					<width>885</width>
++-					<height>50</height>
++-					<aligny>bottom</aligny>
++-					<label>$INFO[VideoPlayer.VideoResolution,[COLOR button_focus]$LOCALIZE[31601]:[/COLOR] ] $VAR[VideoResolutionTypeVar]</label>
++-					<font>font14</font>
++-					<shadowcolor>black</shadowcolor>
++-					<visible>!String.IsEmpty(VideoPlayer.VideoResolution)</visible>
++-				</control>
++-				<control type="label">
++-					<width>885</width>
++-					<height>50</height>
++-					<label>$VAR[VideoHDRTypeVar,[COLOR button_focus]$LOCALIZE[20474]:[/COLOR] ]$INFO[VideoPlayer.HdrDetail, P]</label>
++-					<font>font14</font>
++-					<shadowcolor>black</shadowcolor>
++-					<visible>!String.IsEmpty(VideoPlayer.HdrType)</visible>
++-				</control>
++-				<control type="label">
++-					<width>885</width>
++-					<height>50</height>
++-					<aligny>bottom</aligny>
++-					<label>$INFO[VideoPlayer.VideoAspect,[COLOR button_focus]$LOCALIZE[31602]: [/COLOR],:1]</label>
++-					<font>font14</font>
++-					<shadowcolor>black</shadowcolor>
++-					<visible>!String.IsEmpty(VideoPlayer.VideoAspect)</visible>
++-				</control>
++-				<control type="label">
++-					<width>885</width>
++-					<height>50</height>
++-					<aligny>bottom</aligny>
++-					<label>$INFO[VideoPlayer.VideoBitrate,[COLOR button_focus]$LOCALIZE[31603]:[/COLOR] , kb/s]</label>
++-					<font>font14</font>
++-					<shadowcolor>black</shadowcolor>
++-					<visible>!String.IsEmpty(VideoPlayer.VideoBitrate)</visible>
++-				</control>
+++				<left>1240</left>
+++				<top>146</top>
+++				<width>560</width>
+++				<height>584</height>
+++				<itemgap>0</itemgap>
+++				<include>PlayerInfoOutputRows</include>
++ 			</control>
++-			<control type="grouplist">
++-				<left>985</left>
++-				<top>-204</top>
++-				<visible>String.IsEqual(Window(Home).Property(PlayerInfoDialogFocus),5552)</visible>
++-				<control type="label">
++-					<width>885</width>
++-					<height>50</height>
++-					<aligny>bottom</aligny>
++-					<label>$VAR[AudioCodecVar,[COLOR button_focus]$LOCALIZE[31604]:[/COLOR] ]</label>
++-					<font>font14</font>
++-					<shadowcolor>black</shadowcolor>
++-					<visible>!String.IsEmpty(VideoPlayer.AudioCodec)</visible>
++-				</control>
++-				<control type="label">
++-					<width>885</width>
++-					<height>50</height>
++-					<aligny>bottom</aligny>
++-					<label>$INFO[VideoPlayer.AudioChannels,[COLOR button_focus]$LOCALIZE[31605]:[/COLOR] ]</label>
++-					<font>font14</font>
++-					<shadowcolor>black</shadowcolor>
++-					<visible>!String.IsEmpty(VideoPlayer.AudioChannels)</visible>
++-				</control>
++-				<control type="label">
++-					<width>885</width>
++-					<height>50</height>
++-					<aligny>bottom</aligny>
++-					<label>$INFO[VideoPlayer.AudioBitrate,[COLOR button_focus]$LOCALIZE[31606]:[/COLOR] , kb/s]</label>
++-					<font>font14</font>
++-					<shadowcolor>black</shadowcolor>
++-					<visible>!String.IsEmpty(VideoPlayer.AudioBitrate)</visible>
++-				</control>
++-				<control type="label">
++-					<width>880</width>
++-					<height>38</height>
++-					<label>$INFO[VideoPlayer.AudioLanguage,[COLOR button_focus]$LOCALIZE[21447]:[/COLOR] ]</label>
++-					<font>font14</font>
++-					<shadowcolor>black</shadowcolor>
++-					<visible>!String.IsEmpty(VideoPlayer.AudioLanguage)</visible>
++-				</control>
++-			</control>
++-			<control type="grouplist">
++-				<left>985</left>
++-				<top>-4</top>
++-				<visible>String.IsEqual(Window(Home).Property(PlayerInfoDialogFocus),5552)</visible>
++-				<control type="label">
++-					<width>885</width>
++-					<height>50</height>
++-					<aligny>bottom</aligny>
++-					<label>$INFO[VideoPlayer.SubtitleCodec,[COLOR button_focus]$LOCALIZE[31614]:[/COLOR] ]</label>
++-					<font>font14</font>
++-					<shadowcolor>black</shadowcolor>
++-					<visible>VideoPlayer.HasSubtitles + VideoPlayer.SubtitlesEnabled + !String.IsEmpty(VideoPlayer.SubtitleCodec)</visible>
++-				</control>
++-				<control type="label">
++-					<width>885</width>
++-					<height>50</height>
++-					<aligny>bottom</aligny>
++-					<label>$INFO[VideoPlayer.SubtitlesLanguage,[COLOR button_focus]$LOCALIZE[31615]:[/COLOR] ]</label>
++-					<font>font14</font>
++-					<shadowcolor>black</shadowcolor>
++-					<visible>VideoPlayer.HasSubtitles + VideoPlayer.SubtitlesEnabled + !String.IsEmpty(VideoPlayer.SubtitlesLanguage)</visible>
++-				</control>
++-			</control>
++-			<control type="grouplist">
++-				<left>50</left>
++-				<top>-204</top>
++-				<visible>String.IsEqual(Window(Home).Property(PlayerInfoDialogFocus),5553)</visible>
++-				<control type="label">
++-					<width>885</width>
++-					<height>50</height>
++-					<aligny>bottom</aligny>
++-					<label>$INFO[Player.Process(videodecoder),[COLOR button_focus]$LOCALIZE[31139]:[/COLOR] ]$VAR[VideoHWDecoder, (,)]</label>
++-					<font>font14</font>
++-					<shadowcolor>black</shadowcolor>
++-					<visible>!String.IsEmpty(Player.Process(videodecoder))</visible>
++-				</control>
++-				<control type="label">
++-					<width>885</width>
++-					<height>50</height>
++-					<aligny>bottom</aligny>
++-					<label>$INFO[Player.Process(pixformat),[COLOR button_focus]$LOCALIZE[31140]:[/COLOR] ]</label>
++-					<font>font14</font>
++-					<shadowcolor>black</shadowcolor>
++-					<visible>!String.IsEmpty(Player.Process(pixformat))</visible>
++-				</control>
++-				<control type="label">
++-					<width>885</width>
++-					<height>50</height>
++-					<aligny>bottom</aligny>
++-					<label>$INFO[Player.Process(deintmethod),[COLOR button_focus]$LOCALIZE[16038]:[/COLOR] ]</label>
++-					<font>font14</font>
++-					<shadowcolor>black</shadowcolor>
++-					<visible>!String.IsEmpty(Player.Process(deintmethod))</visible>
++-				</control>
++-				<control type="label">
++-					<width>885</width>
++-					<height>50</height>
++-					<aligny>bottom</aligny>
++-					<label>$INFO[Player.Process(videowidth),[COLOR button_focus]$LOCALIZE[38031]:[/COLOR] ,x]$INFO[Player.Process(videoheight)]$INFO[Player.Process(videoscantype)]$INFO[Player.Process(videodar),$COMMA , AR]$INFO[Player.Process(videofps),$COMMA , FPS]</label>
++-					<font>font14</font>
++-					<shadowcolor>black</shadowcolor>
++-					<visible>!String.IsEmpty(Player.Process(videowidth))</visible>
++-				</control>
++-				<control type="label">
++-					<width>885</width>
++-					<height>50</height>
++-					<label>$INFO[Player.CacheLevel,[COLOR button_focus]$LOCALIZE[31598]:[/COLOR] ,%]</label>
++-					<font>font14</font>
++-					<shadowcolor>black</shadowcolor>
++-					<visible>!String.IsEmpty(Player.CacheLevel)</visible>
++-				</control>
++-			</control>
++-			<control type="grouplist">
++-				<left>985</left>
++-				<top>-204</top>
++-				<visible>String.IsEqual(Window(Home).Property(PlayerInfoDialogFocus),5553)</visible>
++-				<control type="label">
++-					<width>885</width>
++-					<height>50</height>
++-					<aligny>bottom</aligny>
++-					<label>$INFO[Player.Process(audiodecoder),[COLOR button_focus]$LOCALIZE[31599]:[/COLOR] ]</label>
++-					<font>font14</font>
++-					<shadowcolor>black</shadowcolor>
++-					<visible>!String.IsEmpty(Player.Process(audiodecoder))</visible>
++-				</control>
++-				<control type="label">
++-					<width>885</width>
++-					<height>50</height>
++-					<aligny>bottom</aligny>
++-					<label>$INFO[Player.Process(audiochannels),[COLOR button_focus]$LOCALIZE[31605]:[/COLOR] ]</label>
++-					<font>font14</font>
++-					<shadowcolor>black</shadowcolor>
++-					<visible>!String.IsEmpty(Player.Process(audiochannels))</visible>
++-				</control>
++-				<control type="label">
++-					<width>885</width>
++-					<height>50</height>
++-					<aligny>bottom</aligny>
++-					<label>$INFO[Player.Process(audiobitspersample),[COLOR button_focus]$LOCALIZE[460]:[/COLOR] , bits]$INFO[Player.Process(audiosamplerate),$COMMA , Hz]</label>
++-					<font>font14</font>
++-					<shadowcolor>black</shadowcolor>
++-					<visible>!String.IsEmpty(Player.Process(audiobitspersample))</visible>
++-				</control>
++-			</control>
++-			<control type="grouplist">
++-				<left>985</left>
++-				<top>-4</top>
++-				<visible>String.IsEqual(Window(Home).Property(PlayerInfoDialogFocus),5553)</visible>
++-				<control type="label">
++-					<width>885</width>
++-					<height>50</height>
++-					<aligny>bottom</aligny>
++-					<label>$INFO[Player.Process(subtitledecoder),[COLOR button_focus]$LOCALIZE[31613]:[/COLOR] ]</label>
++-					<font>font14</font>
++-					<shadowcolor>black</shadowcolor>
++-					<visible>VideoPlayer.HasSubtitles + VideoPlayer.SubtitlesEnabled + !String.IsEmpty(Player.Process(subtitledecoder))</visible>
++-				</control>
+++			<control type="image">
+++				<left>24</left>
+++				<top>736</top>
+++				<width>1792</width>
+++				<height>76</height>
+++				<texture colordiffuse="FF1E2428">colors/white.png</texture>
++ 			</control>
++ 			<control type="grouplist">
++-				<left>50</left>
++-				<top>-204</top>
++-				<visible>String.IsEqual(Window(Home).Property(PlayerInfoDialogFocus),5554)</visible>
++-				<control type="label">
++-					<width>1820</width>
++-					<height>50</height>
++-					<aligny>bottom</aligny>
++-					<label>$INFO[System.ScreenResolution,[COLOR button_focus]$LOCALIZE[31607]:[/COLOR] ]</label>
++-					<font>font14</font>
++-					<shadowcolor>black</shadowcolor>
++-					<visible>!String.IsEmpty(System.ScreenResolution)</visible>
++-				</control>
++-				<control type="label">
++-					<width>1820</width>
++-					<height>50</height>
++-					<aligny>bottom</aligny>
++-					<label>$INFO[System.FPS,[COLOR button_focus]$LOCALIZE[31608]:[/COLOR] , fps]</label>
++-					<font>font14</font>
++-					<shadowcolor>black</shadowcolor>
++-					<visible>!String.IsEmpty(System.FPS)</visible>
++-				</control>
++-				<control type="label">
++-					<width>1820</width>
++-					<height>50</height>
++-					<aligny>bottom</aligny>
++-					<label>$INFO[System.Memory(used.percent),[COLOR button_focus]$LOCALIZE[31030]:[/COLOR] ]</label>
++-					<font>font14</font>
++-					<shadowcolor>black</shadowcolor>
++-					<visible>System.SupportsCPUUsage</visible>
++-				</control>
++-				<control type="label">
++-					<width>1820</width>
++-					<height>50</height>
++-					<aligny>bottom</aligny>
++-					<label>$INFO[System.CpuUsage,[COLOR button_focus]$LOCALIZE[31609]:[/COLOR] ]</label>
++-					<font>font14</font>
++-					<shadowcolor>black</shadowcolor>
++-					<visible>System.SupportsCPUUsage</visible>
++-				</control>
++-				<control type="label">
++-					<width>1820</width>
++-					<height>50</height>
++-					<aligny>bottom</aligny>
++-					<label>$INFO[System.Memory(used.percent),[COLOR button_focus]$LOCALIZE[31030]:[/COLOR] ]</label>
++-					<font>font14</font>
++-					<shadowcolor>black</shadowcolor>
++-					<visible>!System.SupportsCPUUsage</visible>
++-				</control>
++-				<control type="label">
++-					<width>1820</width>
++-					<height>50</height>
++-					<label>$INFO[System.CPUTemperature,[COLOR button_focus]$LOCALIZE[22011][/COLOR] ]</label>
++-					<font>font14</font>
++-					<shadowcolor>black</shadowcolor>
++-					<visible>!String.IsEmpty(System.CPUTemperature)</visible>
++-				</control>
++-			</control>
++-			<control type="grouplist" id="5550">
++-				<right>20</right>
++-				<top>-310</top>
++-				<width>1000</width>
++-				<height>100</height>
++-				<align>right</align>
+++				<left>48</left>
+++				<top>744</top>
+++				<width>1760</width>
+++				<height>60</height>
++ 				<orientation>horizontal</orientation>
++-				<itemgap>-10</itemgap>
++-				<onup>Close</onup>
++-				<ondown>Close</ondown>
++-				<usecontrolcoords>true</usecontrolcoords>
++-				<control type="button" id="5551">
++-					<width>auto</width>
++-					<height>100</height>
++-					<textoffsetx>40</textoffsetx>
++-					<label>$LOCALIZE[31137]</label>
++-					<visible>VideoPlayer.Content(livetv)</visible>
++-					<onfocus>SetProperty(PlayerInfoDialogFocus,5551,Home)</onfocus>
++-				</control>
++-				<control type="button" id="5552">
++-					<width>auto</width>
++-					<height>100</height>
++-					<textoffsetx>40</textoffsetx>
++-					<label>$LOCALIZE[31610]</label>
++-					<onfocus>SetProperty(PlayerInfoDialogFocus,5552,Home)</onfocus>
++-				</control>
++-				<control type="button" id="5553">
++-					<width>auto</width>
++-					<height>100</height>
++-					<textoffsetx>40</textoffsetx>
++-					<label>$LOCALIZE[31138]</label>
++-					<onfocus>SetProperty(PlayerInfoDialogFocus,5553,Home)</onfocus>
++-				</control>
++-				<control type="button" id="5554">
++-					<width>auto</width>
++-					<height>100</height>
++-					<textoffsetx>40</textoffsetx>
++-					<label>$LOCALIZE[31611]</label>
++-					<onfocus>SetProperty(PlayerInfoDialogFocus,5554,Home)</onfocus>
++-				</control>
+++				<itemgap>0</itemgap>
+++				<include content="PlayerInfoMeter">
+++					<param name="label" value="Engine GPU"/>
+++					<param name="value" value="$INFO[Window(playerprocessinfo).Property(Info.RenderLoad),, %]"/>
+++					<param name="id" value="100"/>
+++					<param name="visible" value="!String.IsEmpty(Window(playerprocessinfo).Property(Info.RenderLoad))"/>
+++				</include>
+++				<include content="PlayerInfoMeter">
+++					<param name="label" value="CPU"/>
+++					<param name="value" value="$INFO[Window(playerprocessinfo).Property(Info.CPU)]"/>
+++					<param name="info" value="System.CPUUsage"/>
+++					<param name="visible" value="!String.IsEmpty(Window(playerprocessinfo).Property(Info.CPU))"/>
+++				</include>
+++				<include content="PlayerInfoMeter">
+++					<param name="label" value="Memory"/>
+++					<param name="value" value="$INFO[Window(playerprocessinfo).Property(Info.Memory)]"/>
+++					<param name="id" value="101"/>
+++				</include>
+++				<include content="PlayerInfoMeter">
+++					<param name="label" value="Player cache"/>
+++					<param name="value" value="$INFO[Player.CacheLevel,, %]"/>
+++					<param name="info" value="Player.CacheLevel"/>
+++				</include>
+++				<include content="PlayerInfoMeter">
+++					<param name="label" value="Drop / skip"/>
+++					<param name="value" value="$VAR[PlayerInfoDroppedSkipped]"/>
+++					<param name="bar" value="false"/>
+++					<param name="visible" value="Player.HasVideo"/>
+++				</include>
+++				<include content="PlayerInfoMeter">
+++					<param name="label" value="Temperature"/>
+++					<param name="value" value="$INFO[System.CPUTemperature]"/>
+++					<param name="bar" value="false"/>
+++					<param name="visible" value="!String.IsEmpty(System.CPUTemperature)"/>
+++				</include>
++ 			</control>
++ 		</control>
++ 	</controls>
++diff --git a/addons/skin.estuary/xml/Includes.xml b/addons/skin.estuary/xml/Includes.xml
++index d7c6bc881..1cbd44862 100644
++--- a/addons/skin.estuary/xml/Includes.xml
+++++ b/addons/skin.estuary/xml/Includes.xml
++@@ -8,6 +8,7 @@
++ 	<include file="Includes_Buttons.xml" />
++ 	<include file="Includes_DialogSelect.xml" />
++ 	<include file="Includes_InfoViewer.xml" />
+++	<include file="Includes_PlayerProcessInfo.xml" />
++ 	<include file="Includes_Maps.xml" />
++ 	<include file="Includes_MusicInfo.xml" />
++ 	<include file="Includes_PVR.xml" />
++diff --git a/addons/skin.estuary/xml/Includes_PlayerProcessInfo.xml b/addons/skin.estuary/xml/Includes_PlayerProcessInfo.xml
++new file mode 100644
++index 000000000..61d222fc7
++--- /dev/null
+++++ b/addons/skin.estuary/xml/Includes_PlayerProcessInfo.xml
++@@ -0,0 +1,530 @@
+++<?xml version="1.0" encoding="UTF-8"?>
+++<includes>
+++	<!-- Player information: Input (what the file carries), Processing (what is done with it)
+++	     and Output (what leaves the box). The video renderer's rows are window properties. -->
+++	<variable name="PlayerInfoSourceFormat">
+++		<value condition="String.IsEqual(VideoPlayer.HdrType,dolbyvision)">Dolby Vision</value>
+++		<value condition="String.IsEqual(VideoPlayer.HdrType,hdr10plus)">HDR10+</value>
+++		<value condition="String.IsEqual(VideoPlayer.HdrType,hdr10)">HDR10</value>
+++		<value condition="String.IsEqual(VideoPlayer.HdrType,hlg)">HLG</value>
+++		<value condition="Player.HasVideo">SDR</value>
+++		<value>$VAR[AudioCodecVar]</value>
+++	</variable>
+++	<variable name="PlayerInfoInputAudio">
+++		<value condition="Player.HasVideo + Integer.IsGreater(VideoPlayer.AudioStreamCount,0)">$VAR[AudioCodecVar]$VAR[AudioChannelsVar, · ]</value>
+++		<value condition="Player.HasVideo">No audio</value>
+++	</variable>
+++	<variable name="PlayerInfoProcessing">
+++		<value condition="!String.IsEmpty(Window(playerprocessinfo).Property(Info.Engine))">[COLOR button_focus]Dolby Vision engine[/COLOR]</value>
+++		<value condition="Player.HasVideo">Kodi playback</value>
+++		<value>Audio playback</value>
+++	</variable>
+++	<variable name="PlayerInfoProcessingDetail">
+++		<value condition="!String.IsEmpty(Window(playerprocessinfo).Property(Info.Engine))">$INFO[Window(playerprocessinfo).Property(Info.Engine)] · TV-led</value>
+++		<value condition="!String.IsEmpty(Window(playerprocessinfo).Property(Info.Signal))">The decoded picture on the video plane</value>
+++		<value>$INFO[Player.Process(videodecoder)]</value>
+++	</variable>
+++	<variable name="PlayerInfoOutput">
+++		<value condition="String.IsEqual(Window(playerprocessinfo).Property(Info.Signal),Dolby Vision)">Dolby Vision · TV-led</value>
+++		<value condition="!String.IsEmpty(Window(playerprocessinfo).Property(Info.Signal))">$INFO[Window(playerprocessinfo).Property(Info.Signal)]</value>
+++		<value condition="Player.HasVideo">$INFO[System.ScreenResolution]</value>
+++	</variable>
+++	<variable name="PlayerInfoOutputAudio">
+++		<value condition="Player.HasVideo + !Integer.IsGreater(VideoPlayer.AudioStreamCount,0)">No audio</value>
+++		<value condition="String.StartsWith(Player.Process(audiodecoder),pt-)">Passthrough$INFO[Player.Process(audiochannels), · ]</value>
+++		<value>PCM decoded$INFO[Player.Process(audiochannels), · ]</value>
+++	</variable>
+++	<variable name="PlayerInfoDroppedSkipped">
+++		<value condition="String.IsEqual(Window(playerprocessinfo).Property(Info.DroppedSkipped),0 / 0)">$INFO[Window(playerprocessinfo).Property(Info.DroppedSkipped)]</value>
+++		<value>[COLOR FFF2C46D]$INFO[Window(playerprocessinfo).Property(Info.DroppedSkipped)][/COLOR]</value>
+++	</variable>
+++
+++	<include name="PlayerInfoHeading">
+++		<param name="left"/>
+++		<param name="title"/>
+++		<param name="primary"/>
+++		<param name="secondary"/>
+++		<definition>
+++			<control type="group">
+++				<left>$PARAM[left]</left>
+++				<top>24</top>
+++				<width>560</width>
+++				<height>124</height>
+++				<control type="label">
+++					<height>50</height>
+++					<aligny>center</aligny>
+++					<font>font37</font>
+++					<textcolor>white</textcolor>
+++					<label>$PARAM[title]</label>
+++				</control>
+++				<control type="label">
+++					<top>52</top>
+++					<height>32</height>
+++					<font>font27</font>
+++					<textcolor>FFEEF2F3</textcolor>
+++					<label>$PARAM[primary]</label>
+++				</control>
+++				<control type="label">
+++					<top>84</top>
+++					<height>32</height>
+++					<font>font27</font>
+++					<textcolor>FF8C989E</textcolor>
+++					<label>$PARAM[secondary]</label>
+++				</control>
+++				<control type="image">
+++					<top>122</top>
+++					<height>2</height>
+++					<texture colordiffuse="FF2C3134">colors/white.png</texture>
+++				</control>
+++			</control>
+++		</definition>
+++	</include>
+++	<include name="PlayerInfoSection">
+++		<param name="label"/>
+++		<param name="visible" default="true"/>
+++		<definition>
+++			<control type="group">
+++				<height>40</height>
+++				<visible>$PARAM[visible]</visible>
+++				<control type="label">
+++					<top>12</top>
+++					<height>26</height>
+++					<aligny>center</aligny>
+++					<font>font_flag</font>
+++					<textcolor>FFA3AFB4</textcolor>
+++					<label>[UPPERCASE]$PARAM[label][/UPPERCASE]</label>
+++				</control>
+++			</control>
+++		</definition>
+++	</include>
+++	<include name="PlayerInfoRow">
+++		<param name="label"/>
+++		<param name="value"/>
+++		<param name="visible" default="true"/>
+++		<definition>
+++			<control type="group">
+++				<height>30</height>
+++				<visible>$PARAM[visible]</visible>
+++				<control type="label">
+++					<width>250</width>
+++					<height>30</height>
+++					<aligny>center</aligny>
+++					<font>font12</font>
+++					<textcolor>FF7D898F</textcolor>
+++					<label>$PARAM[label]</label>
+++				</control>
+++				<control type="label">
+++					<left>170</left>
+++					<width>390</width>
+++					<height>30</height>
+++					<align>right</align>
+++					<aligny>center</aligny>
+++					<font>font12</font>
+++					<textcolor>FFEEF2F3</textcolor>
+++					<label>$PARAM[value]</label>
+++				</control>
+++			</control>
+++		</definition>
+++	</include>
+++	<!-- A row of a renderer property, shown when it is set -->
+++	<include name="PlayerInfoPropertyRow">
+++		<param name="label"/>
+++		<param name="property"/>
+++		<param name="visible" default="true"/>
+++		<definition>
+++			<include content="PlayerInfoRow">
+++				<param name="label" value="$PARAM[label]"/>
+++				<param name="value" value="$INFO[Window(playerprocessinfo).Property($PARAM[property])]"/>
+++				<param name="visible" value="!String.IsEmpty(Window(playerprocessinfo).Property($PARAM[property])) + $PARAM[visible]"/>
+++			</include>
+++		</definition>
+++	</include>
+++	<!-- The Dolby Vision levels in the RPU: "L1 L2 L5", where "L1 " or a trailing "L1" is level 1,
+++	     never L10 or L11 -->
+++	<include name="PlayerInfoChip">
+++		<param name="level"/>
+++		<param name="width" default="44"/>
+++		<definition>
+++			<control type="group">
+++				<width>$PARAM[width]</width>
+++				<height>32</height>
+++				<visible>String.Contains(Window(playerprocessinfo).Property(Info.DV.Levels),"$PARAM[level] ") | String.EndsWith(Window(playerprocessinfo).Property(Info.DV.Levels),$PARAM[level])</visible>
+++				<control type="image">
+++					<texture colordiffuse="FF2E3539">colors/white.png</texture>
+++				</control>
+++				<control type="label">
+++					<align>center</align>
+++					<aligny>center</aligny>
+++					<font>font_flag</font>
+++					<textcolor>FFE6ECEE</textcolor>
+++					<label>$PARAM[level]</label>
+++				</control>
+++			</control>
+++		</definition>
+++	</include>
+++	<include name="PlayerInfoMeter">
+++		<param name="label"/>
+++		<param name="value"/>
+++		<param name="id" default=""/>
+++		<param name="info" default=""/>
+++		<param name="bar" default="true"/>
+++		<param name="visible" default="true"/>
+++		<definition>
+++			<control type="group">
+++				<width>292</width>
+++				<height>60</height>
+++				<visible>$PARAM[visible]</visible>
+++				<control type="label">
+++					<width>270</width>
+++					<height>22</height>
+++					<font>font_flag</font>
+++					<textcolor>FF7D8A90</textcolor>
+++					<label>[UPPERCASE]$PARAM[label][/UPPERCASE]</label>
+++				</control>
+++				<control type="label">
+++					<top>22</top>
+++					<width>270</width>
+++					<height>38</height>
+++					<aligny>center</aligny>
+++					<font>font30_title</font>
+++					<textcolor>white</textcolor>
+++					<label>$PARAM[value]</label>
+++				</control>
+++				<control type="progress" id="$PARAM[id]">
+++					<left>110</left>
+++					<top>40</top>
+++					<width>150</width>
+++					<height>4</height>
+++					<info>$PARAM[info]</info>
+++					<texturebg colordiffuse="FF353B3F">colors/white.png</texturebg>
+++					<lefttexture/>
+++					<midtexture colordiffuse="FFC6CED2">colors/white.png</midtexture>
+++					<righttexture/>
+++					<overlaytexture/>
+++					<visible>$PARAM[bar]</visible>
+++				</control>
+++			</control>
+++		</definition>
+++	</include>
+++
+++	<include name="PlayerInfoInput">
+++		<definition>
+++			<include content="PlayerInfoSection">
+++				<param name="label" value="Video"/>
+++				<param name="visible" value="Player.HasVideo"/>
+++			</include>
+++			<include content="PlayerInfoRow">
+++				<param name="label" value="Stream"/>
+++				<param name="value" value="$INFO[Window(playerprocessinfo).Property(Info.Size)]$INFO[Player.Process(videoscantype)]$INFO[Player.Process(videofps), / , fps]"/>
+++				<param name="visible" value="Player.HasVideo"/>
+++			</include>
+++			<include content="PlayerInfoRow">
+++				<param name="label" value="Codec / decoder"/>
+++				<param name="value" value="$VAR[VideoCodecVar]$INFO[Player.Process(videodecoder), / ]"/>
+++				<param name="visible" value="Player.HasVideo"/>
+++			</include>
+++			<include content="PlayerInfoPropertyRow">
+++				<param name="label" value="Pixel format"/>
+++				<param name="property" value="Info.PixelFormat"/>
+++			</include>
+++			<include content="PlayerInfoPropertyRow">
+++				<param name="label" value="Colour"/>
+++				<param name="property" value="Info.Colour"/>
+++			</include>
+++			<include content="PlayerInfoRow">
+++				<param name="label" value="Aspect ratio"/>
+++				<param name="value" value="$INFO[Player.Process(videodar)]"/>
+++				<param name="visible" value="Player.HasVideo"/>
+++			</include>
+++			<include content="PlayerInfoRow">
+++				<param name="label" value="Bitrate"/>
+++				<param name="value" value="$INFO[Player.Process(videolivebitrate)]"/>
+++				<param name="visible" value="Player.HasVideo + !String.IsEmpty(Player.Process(videolivebitrate))"/>
+++			</include>
+++
+++			<include content="PlayerInfoSection">
+++				<param name="label" value="Audio"/>
+++				<param name="visible" value="[!Player.HasVideo | Integer.IsGreater(VideoPlayer.AudioStreamCount,0)]"/>
+++			</include>
+++			<include content="PlayerInfoRow">
+++				<param name="label" value="Format"/>
+++				<param name="value" value="$VAR[AudioCodecVar]$INFO[Player.Process(audiochannels), · ]"/>
+++				<param name="visible" value="[!Player.HasVideo | Integer.IsGreater(VideoPlayer.AudioStreamCount,0)]"/>
+++			</include>
+++			<include content="PlayerInfoRow">
+++				<param name="label" value="Sample rate"/>
+++				<param name="value" value="$INFO[Player.Process(audiosamplerate),, Hz]$INFO[Player.Process(audiobitspersample), · , bit]"/>
+++				<param name="visible" value="Integer.IsGreater(Player.Process(audiosamplerate),0)"/>
+++			</include>
+++			<include content="PlayerInfoRow">
+++				<param name="label" value="Bitrate"/>
+++				<param name="value" value="$INFO[Player.Process(audiolivebitrate)]"/>
+++				<param name="visible" value="[!Player.HasVideo | Integer.IsGreater(VideoPlayer.AudioStreamCount,0)]"/>
+++			</include>
+++			<include content="PlayerInfoRow">
+++				<param name="label" value="Language"/>
+++				<param name="value" value="$INFO[VideoPlayer.AudioLanguage]"/>
+++				<param name="visible" value="Player.HasVideo + !String.IsEmpty(VideoPlayer.AudioLanguage)"/>
+++			</include>
+++
+++			<include content="PlayerInfoSection">
+++				<param name="label" value="Dolby Vision"/>
+++				<param name="visible" value="!String.IsEmpty(Window(playerprocessinfo).Property(Info.DV.Profile))"/>
+++			</include>
+++			<include content="PlayerInfoRow">
+++				<param name="label" value="Profile / level"/>
+++				<param name="value" value="$INFO[Window(playerprocessinfo).Property(Info.DV.Profile)]$INFO[Window(playerprocessinfo).Property(Info.DV.Level), / ]"/>
+++				<param name="visible" value="!String.IsEmpty(Window(playerprocessinfo).Property(Info.DV.Profile))"/>
+++			</include>
+++			<include content="PlayerInfoPropertyRow">
+++				<param name="label" value="Version"/>
+++				<param name="property" value="Info.DV.CM"/>
+++			</include>
+++			<include content="PlayerInfoPropertyRow">
+++				<param name="label" value="Layers"/>
+++				<param name="property" value="Info.DV.Layers"/>
+++			</include>
+++			<include content="PlayerInfoSection">
+++				<param name="label" value="RPU metadata"/>
+++				<param name="visible" value="!String.IsEmpty(Window(playerprocessinfo).Property(Info.DV.Levels))"/>
+++			</include>
+++			<control type="grouplist">
+++				<height>32</height>
+++				<orientation>horizontal</orientation>
+++				<itemgap>6</itemgap>
+++				<visible>!String.IsEmpty(Window(playerprocessinfo).Property(Info.DV.Levels))</visible>
+++				<include content="PlayerInfoChip"><param name="level" value="L1"/><param name="width" value="40"/></include>
+++				<include content="PlayerInfoChip"><param name="level" value="L2"/><param name="width" value="40"/></include>
+++				<include content="PlayerInfoChip"><param name="level" value="L3"/><param name="width" value="40"/></include>
+++				<include content="PlayerInfoChip"><param name="level" value="L4"/><param name="width" value="40"/></include>
+++				<include content="PlayerInfoChip"><param name="level" value="L5"/><param name="width" value="40"/></include>
+++				<include content="PlayerInfoChip"><param name="level" value="L6"/><param name="width" value="40"/></include>
+++				<include content="PlayerInfoChip"><param name="level" value="L8"/><param name="width" value="40"/></include>
+++				<include content="PlayerInfoChip"><param name="level" value="L9"/><param name="width" value="40"/></include>
+++				<include content="PlayerInfoChip"><param name="level" value="L10"/></include>
+++				<include content="PlayerInfoChip"><param name="level" value="L11"/></include>
+++				<include content="PlayerInfoChip"><param name="level" value="L254"/><param name="width" value="54"/></include>
+++				<include content="PlayerInfoChip"><param name="level" value="L255"/><param name="width" value="54"/></include>
+++			</control>
+++
+++			<include content="PlayerInfoSection">
+++				<param name="label" value="Live TV"/>
+++				<param name="visible" value="VideoPlayer.Content(LiveTV)"/>
+++			</include>
+++			<include content="PlayerInfoRow">
+++				<param name="label" value="$LOCALIZE[19099]"/>
+++				<param name="value" value="$INFO[PVR.ActStreamServiceName]"/>
+++				<param name="visible" value="VideoPlayer.Content(LiveTV) + !String.IsEmpty(PVR.ActStreamServiceName)"/>
+++			</include>
+++			<include content="PlayerInfoRow">
+++				<param name="label" value="$LOCALIZE[19012]"/>
+++				<param name="value" value="$INFO[PVR.ActStreamClient]"/>
+++				<param name="visible" value="VideoPlayer.Content(LiveTV) + !String.IsEmpty(PVR.ActStreamClient)"/>
+++			</include>
+++			<include content="PlayerInfoRow">
+++				<param name="label" value="$LOCALIZE[19008] / $LOCALIZE[19009]"/>
+++				<param name="value" value="$INFO[PVR.ActStreamSignal]$INFO[PVR.ActStreamSNR, / ]"/>
+++				<param name="visible" value="VideoPlayer.Content(LiveTV) + !String.IsEmpty(PVR.ActStreamSignal)"/>
+++			</include>
+++		</definition>
+++	</include>
+++
+++	<include name="PlayerInfoProcessingRows">
+++		<definition>
+++			<include content="PlayerInfoSection">
+++				<param name="label" value="Rendering"/>
+++				<param name="visible" value="Player.HasVideo"/>
+++			</include>
+++			<include content="PlayerInfoRow">
+++				<param name="label" value="Dolby Vision engine"/>
+++				<param name="value" value="Not active"/>
+++				<param name="visible" value="Player.HasVideo + String.IsEmpty(Window(playerprocessinfo).Property(Info.Engine))"/>
+++			</include>
+++			<include content="PlayerInfoRow">
+++				<param name="label" value="Decoded surface"/>
+++				<param name="value" value="$INFO[Player.Process(pixformat)]"/>
+++				<param name="visible" value="Player.HasVideo + !String.IsEmpty(Player.Process(pixformat)) + String.IsEmpty(Window(playerprocessinfo).Property(Info.Engine))"/>
+++			</include>
+++			<include content="PlayerInfoRow">
+++				<param name="label" value="Deinterlacing"/>
+++				<param name="value" value="$INFO[Player.Process(deintmethod)]"/>
+++				<param name="visible" value="String.IsEqual(Player.Process(videoscantype),i) + !String.IsEmpty(Player.Process(deintmethod))"/>
+++			</include>
+++			<include content="PlayerInfoPropertyRow">
+++				<param name="label" value="Reconstruction"/>
+++				<param name="property" value="Info.Reconstruction"/>
+++			</include>
+++			<include content="PlayerInfoPropertyRow">
+++				<param name="label" value="Chroma mapping"/>
+++				<param name="property" value="Info.ChromaMapping"/>
+++			</include>
+++			<include content="PlayerInfoPropertyRow">
+++				<param name="label" value="Filters"/>
+++				<param name="property" value="Info.Filters"/>
+++			</include>
+++			<include content="PlayerInfoPropertyRow">
+++				<param name="label" value="GPU per picture"/>
+++				<param name="property" value="Info.GPU"/>
+++			</include>
+++
+++			<include content="PlayerInfoSection">
+++				<param name="label" value="Source metadata"/>
+++				<param name="visible" value="!String.IsEmpty(Window(playerprocessinfo).Property(Info.Mastering)) | !String.IsEmpty(Window(playerprocessinfo).Property(Info.LightLevel)) | !String.IsEmpty(Window(playerprocessinfo).Property(Info.DV.Levels))"/>
+++			</include>
+++			<include content="PlayerInfoPropertyRow">
+++				<param name="label" value="Mastering max / min"/>
+++				<param name="property" value="Info.Mastering"/>
+++			</include>
+++			<include content="PlayerInfoPropertyRow">
+++				<param name="label" value="MaxCLL / MaxFALL"/>
+++				<param name="property" value="Info.LightLevel"/>
+++			</include>
+++			<include content="PlayerInfoPropertyRow">
+++				<param name="label" value="L1 min / max / avg"/>
+++				<param name="property" value="Info.DV.L1"/>
+++			</include>
+++			<include content="PlayerInfoPropertyRow">
+++				<param name="label" value="L2 trim targets"/>
+++				<param name="property" value="Info.DV.L2"/>
+++			</include>
+++			<include content="PlayerInfoPropertyRow">
+++				<param name="label" value="L3 offsets"/>
+++				<param name="property" value="Info.DV.L3"/>
+++			</include>
+++			<include content="PlayerInfoPropertyRow">
+++				<param name="label" value="L4 anchor / power"/>
+++				<param name="property" value="Info.DV.L4"/>
+++			</include>
+++			<include content="PlayerInfoPropertyRow">
+++				<param name="label" value="L5 L / R / T / B"/>
+++				<param name="property" value="Info.DV.L5"/>
+++			</include>
+++			<include content="PlayerInfoPropertyRow">
+++				<param name="label" value="L6 max / min"/>
+++				<param name="property" value="Info.DV.L6"/>
+++			</include>
+++			<include content="PlayerInfoPropertyRow">
+++				<param name="label" value="L6 MaxCLL / MaxFALL"/>
+++				<param name="property" value="Info.DV.L6Light"/>
+++			</include>
+++			<include content="PlayerInfoPropertyRow">
+++				<param name="label" value="L8 trim targets"/>
+++				<param name="property" value="Info.DV.L8"/>
+++			</include>
+++			<include content="PlayerInfoPropertyRow">
+++				<param name="label" value="L9 source primaries"/>
+++				<param name="property" value="Info.DV.L9"/>
+++			</include>
+++			<include content="PlayerInfoPropertyRow">
+++				<param name="label" value="L10 target displays"/>
+++				<param name="property" value="Info.DV.L10"/>
+++			</include>
+++			<include content="PlayerInfoPropertyRow">
+++				<param name="label" value="L11 content"/>
+++				<param name="property" value="Info.DV.L11"/>
+++			</include>
+++			<include content="PlayerInfoPropertyRow">
+++				<param name="label" value="L254 mode / version"/>
+++				<param name="property" value="Info.DV.L254"/>
+++			</include>
+++			<include content="PlayerInfoPropertyRow">
+++				<param name="label" value="L255 mode / version"/>
+++				<param name="property" value="Info.DV.L255"/>
+++			</include>
+++
+++			<include content="PlayerInfoSection">
+++				<param name="label" value="HDR10+"/>
+++				<param name="visible" value="!String.IsEmpty(Window(playerprocessinfo).Property(Info.HDR10Plus.Target)) + String.IsEmpty(Window(playerprocessinfo).Property(Info.Engine))"/>
+++			</include>
+++			<include content="PlayerInfoPropertyRow">
+++				<param name="label" value="Target display"/>
+++				<param name="property" value="Info.HDR10Plus.Target"/>
+++				<param name="visible" value="String.IsEmpty(Window(playerprocessinfo).Property(Info.Engine))"/>
+++			</include>
+++			<include content="PlayerInfoPropertyRow">
+++				<param name="label" value="MaxSCL R / G / B"/>
+++				<param name="property" value="Info.HDR10Plus.MaxSCL"/>
+++				<param name="visible" value="String.IsEmpty(Window(playerprocessinfo).Property(Info.Engine))"/>
+++			</include>
+++			<include content="PlayerInfoPropertyRow">
+++				<param name="label" value="Average MaxRGB"/>
+++				<param name="property" value="Info.HDR10Plus.Average"/>
+++				<param name="visible" value="String.IsEmpty(Window(playerprocessinfo).Property(Info.Engine))"/>
+++			</include>
+++			<include content="PlayerInfoPropertyRow">
+++				<param name="label" value="Bezier curve"/>
+++				<param name="property" value="Info.HDR10Plus.Curve"/>
+++				<param name="visible" value="String.IsEmpty(Window(playerprocessinfo).Property(Info.Engine))"/>
+++			</include>
+++		</definition>
+++	</include>
+++
+++	<include name="PlayerInfoOutputRows">
+++		<definition>
+++			<include content="PlayerInfoSection">
+++				<param name="label" value="Video"/>
+++				<param name="visible" value="Player.HasVideo"/>
+++			</include>
+++			<include content="PlayerInfoRow">
+++				<param name="label" value="Display output"/>
+++				<param name="value" value="$INFO[Window(playerprocessinfo).Property(Info.Display)]"/>
+++				<param name="visible" value="!String.IsEmpty(Window(playerprocessinfo).Property(Info.Display))"/>
+++			</include>
+++			<include content="PlayerInfoRow">
+++				<param name="label" value="Display output"/>
+++				<param name="value" value="$INFO[System.ScreenResolution]"/>
+++				<param name="visible" value="Player.HasVideo + String.IsEmpty(Window(playerprocessinfo).Property(Info.Display))"/>
+++			</include>
+++			<include content="PlayerInfoPropertyRow">
+++				<param name="label" value="Refresh"/>
+++				<param name="property" value="Info.Refresh"/>
+++			</include>
+++			<include content="PlayerInfoPropertyRow">
+++				<param name="label" value="Signal"/>
+++				<param name="property" value="Info.Signal"/>
+++			</include>
+++			<include content="PlayerInfoPropertyRow">
+++				<param name="label" value="Link"/>
+++				<param name="property" value="Info.Link"/>
+++			</include>
+++			<include content="PlayerInfoPropertyRow">
+++				<param name="label" value="Infoframe"/>
+++				<param name="property" value="Info.Infoframe"/>
+++			</include>
+++			<include content="PlayerInfoRow">
+++				<param name="label" value="Subtitles"/>
+++				<param name="value" value="$VAR[SubtitleCodecVar]$INFO[VideoPlayer.SubtitlesLanguage, · ]"/>
+++				<param name="visible" value="VideoPlayer.SubtitlesEnabled + VideoPlayer.HasSubtitles"/>
+++			</include>
+++
+++			<include content="PlayerInfoSection">
+++				<param name="label" value="Audio"/>
+++				<param name="visible" value="[!Player.HasVideo | Integer.IsGreater(VideoPlayer.AudioStreamCount,0)]"/>
+++			</include>
+++			<include content="PlayerInfoRow">
+++				<param name="label" value="Transport"/>
+++				<param name="value" value="$VAR[PlayerInfoOutputAudio]"/>
+++				<param name="visible" value="[!Player.HasVideo | Integer.IsGreater(VideoPlayer.AudioStreamCount,0)]"/>
+++			</include>
+++			<include content="PlayerInfoRow">
+++				<param name="label" value="Decoder"/>
+++				<param name="value" value="$INFO[Player.Process(audiodecoder)]"/>
+++				<param name="visible" value="[!Player.HasVideo | Integer.IsGreater(VideoPlayer.AudioStreamCount,0)]"/>
+++			</include>
+++
+++			<include content="PlayerInfoSection">
+++				<param name="label" value="Buffers"/>
+++			</include>
+++			<include content="PlayerInfoRow">
+++				<param name="label" value="Video queue / data"/>
+++				<param name="value" value="$INFO[Player.Process(videoqueuelevel),, %]$INFO[Player.Process(videoqueuedatalevel), / , %]"/>
+++				<param name="visible" value="Player.HasVideo"/>
+++			</include>
+++			<include content="PlayerInfoRow">
+++				<param name="label" value="Audio queue / data"/>
+++				<param name="value" value="$INFO[Player.Process(audioqueuelevel),, %]$INFO[Player.Process(audioqueuedatalevel), / , %]"/>
+++				<param name="visible" value="[!Player.HasVideo | Integer.IsGreater(VideoPlayer.AudioStreamCount,0)]"/>
+++			</include>
+++		</definition>
+++	</include>
+++</includes>
++diff --git a/xbmc/cores/DataCacheCore.cpp b/xbmc/cores/DataCacheCore.cpp
++index fa1d77602..853f21648 100644
++--- a/xbmc/cores/DataCacheCore.cpp
+++++ b/xbmc/cores/DataCacheCore.cpp
++@@ -209,6 +209,52 @@ int CDataCacheCore::GetVideoQueueDataLevel()
++   return m_playerVideoInfo.queueDataLevel;
++ }
++ 
+++void CDataCacheCore::SetVideoDropSkip(int dropped, int skipped)
+++{
+++  std::unique_lock lock(m_videoPlayerSection);
+++
+++  m_playerVideoInfo.dropped = dropped;
+++  m_playerVideoInfo.skipped = skipped;
+++}
+++
+++int CDataCacheCore::GetVideoDropped()
+++{
+++  std::unique_lock lock(m_videoPlayerSection);
+++
+++  return m_playerVideoInfo.dropped;
+++}
+++
+++int CDataCacheCore::GetVideoSkipped()
+++{
+++  std::unique_lock lock(m_videoPlayerSection);
+++
+++  return m_playerVideoInfo.skipped;
+++}
+++
+++void CDataCacheCore::SetPlayerInfoShown(bool shown)
+++{
+++  m_playerInfoShown = shown;
+++}
+++
+++bool CDataCacheCore::IsPlayerInfoShown() const
+++{
+++  return m_playerInfoShown;
+++}
+++
+++void CDataCacheCore::SetVideoPlayerInfo(std::map<std::string, std::string, std::less<>> info)
+++{
+++  std::unique_lock lock(m_videoPlayerSection);
+++
+++  m_playerVideoInfo.playerInfo = std::move(info);
+++}
+++
+++std::map<std::string, std::string, std::less<>> CDataCacheCore::GetVideoPlayerInfo()
+++{
+++  std::unique_lock lock(m_videoPlayerSection);
+++
+++  return m_playerVideoInfo.playerInfo;
+++}
+++
++ void CDataCacheCore::SetVideoFps(float fps)
++ {
++   std::unique_lock lock(m_videoPlayerSection);
++diff --git a/xbmc/cores/DataCacheCore.h b/xbmc/cores/DataCacheCore.h
++index 7dff9cd87..f5ffd7966 100644
++--- a/xbmc/cores/DataCacheCore.h
+++++ b/xbmc/cores/DataCacheCore.h
++@@ -13,6 +13,7 @@
++ 
++ #include <atomic>
++ #include <chrono>
+++#include <map>
++ #include <string>
++ #include <vector>
++ 
++@@ -52,6 +53,22 @@ public:
++   int GetVideoQueueLevel();
++   void SetVideoQueueDataLevel(int level);
++   int GetVideoQueueDataLevel();
+++  void SetVideoDropSkip(int dropped, int skipped);
+++  int GetVideoDropped();
+++  int GetVideoSkipped();
+++
+++  /*!
+++   * @brief Whether Player information is shown: the video renderer then describes what it
+++   * renders, and how, with SetVideoPlayerInfo
+++   */
+++  void SetPlayerInfoShown(bool shown);
+++  bool IsPlayerInfoShown() const;
+++  /*!
+++   * @brief The renderer's description of the picture shown, its rendering and its output, as
+++   * Player information's window properties and their values
+++   */
+++  void SetVideoPlayerInfo(std::map<std::string, std::string, std::less<>> info);
+++  std::map<std::string, std::string, std::less<>> GetVideoPlayerInfo();
++ 
++   /*!
++    * @brief Set if the video is interlaced in cache.
++@@ -243,7 +260,11 @@ protected:
++     int liveBitRate;
++     int queueLevel;
++     int queueDataLevel;
+++    int dropped;
+++    int skipped;
+++    std::map<std::string, std::string, std::less<>> playerInfo;
++   } m_playerVideoInfo;
+++  std::atomic_bool m_playerInfoShown = false;
++ 
++   CCriticalSection m_audioPlayerSection;
++   struct SPlayerAudioInfo
++diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.cpp
++index 1e18f997b..139594cd8 100644
++--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.cpp
+++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.cpp
++@@ -58,6 +58,8 @@ void VideoPicture::Reset()
++ 
++   hdrType = StreamHdrType::HDR_TYPE_NONE;
++   doviProfile = 0;
+++  doviLevel = 0;
+++  doviCompatibility = 0;
++   doviRpu.reset();
++ 
++   hasDisplayMetadata = false;
++diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.h b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.h
++index fbd69482f..63fb5691b 100644
++--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.h
+++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.h
++@@ -86,6 +86,8 @@ public:
++   StreamHdrType hdrTypeAlt;
++   std::string strDVELType;
++   int doviProfile = 0; //!< the Dolby Vision profile (the stream's configuration record), 0 if none
+++  int doviLevel = 0; //!< the Dolby Vision level (the configuration record)
+++  int doviCompatibility = 0; //!< the base layer's compatibility ID (the configuration record)
++   std::shared_ptr<const DoviRpu> doviRpu;
++ 
++   bool hasDisplayMetadata = false;
++diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.cpp
++index fe9e278c4..1a4bd991c 100644
++--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.cpp
+++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.cpp
++@@ -712,6 +712,9 @@ bool CDVDVideoCodecDRMPRIME::SetPictureParams(VideoPicture* pVideoPicture, AVFra
++   pVideoPicture->hdrTypeAlt = StreamHdrType::HDR_TYPE_NONE;
++   pVideoPicture->doviProfile =
++       m_hints.hdrType == StreamHdrType::HDR_TYPE_DOLBYVISION ? m_hints.dovi.dv_profile : 0;
+++  pVideoPicture->doviLevel = pVideoPicture->doviProfile ? m_hints.dovi.dv_level : 0;
+++  pVideoPicture->doviCompatibility =
+++      pVideoPicture->doviProfile ? m_hints.dovi.dv_bl_signal_compatibility_id : 0;
++ 
++   if (pVideoPicture->hdrType == StreamHdrType::HDR_TYPE_HDR10 ||
++       pVideoPicture->hdrType == StreamHdrType::HDR_TYPE_DOLBYVISION)
++diff --git a/xbmc/cores/VideoPlayer/VideoPlayerVideo.cpp b/xbmc/cores/VideoPlayer/VideoPlayerVideo.cpp
++index 105755f60..daf76cbb1 100644
++--- a/xbmc/cores/VideoPlayer/VideoPlayerVideo.cpp
+++++ b/xbmc/cores/VideoPlayer/VideoPlayerVideo.cpp
++@@ -13,6 +13,7 @@
++ #include "DVDCodecs/Overlay/DVDOverlay.h"
++ #include "DVDCodecs/Video/DVDVideoCodecFFmpeg.h"
++ #include "ServiceBroker.h"
+++#include "cores/DataCacheCore.h"
++ #include "cores/VideoPlayer/Interface/DemuxPacket.h"
++ #include "cores/VideoPlayer/Interface/TimingConstants.h"
++ #include "settings/AdvancedSettings.h"
++@@ -673,6 +674,8 @@ void CVideoPlayerVideo::UpdatePlayerInfo()
++   m_processInfo.SetVideoLiveBitRate(GetVideoBitrate());
++   m_processInfo.SetVideoQueueLevel(std::min(99, m_messageQueue.GetLevel()));
++   m_processInfo.SetVideoQueueDataLevel(std::min(99, m_messageQueue.GetLevel(true)));
+++  CServiceBroker::GetDataCacheCore().SetVideoDropSkip(m_iDroppedFrames,
+++                                                      m_renderManager.GetSkippedFrames());
++ }
++ 
++ bool CVideoPlayerVideo::ProcessDecoderOutput(double &frametime, double &pts)
++diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/CMakeLists.txt b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/CMakeLists.txt
++index 87bb92512..db8d98ef9 100644
++--- a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/CMakeLists.txt
+++++ b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/CMakeLists.txt
++@@ -50,9 +50,11 @@ endif()
++ 
++ if("gbm" IN_LIST CORE_PLATFORM_NAME_LC OR "wayland" IN_LIST CORE_PLATFORM_NAME_LC)
++   if("gbm" IN_LIST CORE_PLATFORM_NAME_LC AND TARGET ${APP_NAME_LC}::OpenGLES)
++-    list(APPEND SOURCES RendererDRMPRIME.cpp
+++    list(APPEND SOURCES DRMPRIMEPlayerInfo.cpp
+++                        RendererDRMPRIME.cpp
++                         VideoLayerBridgeDRMPRIME.cpp)
++-    list(APPEND HEADERS RendererDRMPRIME.h
+++    list(APPEND HEADERS DRMPRIMEPlayerInfo.h
+++                        RendererDRMPRIME.h
++                         VideoLayerBridgeDRMPRIME.h)
++ 
++     if(TARGET ${APP_NAME_LC}::PiDV)
++diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DRMPRIMEPlayerInfo.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DRMPRIMEPlayerInfo.cpp
++new file mode 100644
++index 000000000..f36e368d6
++--- /dev/null
+++++ b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DRMPRIMEPlayerInfo.cpp
++@@ -0,0 +1,324 @@
+++/*
+++ *  Copyright (C) 2026 Team Kodi
+++ *  This file is part of Kodi - https://kodi.tv
+++ *
+++ *  SPDX-License-Identifier: GPL-2.0-or-later
+++ *  See LICENSES/README.md for more information.
+++ */
+++
+++#include "DRMPRIMEPlayerInfo.h"
+++
+++#include "ServiceBroker.h"
+++#include "cores/DataCacheCore.h"
+++#include "cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.h"
+++#include "utils/StringUtils.h"
+++
+++#include <algorithm>
+++#include <cmath>
+++#include <vector>
+++
+++extern "C"
+++{
+++#include <libavutil/dovi_meta.h>
+++#include <libavutil/frame.h>
+++#include <libavutil/hdr_dynamic_metadata.h>
+++#include <libavutil/hwcontext_drm.h>
+++#include <libavutil/pixdesc.h>
+++}
+++
+++#include <drm_fourcc.h>
+++
+++namespace
+++{
+++// a 12-bit PQ code value, as the RPU's levels carry them
+++double PQToNits(unsigned int code)
+++{
+++  constexpr double m1 = 2610.0 / 16384.0;
+++  constexpr double m2 = 2523.0 / 4096.0 * 128.0;
+++  constexpr double c1 = 3424.0 / 4096.0;
+++  constexpr double c2 = 2413.0 / 4096.0 * 32.0;
+++  constexpr double c3 = 2392.0 / 4096.0 * 32.0;
+++  const double e = std::pow(std::min(code, 4095u) / 4095.0, 1.0 / m2);
+++  return 10000.0 * std::pow(std::max(e - c1, 0.0) / (c2 - c3 * e), 1.0 / m1);
+++}
+++
+++std::string Join(const std::vector<std::string>& values, const char* separator)
+++{
+++  return StringUtils::Join(values, separator);
+++}
+++
+++// three significant digits, the precision of a 12-bit PQ code
+++std::string Nits(double nits)
+++{
+++  if (nits >= 100)
+++    return StringUtils::Format("{:.0f}", nits);
+++  if (nits >= 10)
+++    return StringUtils::Format("{:.1f}", nits);
+++  if (nits >= 1)
+++    return StringUtils::Format("{:.2f}", nits);
+++  return StringUtils::Format("{:.4f}", nits);
+++}
+++
+++const char* DrmChroma(uint32_t format)
+++{
+++  switch (format)
+++  {
+++    case DRM_FORMAT_NV12:
+++    case DRM_FORMAT_NV21:
+++    case DRM_FORMAT_NV15:
+++    case DRM_FORMAT_P010:
+++    case DRM_FORMAT_P030:
+++    case DRM_FORMAT_YUV420:
+++      return "4:2:0";
+++    case DRM_FORMAT_NV16:
+++    case DRM_FORMAT_NV20:
+++    case DRM_FORMAT_P210:
+++    case DRM_FORMAT_YUV422:
+++      return "4:2:2";
+++    case DRM_FORMAT_NV24:
+++    case DRM_FORMAT_YUV444:
+++      return "4:4:4";
+++    default:
+++      return nullptr;
+++  }
+++}
+++
+++std::string PixelFormat(const VideoPicture& picture, const AVFrame* frame)
+++{
+++  const char* chroma = nullptr;
+++  if (frame && frame->format == AV_PIX_FMT_DRM_PRIME && frame->data[0])
+++  {
+++    const auto* descriptor = reinterpret_cast<const AVDRMFrameDescriptor*>(frame->data[0]);
+++    if (descriptor->nb_layers > 0)
+++      chroma = DrmChroma(descriptor->layers[0].format);
+++  }
+++  else
+++  {
+++    // a picture copied out of a software decoder: the decoder's format
+++    const AVPixelFormat format =
+++        frame ? static_cast<AVPixelFormat>(frame->format)
+++              : av_get_pix_fmt(CServiceBroker::GetDataCacheCore().GetVideoPixelFormat().c_str());
+++    const AVPixFmtDescriptor* desc = av_pix_fmt_desc_get(format);
+++    if (desc && !(desc->flags & (AV_PIX_FMT_FLAG_HWACCEL | AV_PIX_FMT_FLAG_RGB)))
+++      chroma = desc->log2_chroma_w == 0 ? "4:4:4" : desc->log2_chroma_h ? "4:2:0" : "4:2:2";
+++  }
+++
+++  if (!chroma)
+++    return StringUtils::Format("{}-bit", picture.colorBits);
+++  return StringUtils::Format("YUV {} · {}-bit", chroma, picture.colorBits);
+++}
+++
+++std::string ColourName(const VideoPicture& picture)
+++{
+++  std::vector<std::string> parts;
+++  switch (picture.color_primaries)
+++  {
+++    case AVCOL_PRI_BT2020:
+++      parts.emplace_back("BT.2020");
+++      break;
+++    case AVCOL_PRI_BT709:
+++      parts.emplace_back("BT.709");
+++      break;
+++    case AVCOL_PRI_SMPTE432:
+++      parts.emplace_back("P3-D65");
+++      break;
+++    case AVCOL_PRI_BT470BG:
+++    case AVCOL_PRI_SMPTE170M:
+++      parts.emplace_back("BT.601");
+++      break;
+++    default:
+++      break;
+++  }
+++  switch (picture.color_transfer)
+++  {
+++    case AVCOL_TRC_SMPTE2084:
+++      parts.emplace_back("PQ");
+++      break;
+++    case AVCOL_TRC_ARIB_STD_B67:
+++      parts.emplace_back("HLG");
+++      break;
+++    case AVCOL_TRC_BT709:
+++    case AVCOL_TRC_BT2020_10:
+++    case AVCOL_TRC_BT2020_12:
+++    case AVCOL_TRC_SMPTE170M:
+++      parts.emplace_back("SDR gamma");
+++      break;
+++    default:
+++      break;
+++  }
+++  if (parts.empty())
+++    parts.emplace_back("Untagged");
+++  parts.emplace_back(picture.color_range ? "Full" : "Limited");
+++  return Join(parts, " · ");
+++}
+++
+++void DescribeStatic(const VideoPicture& picture, DRMPRIME::PlayerInfo& info)
+++{
+++  if (picture.hasDisplayMetadata && picture.displayMetadata.has_luminance)
+++    info["Info.Mastering"] =
+++        StringUtils::Format("{} / {} nits", Nits(av_q2d(picture.displayMetadata.max_luminance)),
+++                            Nits(av_q2d(picture.displayMetadata.min_luminance)));
+++  if (picture.hasLightMetadata)
+++    info["Info.LightLevel"] = StringUtils::Format("{} / {} nits", picture.lightMetadata.MaxCLL,
+++                                                  picture.lightMetadata.MaxFALL);
+++}
+++
+++void DescribeHDR10Plus(const AVFrame* frame, DRMPRIME::PlayerInfo& info)
+++{
+++  const AVFrameSideData* sd = av_frame_get_side_data(frame, AV_FRAME_DATA_DYNAMIC_HDR_PLUS);
+++  if (!sd)
+++    return;
+++
+++  const auto* hdr = reinterpret_cast<const AVDynamicHDRPlus*>(sd->data);
+++  info["Info.HDR10Plus.Target"] =
+++      Nits(av_q2d(hdr->targeted_system_display_maximum_luminance)) + " nits";
+++  if (hdr->num_windows < 1)
+++    return;
+++
+++  // MaxSCL and the average MaxRGB are fractions of 10000 nits
+++  const AVHDRPlusColorTransformParams& params = hdr->params[0];
+++  info["Info.HDR10Plus.MaxSCL"] =
+++      StringUtils::Format("{:.0f} / {:.0f} / {:.0f} nits", 10000 * av_q2d(params.maxscl[0]),
+++                          10000 * av_q2d(params.maxscl[1]), 10000 * av_q2d(params.maxscl[2]));
+++  info["Info.HDR10Plus.Average"] = Nits(10000 * av_q2d(params.average_maxrgb)) + " nits";
+++  if (params.tone_mapping_flag)
+++    info["Info.HDR10Plus.Curve"] =
+++        StringUtils::Format("knee {:.3f}, {:.3f} · {} anchors", av_q2d(params.knee_point_x),
+++                            av_q2d(params.knee_point_y), params.num_bezier_curve_anchors);
+++}
+++
+++const char* BaseLayerName(const VideoPicture& picture)
+++{
+++  if (picture.doviProfile == 5)
+++    return "IPT-PQc2 BL";
+++  if (picture.doviProfile == 8 && picture.doviCompatibility == 2)
+++    return "SDR BL";
+++  if (picture.doviProfile == 8 && picture.doviCompatibility == 4)
+++    return "HLG BL";
+++  return "HDR10 BL";
+++}
+++
+++void DescribeLevels(const AVDOVIMetadata* metadata, DRMPRIME::PlayerInfo& info)
+++{
+++  std::vector<std::string> levels;
+++  std::vector<std::string> l2;
+++  std::vector<std::string> l8;
+++  std::vector<std::string> l10;
+++  for (int i = 0; i < metadata->num_ext_blocks; i++)
+++  {
+++    const AVDOVIDmData* block = av_dovi_get_ext(metadata, i);
+++    const std::string level = StringUtils::Format("L{}", block->level);
+++    if (std::ranges::find(levels, level) == levels.end())
+++      levels.push_back(level);
+++
+++    switch (block->level)
+++    {
+++      case 1:
+++        info["Info.DV.L1"] =
+++            StringUtils::Format("{} / {} / {} nits", Nits(PQToNits(block->l1.min_pq)),
+++                                Nits(PQToNits(block->l1.max_pq)), Nits(PQToNits(block->l1.avg_pq)));
+++        break;
+++      case 2:
+++        l2.push_back(StringUtils::Format("{:.0f}", PQToNits(block->l2.target_max_pq)));
+++        break;
+++      case 3:
+++        info["Info.DV.L3"] =
+++            StringUtils::Format("{} / {} / {}", block->l3.min_pq_offset - 2048,
+++                                block->l3.max_pq_offset - 2048, block->l3.avg_pq_offset - 2048);
+++        break;
+++      case 4:
+++        info["Info.DV.L4"] =
+++            StringUtils::Format("{} / {}", block->l4.anchor_pq, block->l4.anchor_power);
+++        break;
+++      case 5:
+++        info["Info.DV.L5"] =
+++            StringUtils::Format("{} / {} / {} / {}", block->l5.left_offset, block->l5.right_offset,
+++                                block->l5.top_offset, block->l5.bottom_offset);
+++        break;
+++      case 6:
+++        // the minimum is in 0.0001 nits
+++        info["Info.DV.L6"] = StringUtils::Format("{} / {} nits", block->l6.max_luminance,
+++                                                 Nits(block->l6.min_luminance / 10000.0));
+++        info["Info.DV.L6Light"] =
+++            StringUtils::Format("{} / {} nits", block->l6.max_cll, block->l6.max_fall);
+++        break;
+++      case 8:
+++        l8.push_back(std::to_string(block->l8.target_display_index));
+++        break;
+++      case 9:
+++        if (block->l9.source_primary_index == 0)
+++          info["Info.DV.L9"] = "DCI-P3 D65";
+++        else if (block->l9.source_primary_index == 2)
+++          info["Info.DV.L9"] = "BT.2020";
+++        else
+++          info["Info.DV.L9"] = StringUtils::Format("index {}", block->l9.source_primary_index);
+++        break;
+++      case 10:
+++        l10.push_back(StringUtils::Format("{}: {:.0f}", block->l10.target_display_index,
+++                                          PQToNits(block->l10.target_max_pq)));
+++        break;
+++      case 11:
+++      {
+++        static constexpr const char* types[] = {"default", "film", "game", "sport",
+++                                                "user-generated"};
+++        const uint8_t type = block->l11.content_type;
+++        info["Info.DV.L11"] = StringUtils::Format(
+++            "{} · white point {}{}", type < std::size(types) ? types[type] : "other",
+++            block->l11.whitepoint, block->l11.reference_mode_flag ? " · reference mode" : "");
+++        break;
+++      }
+++      case 254:
+++        info["Info.DV.L254"] =
+++            StringUtils::Format("{} / {}", block->l254.dm_mode, block->l254.dm_version_index);
+++        break;
+++      case 255:
+++        info["Info.DV.L255"] =
+++            StringUtils::Format("{} / {}", block->l255.dm_run_mode, block->l255.dm_run_version);
+++        break;
+++      default:
+++        break;
+++    }
+++  }
+++
+++  std::ranges::sort(levels, {},
+++                    [](const std::string& level) { return std::stoi(level.substr(1)); });
+++  info["Info.DV.Levels"] = Join(levels, " ");
+++  if (!l2.empty())
+++    info["Info.DV.L2"] = Join(l2, " · ") + " nits";
+++  if (!l8.empty())
+++    info["Info.DV.L8"] = Join(l8, " · ");
+++  if (!l10.empty())
+++    info["Info.DV.L10"] = Join(l10, " · ") + " nits";
+++  info["Info.DV.CM"] = std::ranges::find(levels, "L254") != levels.end() ? "CM v4.0" : "CM v2.9";
+++}
+++} // namespace
+++
+++void DRMPRIME::DescribePicture(const VideoPicture& picture,
+++                               const AVFrame* frame,
+++                               const AVFrame* el,
+++                               PlayerInfo& info)
+++{
+++  info["Info.Size"] = StringUtils::Format("{}x{}", picture.iWidth, picture.iHeight);
+++  info["Info.PixelFormat"] = PixelFormat(picture, frame);
+++  info["Info.Colour"] = ColourName(picture);
+++  DescribeStatic(picture, info);
+++  if (frame)
+++    DescribeHDR10Plus(frame, info);
+++
+++  if (!picture.doviProfile)
+++    return;
+++
+++  info["Info.DV.Profile"] = picture.doviProfile == 8
+++                                ? StringUtils::Format("8.{}", picture.doviCompatibility)
+++                                : std::to_string(picture.doviProfile);
+++  info["Info.DV.Level"] = std::to_string(picture.doviLevel);
+++  info["Info.DV.Layers"] = StringUtils::Format("{}{} + RPU", BaseLayerName(picture),
+++                                               picture.doviProfile == 7 ? " + EL" : "");
+++
+++  const AVFrameSideData* sd =
+++      frame ? av_frame_get_side_data(frame, AV_FRAME_DATA_DOVI_METADATA) : nullptr;
+++  if (!sd && el)
+++    sd = av_frame_get_side_data(el, AV_FRAME_DATA_DOVI_METADATA);
+++  if (sd)
+++    DescribeLevels(reinterpret_cast<const AVDOVIMetadata*>(sd->data), info);
+++}
++diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DRMPRIMEPlayerInfo.h b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DRMPRIMEPlayerInfo.h
++new file mode 100644
++index 000000000..83d308a46
++--- /dev/null
+++++ b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DRMPRIMEPlayerInfo.h
++@@ -0,0 +1,33 @@
+++/*
+++ *  Copyright (C) 2026 Team Kodi
+++ *  This file is part of Kodi - https://kodi.tv
+++ *
+++ *  SPDX-License-Identifier: GPL-2.0-or-later
+++ *  See LICENSES/README.md for more information.
+++ */
+++
+++#pragma once
+++
+++#include <functional>
+++#include <map>
+++#include <string>
+++
+++struct AVFrame;
+++struct VideoPicture;
+++
+++namespace DRMPRIME
+++{
+++//! Player information's window properties and their values (CDataCacheCore::SetVideoPlayerInfo)
+++using PlayerInfo = std::map<std::string, std::string, std::less<>>;
+++
+++/*!
+++ * \brief Describes a decoded picture for Player information: its pixel format and colour, its
+++ * static and HDR10+ metadata, and its Dolby Vision configuration and RPU levels
+++ * \param frame The decoded frame, or nullptr
+++ * \param el Its enhancement layer, whose RPU stands in where frame carries none, or nullptr
+++ */
+++void DescribePicture(const VideoPicture& picture,
+++                     const AVFrame* frame,
+++                     const AVFrame* el,
+++                     PlayerInfo& info);
+++} // namespace DRMPRIME
++diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.cpp
++index a21bea9a6..9bab58611 100644
++--- a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.cpp
+++++ b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.cpp
++@@ -36,6 +36,11 @@
++ 
++ #include "system_gl.h"
++ 
+++extern "C"
+++{
+++#include <libavutil/dovi_meta.h>
+++}
+++
++ namespace
++ {
++ // one on the plane, one leaving it, one being rendered, one spare
++@@ -58,6 +63,45 @@ const char* UpscaleName(pi_el_upscale upscale)
++   }
++ }
++ 
+++const char* MMRName(pi_mmr_mode mmr)
+++{
+++  switch (mmr)
+++  {
+++    case PI_MMR_SPLIT:
+++      return "split";
+++    case PI_MMR_EXACT64:
+++      return "exact, 64-bit";
+++    case PI_MMR_FLOAT:
+++      return "float";
+++    default:
+++      return "exact";
+++  }
+++}
+++
+++bool UsesMMR(const AVFrame* frame)
+++{
+++  const AVFrameSideData* sd = av_frame_get_side_data(frame, AV_FRAME_DATA_DOVI_METADATA);
+++  if (!sd)
+++    return false;
+++  const AVDOVIDataMapping* mapping =
+++      av_dovi_get_mapping(reinterpret_cast<const AVDOVIMetadata*>(sd->data));
+++  for (int c = 1; c < 3; c++)
+++  {
+++    for (int piece = 0; piece < mapping->curves[c].num_pivots - 1; piece++)
+++    {
+++      if (mapping->curves[c].mapping_idc[piece] == AV_DOVI_MAPPING_MMR)
+++        return true;
+++    }
+++  }
+++  return false;
+++}
+++
+++std::string& DeviceName()
+++{
+++  static std::string device;
+++  return device;
+++}
+++
++ void Log(void* /*opaque*/, pi_log_level level, const char* message)
++ {
++   int kodiLevel = LOGDEBUG;
++@@ -209,6 +253,7 @@ bool CDVTunnelDRMPRIME::Supports(const VideoPicture& picture)
++                 info.device);
++       return false;
++     }
+++    DeviceName() = info.device;
++     return true;
++   }();
++ 
++@@ -230,6 +275,8 @@ std::unique_ptr<CDVTunnelDRMPRIME> CDVTunnelDRMPRIME::Create(const VideoPicture&
++   o.pipeline_cache = tunnel->m_pipelineCache.c_str();
++   o.log = Log;
++   o.log_level = PI_LOG_INFO;
+++  // three GPU timestamps per render, for Player information
+++  o.profile = 1;
++ 
++   int ret = pi_engine_create(&o, &tunnel->m_engine);
++   if (ret != PI_OK)
++@@ -574,6 +621,13 @@ CVideoBufferDRMPRIME* CDVTunnelDRMPRIME::Render(CVideoBufferDRMPRIME* buffer, in
++     return nullptr;
++   }
++ 
+++  // the output's last render is done: its GPU time
+++  pi_render_stats stats;
+++  pi_output_stats(m_engine, output->m_output, &stats);
+++  const double gpuMs = stats.pass_ms[0] + stats.pass_ms[1];
+++  if (gpuMs > 0)
+++    m_gpuMs = m_gpuMs > 0 ? 0.9 * m_gpuMs + 0.1 * gpuMs : gpuMs;
+++
++   pi_frame frame{};
++   frame.bl = decoded->GetFrame();
++   const AVFrame* el = decoded->GetEnhancementLayer();
++@@ -617,6 +671,14 @@ CVideoBufferDRMPRIME* CDVTunnelDRMPRIME::Render(CVideoBufferDRMPRIME* buffer, in
++     return nullptr;
++   }
++ 
+++  if (!el)
+++    m_layers = Layers::NONE;
+++  else if (frame.el)
+++    m_layers = Layers::FULL;
+++  else
+++    m_layers = m_options.enhancementLayer ? Layers::MINIMAL : Layers::OFF;
+++  m_mmr = UsesMMR(frame.rpu_frame ? frame.rpu_frame : frame.bl);
+++
++   if (m_overlayShown >= 0 && fence >= 0)
++   {
++     Overlay& overlay = *m_overlays[m_overlayShown];
++@@ -628,3 +690,38 @@ CVideoBufferDRMPRIME* CDVTunnelDRMPRIME::Render(CVideoBufferDRMPRIME* buffer, in
++ 
++   return output;
++ }
+++
+++void CDVTunnelDRMPRIME::Describe(DRMPRIME::PlayerInfo& info, float fps) const
+++{
+++  info["Info.Engine"] = DeviceName();
+++  switch (m_layers)
+++  {
+++    case Layers::FULL:
+++      info["Info.DV.Layers"] = "HDR10 BL + FEL + RPU";
+++      info["Info.Reconstruction"] =
+++          StringUtils::Format("BL + FEL · {} upscale", UpscaleName(m_options.elUpscale));
+++      break;
+++    case Layers::MINIMAL:
+++      info["Info.DV.Layers"] = "HDR10 BL + MEL + RPU";
+++      info["Info.Reconstruction"] = "BL (MEL: no residual)";
+++      break;
+++    case Layers::OFF:
+++      info["Info.Reconstruction"] = "BL (enhancement layer off)";
+++      break;
+++    default:
+++      info["Info.Reconstruction"] = "BL";
+++      break;
+++  }
+++  info["Info.ChromaMapping"] =
+++      m_mmr ? StringUtils::Format("MMR · {}", MMRName(m_options.mmr)) : "Polynomial";
+++  info["Info.Filters"] = m_options.filters == PI_FILTERS_PHASE ? "Phase" : "CB1";
+++  info["Info.Link"] = "RGB 8-bit tunnel";
+++
+++  if (m_gpuMs > 0 && fps > 0)
+++  {
+++    const double frameMs = 1000.0 / static_cast<double>(fps);
+++    info["Info.GPU"] = StringUtils::Format("{:.1f} of {:.1f} ms", m_gpuMs, frameMs);
+++    info["Info.RenderLoad"] =
+++        std::to_string(static_cast<int>(std::lround(100.0 * m_gpuMs / frameMs)));
+++  }
+++}
++diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.h b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.h
++index 5ee1f500f..d296141b4 100644
++--- a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.h
+++++ b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.h
++@@ -8,6 +8,7 @@
++ 
++ #pragma once
++ 
+++#include "DRMPRIMEPlayerInfo.h"
++ #include "utils/Geometry.h"
++ 
++ #include <functional>
++@@ -96,6 +97,13 @@ public:
++   //! \brief Whether the renders composite an overlay
++   bool HasOverlay() const { return m_overlayShown >= 0; }
++ 
+++  /*!
+++   * \brief Describes the renders for Player information: the engine, the layers it renders,
+++   * how, and its GPU time per picture
+++   * \param fps The video's frame rate, for the share of a picture's time the GPU takes
+++   */
+++  void Describe(DRMPRIME::PlayerInfo& info, float fps) const;
+++
++ private:
++   struct Overlay;
++ 
++@@ -113,6 +121,19 @@ private:
++   unsigned int m_failures = 0;
++   bool m_warnedEnhancementLayer = false;
++ 
+++  //! what the last render did with an enhancement layer
+++  enum class Layers
+++  {
+++    NONE, //!< none in the stream
+++    FULL, //!< rendered (FEL)
+++    MINIMAL, //!< left out: its residual is zero (MEL)
+++    OFF, //!< left out: turned off
+++  } m_layers = Layers::NONE;
+++  //! the last renders' GPU time, ms, smoothed; 0 none measured
+++  double m_gpuMs = 0;
+++  //! whether the last render's RPU maps chroma with MMR
+++  bool m_mmr = false;
+++
++   std::vector<std::unique_ptr<Overlay>> m_overlays;
++   unsigned int m_overlayWidth = 0;
++   unsigned int m_overlayHeight = 0;
++diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIME.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIME.cpp
++index 1b32a83f9..b9737bddd 100644
++--- a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIME.cpp
+++++ b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIME.cpp
++@@ -8,7 +8,9 @@
++ 
++ #include "RendererDRMPRIME.h"
++ 
+++#include "DRMPRIMEPlayerInfo.h"
++ #include "ServiceBroker.h"
+++#include "cores/DataCacheCore.h"
++ #include "cores/VideoPlayer/Buffers/VideoBufferDRMPRIME.h"
++ #include "cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.h"
++ #include "cores/VideoPlayer/VideoRenderers/HwDecRender/DRMPRIMECaptureGLES.h"
++@@ -19,6 +21,7 @@
++ #include "settings/Settings.h"
++ #include "settings/SettingsComponent.h"
++ #include "settings/lib/Setting.h"
+++#include "utils/StringUtils.h"
++ #include "utils/log.h"
++ #include "windowing/GraphicContext.h"
++ #include "windowing/gbm/WinSystemGbm.h"
++@@ -138,6 +141,7 @@ void CRendererDRMPRIME::Register()
++ bool CRendererDRMPRIME::Configure(const VideoPicture& picture, float fps, unsigned int orientation)
++ {
++   m_format = picture.videoBuffer->GetFormat();
+++  m_fps = fps;
++   m_sourceWidth = picture.iWidth;
++   m_sourceHeight = picture.iHeight;
++   m_renderOrientation = orientation;
++@@ -175,6 +179,7 @@ void CRendererDRMPRIME::SetHDROutput(const VideoPicture& picture)
++     winSystem->SetColorimetry(&picture);
++ 
++     const bool passthroughHDR = winSystem->SetHDR(&picture);
+++    m_hdrOutput = passthroughHDR;
++     CLog::Log(LOGDEBUG, "CRendererDRMPRIME::Configure: HDR passthrough: {}",
++               passthroughHDR ? "on" : "off");
++ 
++@@ -717,9 +722,54 @@ void CRendererDRMPRIME::UpdateGuiOverlay()
++ #endif
++ }
++ 
+++void CRendererDRMPRIME::UpdatePlayerInfo(CVideoBufferDRMPRIME* buffer)
+++{
+++  using namespace std::chrono_literals;
+++  CDataCacheCore& dataCache = CServiceBroker::GetDataCacheCore();
+++  const auto now = std::chrono::steady_clock::now();
+++  if (!dataCache.IsPlayerInfoShown() || now - m_playerInfoTime < 500ms)
+++    return;
+++  m_playerInfoTime = now;
+++
+++  const auto* decoded = dynamic_cast<CVideoBufferDRMPRIMEFFmpeg*>(buffer);
+++  DRMPRIME::PlayerInfo info;
+++  DRMPRIME::DescribePicture(buffer->GetPicture(), decoded ? decoded->GetFrame() : nullptr,
+++                            decoded ? decoded->GetEnhancementLayer() : nullptr, info);
+++
+++  auto* winSystem = static_cast<CWinSystemGbm*>(CServiceBroker::GetWinSystem());
+++  const RESOLUTION_INFO& res = winSystem->GetGfxContext().GetResInfo();
+++  info["Info.Display"] = StringUtils::Format("{}x{} / {:.3f} Hz", res.iScreenWidth,
+++                                             res.iScreenHeight, res.fRefreshRate);
+++  info["Info.Refresh"] = winSystem->GetDrm()->UseVrr() && (res.dwFlags & D3DPRESENTFLAG_VRR)
+++                             ? "Variable (FreeSync)"
+++                             : "Fixed";
+++  if (!m_hdrOutput)
+++    info["Info.Signal"] = "SDR";
+++  else if (buffer->GetPicture().color_transfer == AVCOL_TRC_ARIB_STD_B67)
+++    info["Info.Signal"] = "HLG";
+++  else
+++    info["Info.Signal"] = "HDR10";
+++#if defined(HAVE_PIDV)
+++  if (m_dolbyVision)
+++  {
+++    info["Info.Signal"] = "Dolby Vision";
+++    info["Info.Infoframe"] =
+++        GetDolbyVisionInfoframe(m_videoSettings) == DolbyVisionOutput::DOLBY_VSIF ? "Dolby VSIF"
+++                                                                                  : "HDMI VSIF";
+++    m_dolbyVision->Describe(info, m_fps);
+++  }
+++#endif
+++
+++  dataCache.SetVideoPlayerInfo(std::move(info));
+++}
+++
++ void CRendererDRMPRIME::RenderUpdate(
++     int index, int index2, bool clear, unsigned int flags, unsigned int alpha)
++ {
+++  if (auto* shown = dynamic_cast<CVideoBufferDRMPRIME*>(m_buffers[index].videoBuffer);
+++      shown && shown->IsValid())
+++    UpdatePlayerInfo(shown);
+++
++   if (m_iLastRenderBuffer == index && m_videoLayerBridge)
++   {
++ #if defined(HAVE_PIDV)
++diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIME.h b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIME.h
++index 210cd7bf0..a1aec3777 100644
++--- a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIME.h
+++++ b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIME.h
++@@ -73,6 +73,9 @@ private:
++   bool CachePlaneParams(const VideoPicture& picture);
++   //! \brief Reclaim any video plane a display mode change has taken away.
++   void EnsurePlanes();
+++  //! \brief Describes the picture shown, its rendering and the output, while Player
+++  //!        information is shown
+++  void UpdatePlayerInfo(CVideoBufferDRMPRIME* buffer);
++ 
++   bool m_bConfigured = false;
++   int m_iLastRenderBuffer = -1;
++@@ -100,6 +103,9 @@ private:
++ 
++   std::shared_ptr<CVideoLayerBridgeDRMPRIME> m_videoLayerBridge;
++ 
+++  bool m_hdrOutput = false;
+++  std::chrono::steady_clock::time_point m_playerInfoTime;
+++
++   bool m_dolbyVisionCapable = false;
++   bool m_dolbyVisionEnabled = false;
++ #if defined(HAVE_PIDV)
++diff --git a/xbmc/dialogs/GUIDialogPlayerProcessInfo.cpp b/xbmc/dialogs/GUIDialogPlayerProcessInfo.cpp
++index 87ec544b4..b03afab16 100644
++--- a/xbmc/dialogs/GUIDialogPlayerProcessInfo.cpp
+++++ b/xbmc/dialogs/GUIDialogPlayerProcessInfo.cpp
++@@ -8,8 +8,23 @@
++ 
++ #include "GUIDialogPlayerProcessInfo.h"
++ 
+++#include "ServiceBroker.h"
+++#include "cores/DataCacheCore.h"
+++#include "guilib/GUIMessage.h"
++ #include "input/actions/Action.h"
++ #include "input/actions/ActionIDs.h"
+++#include "utils/CPUInfo.h"
+++#include "utils/MemUtils.h"
+++#include "utils/StringUtils.h"
+++
+++#include <algorithm>
+++
+++namespace
+++{
+++// progress controls the meters' percentages are sent to
+++constexpr int CONTROL_RENDER_METER = 100;
+++constexpr int CONTROL_MEMORY_METER = 101;
+++} // namespace
++ 
++ CGUIDialogPlayerProcessInfo::CGUIDialogPlayerProcessInfo(void)
++     : CGUIDialog(WINDOW_DIALOG_PLAYER_PROCESS_INFO, "DialogPlayerProcessInfo.xml")
++@@ -28,3 +43,64 @@ bool CGUIDialogPlayerProcessInfo::OnAction(const CAction &action)
++   }
++   return CGUIDialog::OnAction(action);
++ }
+++
+++void CGUIDialogPlayerProcessInfo::OnInitWindow()
+++{
+++  CServiceBroker::GetDataCacheCore().SetPlayerInfoShown(true);
+++  UpdateProperties();
+++  CGUIDialog::OnInitWindow();
+++}
+++
+++void CGUIDialogPlayerProcessInfo::OnDeinitWindow(int nextWindowID)
+++{
+++  CServiceBroker::GetDataCacheCore().SetPlayerInfoShown(false);
+++  CGUIDialog::OnDeinitWindow(nextWindowID);
+++}
+++
+++void CGUIDialogPlayerProcessInfo::FrameMove()
+++{
+++  using namespace std::chrono_literals;
+++  if (std::chrono::steady_clock::now() - m_updated >= 500ms)
+++    UpdateProperties();
+++  CGUIDialog::FrameMove();
+++}
+++
+++void CGUIDialogPlayerProcessInfo::UpdateProperties()
+++{
+++  m_updated = std::chrono::steady_clock::now();
+++  CDataCacheCore& dataCache = CServiceBroker::GetDataCacheCore();
+++
+++  const auto info = dataCache.GetVideoPlayerInfo();
+++  for (const std::string& name : m_properties)
+++  {
+++    if (!info.contains(name))
+++      SetProperty(name, "");
+++  }
+++  m_properties.clear();
+++  for (const auto& [name, value] : info)
+++  {
+++    SetProperty(name, value);
+++    m_properties.insert(name);
+++  }
+++
+++  const auto load = info.find("Info.RenderLoad");
+++  CGUIMessage render(GUI_MSG_ITEM_SELECT, GetID(), CONTROL_RENDER_METER,
+++                     load != info.end() ? std::min(std::stoi(load->second), 100) : 0);
+++  OnMessage(render);
+++
+++  // System.Memory reads /proc/meminfo at every frame it is shown
+++  KODI::MEMORY::MemoryStatus memory;
+++  KODI::MEMORY::GetMemoryStatus(&memory);
+++  const int used =
+++      memory.totalPhys ? static_cast<int>(100 - memory.availPhys * 100 / memory.totalPhys) : 0;
+++  SetProperty("Info.Memory", StringUtils::Format("{} %", used));
+++  CGUIMessage meter(GUI_MSG_ITEM_SELECT, GetID(), CONTROL_MEMORY_METER, used);
+++  OnMessage(meter);
+++
+++  if (CServiceBroker::GetCPUInfo()->SupportsCPUUsage())
+++    SetProperty("Info.CPU",
+++                StringUtils::Format("{} %", CServiceBroker::GetCPUInfo()->GetUsedPercentage()));
+++
+++  SetProperty("Info.DroppedSkipped", StringUtils::Format("{} / {}", dataCache.GetVideoDropped(),
+++                                                         dataCache.GetVideoSkipped()));
+++}
++diff --git a/xbmc/dialogs/GUIDialogPlayerProcessInfo.h b/xbmc/dialogs/GUIDialogPlayerProcessInfo.h
++index 74137709a..b1acb6ffb 100644
++--- a/xbmc/dialogs/GUIDialogPlayerProcessInfo.h
+++++ b/xbmc/dialogs/GUIDialogPlayerProcessInfo.h
++@@ -10,6 +10,10 @@
++ 
++ #include "guilib/GUIDialog.h"
++ 
+++#include <chrono>
+++#include <set>
+++#include <string>
+++
++ class CGUIDialogPlayerProcessInfo : public CGUIDialog
++ {
++ public:
++@@ -17,4 +21,17 @@ public:
++   ~CGUIDialogPlayerProcessInfo(void) override;
++ 
++   bool OnAction(const CAction &action) override;
+++
+++protected:
+++  void OnInitWindow() override;
+++  void OnDeinitWindow(int nextWindowID) override;
+++  void FrameMove() override;
+++
+++private:
+++  //! \brief Sets the window's properties from the video renderer's description and the meters
+++  void UpdateProperties();
+++
+++  std::chrono::steady_clock::time_point m_updated;
+++  //! the renderer's properties set
+++  std::set<std::string, std::less<>> m_properties;
++ };
++-- 
++2.50.1 (Apple Git-155)
++
+-- 
+2.43.0
+

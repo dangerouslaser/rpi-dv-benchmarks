@@ -1,0 +1,32 @@
+From cbf924d9d69d7775d76ccd654353e0526fd0ce8e Mon Sep 17 00:00:00 2001
+From: Bryan Hoban <bryan.hoban@gmail.com>
+Date: Wed, 11 Nov 2026 12:53:03 -0500
+Subject: [PATCH] pi-dv-engine: update to 0.5.0
+
+CM v4.0 metadata and L2 trim options (pi_engine_set_dm), the picture
+under an overlay's opaque areas skipped, and decoder buffers bound
+under Mesa 26.3's v3dv.
+
+Signed-off-by: Bryan Hoban <bryan.hoban@gmail.com>
+---
+ packages/multimedia/pi-dv-engine/package.mk | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/packages/multimedia/pi-dv-engine/package.mk b/packages/multimedia/pi-dv-engine/package.mk
+index d8ca50b9da..45463db289 100644
+--- a/packages/multimedia/pi-dv-engine/package.mk
++++ b/packages/multimedia/pi-dv-engine/package.mk
+@@ -2,8 +2,8 @@
+ # Copyright (C) 2026-present Team LibreELEC (https://libreelec.tv)
+ 
+ PKG_NAME="pi-dv-engine"
+-PKG_VERSION="0.4.2"
+-PKG_SHA256="94e08f78d84f874fb925dafb39b647b8d57ff8064af0f9db502631fd8e657ee5"
++PKG_VERSION="0.5.0"
++PKG_SHA256="5e256d79db91a16a7ba5705f76cef00841face6b8a0bc7ea412c81c61cd02306"
+ PKG_LICENSE="GPL-2.0-or-later"
+ PKG_SITE="https://github.com/dangerouslaser/libreelec-rpi-dv"
+ PKG_URL="https://github.com/dangerouslaser/libreelec-rpi-dv/releases/download/engine-${PKG_VERSION}/${PKG_NAME}-${PKG_VERSION}.tar.xz"
+-- 
+2.43.0
+

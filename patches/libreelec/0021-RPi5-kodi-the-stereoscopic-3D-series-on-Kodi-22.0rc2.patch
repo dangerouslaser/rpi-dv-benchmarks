@@ -1,0 +1,519 @@
+From a46f70638431d465ff07d6d0082502e6913079f9 Mon Sep 17 00:00:00 2001
+From: Bryan Hoban <bryan.hoban@gmail.com>
+Date: Wed, 11 Nov 2026 12:20:00 -0500
+Subject: [PATCH] RPi5: kodi: the stereoscopic 3D series on Kodi 22.0rc2
+
+LibreELEC.tv builds Kodi 22.0rc2-Piers from 01a57f984b on. Of the
+series, 0017, 0022 and 0023 are refreshed for it, and 0021 (keep a
+Blu-ray menu out of the subtitles' way) goes: Kodi now keeps Blu-ray
+menu overlays apart from subtitles and across flushes itself. 0023
+loses the lines that cleared the menu overlays by 0021's source, which
+opening an input stream now does. The other patches apply as they are.
+
+Signed-off-by: Bryan Hoban <bryan.hoban@gmail.com>
+---
+diff --git a/projects/RPi/devices/RPi5/patches/kodi/0017-VideoPlayer-pack-the-separately-coded-views-of-an-MV.patch b/projects/RPi/devices/RPi5/patches/kodi/0017-VideoPlayer-pack-the-separately-coded-views-of-an-MV.patch
+index d2b1ac60ed..5d9f7538dd 100644
+--- a/projects/RPi/devices/RPi5/patches/kodi/0017-VideoPlayer-pack-the-separately-coded-views-of-an-MV.patch
++++ b/projects/RPi/devices/RPi5/patches/kodi/0017-VideoPlayer-pack-the-separately-coded-views-of-an-MV.patch
+@@ -555,7 +555,7 @@ index e9bf7d09d..b12da5ac7 100644
+    bool m_startedInput = false;
+    int m_iLastKeyframe = 0;
+ diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp
+-index ed1ff235a..dee4d11bb 100644
++index 6c8a18f81..4db7ee635 100644
+ --- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp
+ +++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp
+ @@ -40,6 +40,7 @@ extern "C" {
+@@ -645,7 +645,7 @@ index ed1ff235a..dee4d11bb 100644
+    else
+      pVideoPicture->stereoMode.clear();
+  
+-@@ -1236,7 +1276,7 @@ int CDVDVideoCodecFFmpeg::FilterOpen(const std::string& filters, bool scale)
++@@ -1255,7 +1295,7 @@ int CDVDVideoCodecFFmpeg::FilterOpen(const std::string& filters, bool scale)
+    if (m_pFilterGraph)
+      FilterClose();
+  
+@@ -654,7 +654,7 @@ index ed1ff235a..dee4d11bb 100644
+      return 0;
+  
+    if (m_pHardware)
+-@@ -1294,7 +1334,20 @@ int CDVDVideoCodecFFmpeg::FilterOpen(const std::string& filters, bool scale)
++@@ -1313,7 +1353,20 @@ int CDVDVideoCodecFFmpeg::FilterOpen(const std::string& filters, bool scale)
+      return result;
+    }
+  
+@@ -676,7 +676,7 @@ index ed1ff235a..dee4d11bb 100644
+    {
+      AVFilterInOut* outputs = avfilter_inout_alloc();
+      AVFilterInOut* inputs  = avfilter_inout_alloc();
+-@@ -1309,7 +1362,22 @@ int CDVDVideoCodecFFmpeg::FilterOpen(const std::string& filters, bool scale)
++@@ -1328,7 +1381,22 @@ int CDVDVideoCodecFFmpeg::FilterOpen(const std::string& filters, bool scale)
+      inputs->pad_idx = 0;
+      inputs->next = nullptr;
+  
+@@ -700,7 +700,7 @@ index ed1ff235a..dee4d11bb 100644
+      avfilter_inout_free(&outputs);
+      avfilter_inout_free(&inputs);
+  
+-@@ -1368,17 +1436,92 @@ void CDVDVideoCodecFFmpeg::FilterClose()
++@@ -1387,17 +1455,92 @@ void CDVDVideoCodecFFmpeg::FilterClose()
+  
+      // Disposed by above code
+      m_pFilterIn = nullptr;
+@@ -944,7 +944,7 @@ index 3cc705ba6..6190f05ca 100644
+    }
+    else if (right.type == StreamType::SUBTITLE)
+ diff --git a/xbmc/cores/VideoPlayer/DVDStreamInfo.h b/xbmc/cores/VideoPlayer/DVDStreamInfo.h
+-index 1da58a7e6..6cee4842c 100644
++index 609a13006..9239bced0 100644
+ --- a/xbmc/cores/VideoPlayer/DVDStreamInfo.h
+ +++ b/xbmc/cores/VideoPlayer/DVDStreamInfo.h
+ @@ -79,6 +79,7 @@ public:
+@@ -954,4 +954,4 @@ index 1da58a7e6..6cee4842c 100644
+ +  bool multiview; // eyes are coded as separate views and must be packed by the decoder
+    AVDOVIDecoderConfigurationRecord dovi{};
+  
+-   // AUDIO
++   // Dolby Vision profile 8 compatibility IDs 1 and 4 identify HDR10 and HLG
+diff --git a/projects/RPi/devices/RPi5/patches/kodi/0021-VideoPlayer-keep-a-Blu-ray-menu-out-of-the-subtitles.patch b/projects/RPi/devices/RPi5/patches/kodi/0021-VideoPlayer-keep-a-Blu-ray-menu-out-of-the-subtitles.patch
+deleted file mode 100644
+index f83ed572f6..0000000000
+--- a/projects/RPi/devices/RPi5/patches/kodi/0021-VideoPlayer-keep-a-Blu-ray-menu-out-of-the-subtitles.patch
++++ /dev/null
+@@ -1,225 +0,0 @@
+-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+-From: Dom Cobley <popcornmix@gmail.com>
+-Date: Sat, 22 Aug 2026 19:05:07 +0100
+-Subject: [PATCH 21/46] VideoPlayer: keep a Blu-ray menu out of the subtitles'
+- way
+-
+-The top menu of a Blu-ray 3D disc is invisible. The buttons are live -- enter
+-starts the feature -- and moving between them brings the menu into view, where
+-it then stays. Only the first drawing of it is lost.
+-
+-The navigator's menu goes into the same overlay container as the subtitles, and
+-everything in there is treated as one sequence of cues. Three things follow from
+-that, all of which the menu has to survive. Closing a subtitle stream empties
+-the container, so opening one throws away a menu drawn moments earlier. A cue
+-arriving with no stop time of its own is taken to end whatever came before it,
+-so the first subtitle gives the menu a stop time in the past. And a forced cue
+-supersedes an older forced one, which a menu is.
+-
+-Between subtitles all three are right; between a subtitle and a menu none of
+-them are. So say where an overlay came from: CDVDOverlay carries a source, a
+-subtitle stream unless told otherwise, and the navigator marks its pages as the
+-menu. Ending and superseding then apply within a source and not across two, so
+-the menu still goes when the next page replaces it or the navigator closes it
+-with an empty one -- which is what takes it off the screen when a scene starts
+-playing -- but a subtitle appearing over the top of it changes nothing. Closing
+-a subtitle stream clears the subtitles and only the subtitles, so WebVTT cues
+-behave exactly as they did. The menu is also marked unflushable, since a seek
+-flushes the container and libbluray will not draw the page again on its own.
+-
+-libbluray composes a page only when something happens on the disc, so nothing
+-would put a lost menu back, which is why moving a button was a way in.
+-
+-Seen on Gravity, whose menu playlist carries the PG streams that make Kodi open
+-a subtitle stream over the top of the menu. A disc offering none of those never
+-had the problem, which is why menus otherwise work.
+-
+-(cherry picked from commit a2948b86dca141762545e1b8dd310c99ef3d36a1)
+----
+- .../DVDCodecs/Overlay/DVDOverlay.h            | 25 ++++++++++++++++++-
+- .../DVDInputStreams/DVDInputStreamBluray.cpp  |  8 ++++++
+- .../cores/VideoPlayer/DVDOverlayContainer.cpp | 18 +++++++++++++
+- xbmc/cores/VideoPlayer/DVDOverlayContainer.h  |  5 ++++
+- .../cores/VideoPlayer/VideoPlayerSubtitle.cpp |  5 +++-
+- 5 files changed, 59 insertions(+), 2 deletions(-)
+-
+-diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Overlay/DVDOverlay.h b/xbmc/cores/VideoPlayer/DVDCodecs/Overlay/DVDOverlay.h
+-index 1f37ab387..d8f635927 100644
+---- a/xbmc/cores/VideoPlayer/DVDCodecs/Overlay/DVDOverlay.h
+-+++ b/xbmc/cores/VideoPlayer/DVDCodecs/Overlay/DVDOverlay.h
+-@@ -22,6 +22,14 @@ enum DVDOverlayType
+-   DVDOVERLAY_TYPE_GROUP   = 5,
+- };
+- 
+-+//! Where an overlay came from. Subtitles and a disc menu share one container, and only an
+-+//! overlay from the same source ends or replaces another.
+-+enum class DVDOverlaySource
+-+{
+-+  SUBTITLE,
+-+  MENU,
+-+};
+-+
+- enum class DVDOverlayStereoView
+- {
+-   BOTH,
+-@@ -44,6 +52,7 @@ public:
+-     m_enableTextAlign = false;
+-     m_overlayContainerFlushable = true;
+-     m_setForcedMargins = false;
+-+    m_source = DVDOverlaySource::SUBTITLE;
+-     m_stereoView = DVDOverlayStereoView::BOTH;
+-   }
+- 
+-@@ -58,6 +67,7 @@ public:
+-     m_enableTextAlign = src.m_enableTextAlign;
+-     m_overlayContainerFlushable = src.m_overlayContainerFlushable;
+-     m_setForcedMargins = src.m_setForcedMargins;
+-+    m_source = src.m_source;
+-     m_stereoView = src.m_stereoView;
+-   }
+- 
+-@@ -69,7 +79,8 @@ public:
+-     return std::abs(iPTSStartTime - other.iPTSStartTime) < epsilon &&
+-            std::abs(iPTSStopTime - other.iPTSStopTime) < epsilon && bForced == other.bForced &&
+-            replace == other.replace &&
+--           m_overlayContainerFlushable == other.m_overlayContainerFlushable;
+-+           m_overlayContainerFlushable == other.m_overlayContainerFlushable &&
+-+           m_source == other.m_source;
+-   }
+- 
+-   bool IsOverlayType(DVDOverlayType type) const { return (m_type == type); }
+-@@ -103,6 +114,17 @@ public:
+-    */
+-   bool IsOverlayContainerFlushable() const { return m_overlayContainerFlushable; }
+- 
+-+  /*
+-+   * \brief Say where the overlay came from: a subtitle stream unless told otherwise.
+-+   */
+-+  void SetSource(DVDOverlaySource source) { m_source = source; }
+-+
+-+  /*
+-+   * \brief Where the overlay came from. Only an overlay from the same source ends or
+-+   *        replaces this one.
+-+   */
+-+  DVDOverlaySource GetSource() const { return m_source; }
+-+
+-   /*
+-    * \brief Specify if the margins are handled by the subtitle codec/parser.
+-    */
+-@@ -125,6 +147,7 @@ protected:
+-   bool m_enableTextAlign;
+-   bool m_overlayContainerFlushable;
+-   bool m_setForcedMargins;
+-+  DVDOverlaySource m_source;
+- };
+- 
+- using VecOverlays = std::vector<std::shared_ptr<CDVDOverlay>>;
+-diff --git a/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamBluray.cpp b/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamBluray.cpp
+-index fc4aca21d..a3934b18f 100644
+---- a/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamBluray.cpp
+-+++ b/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamBluray.cpp
+-@@ -783,6 +783,8 @@ void CDVDInputStreamBluray::OverlayClose()
+-     plane.o.clear();
+-   auto group = std::make_shared<CDVDOverlayGroup>();
+-   group->bForced = true;
+-+  group->SetSource(DVDOverlaySource::MENU);
+-+  group->SetOverlayContainerFlushable(false);
+-   m_player->OnDiscNavResult(static_cast<void*>(&group), BD_EVENT_MENU_OVERLAY);
+-   m_hasOverlay = false;
+- #endif
+-@@ -844,6 +846,12 @@ void CDVDInputStreamBluray::OverlayFlush(int64_t pts)
+-   group->iPTSStartTime = static_cast<double>(pts);
+-   group->iPTSStopTime  = 0;
+- 
+-+  // A menu, so that only the next page ends or replaces it and never a subtitle, and not
+-+  // flushable: a seek flushes the container, and libbluray will not draw the page again on
+-+  // its own.
+-+  group->SetSource(DVDOverlaySource::MENU);
+-+  group->SetOverlayContainerFlushable(false);
+-+
+-   for(SPlane& plane : m_planes)
+-   {
+-     for(SOverlays::iterator it = plane.o.begin(); it != plane.o.end(); ++it)
+-diff --git a/xbmc/cores/VideoPlayer/DVDOverlayContainer.cpp b/xbmc/cores/VideoPlayer/DVDOverlayContainer.cpp
+-index d5b2e087b..ad83a742c 100644
+---- a/xbmc/cores/VideoPlayer/DVDOverlayContainer.cpp
+-+++ b/xbmc/cores/VideoPlayer/DVDOverlayContainer.cpp
+-@@ -31,6 +31,12 @@ void CDVDOverlayContainer::ProcessAndAddOverlayIfValid(const std::shared_ptr<CDV
+-   for(int i = m_overlays.size();i>0;)
+-   {
+-     i--;
+-+
+-+    // Only what came from the same place ends this. A menu sits in here alongside the
+-+    // subtitles it has nothing to do with, and a cue starting is no reason for it to go.
+-+    if (m_overlays[i]->GetSource() != pOverlay->GetSource())
+-+      continue;
+-+
+-     if(m_overlays[i]->iPTSStopTime)
+-     {
+-       if(!m_overlays[i]->replace)
+-@@ -85,6 +91,11 @@ void CDVDOverlayContainer::CleanUp(double pts)
+-       while (!bNewer && ++it2 != m_overlays.end())
+-       {
+-         const std::shared_ptr<CDVDOverlay>& pOverlay2 = *it2;
+-+        // Only what came from the same place replaces this: a menu is redrawn by the
+-+        // next menu, and closing one sends an empty page to stand in for it, but a
+-+        // forced subtitle over the top of a menu replaces nothing.
+-+        if (pOverlay2->GetSource() != pOverlay->GetSource())
+-+          continue;
+-         // There can be multiple overlays queued at same start point.
+-         // Skip them to find a new start point.
+-         if (pOverlay2->bForced && pOverlay2->iPTSStartTime <= pts)
+-@@ -120,6 +131,13 @@ void CDVDOverlayContainer::Clear()
+-   m_overlays.clear();
+- }
+- 
+-+void CDVDOverlayContainer::Clear(DVDOverlaySource source)
+-+{
+-+  std::unique_lock lock(*this);
+-+  std::erase_if(m_overlays, [source](const std::shared_ptr<CDVDOverlay>& ov)
+-+                { return ov->GetSource() == source; });
+-+}
+-+
+- size_t CDVDOverlayContainer::GetSize()
+- {
+-   return m_overlays.size();
+-diff --git a/xbmc/cores/VideoPlayer/DVDOverlayContainer.h b/xbmc/cores/VideoPlayer/DVDOverlayContainer.h
+-index e64e44571..20b2d10e0 100644
+---- a/xbmc/cores/VideoPlayer/DVDOverlayContainer.h
+-+++ b/xbmc/cores/VideoPlayer/DVDOverlayContainer.h
+-@@ -40,6 +40,11 @@ public:
+- 
+-   void Clear(); // clear the fifo and delete all overlays
+- 
+-+  /*!
+-+   * \brief Remove every overlay that came from one source, leaving the others in place.
+-+   */
+-+  void Clear(DVDOverlaySource source);
+-+
+-   /*
+-    * \brief Flush the overlays.
+-    */
+-diff --git a/xbmc/cores/VideoPlayer/VideoPlayerSubtitle.cpp b/xbmc/cores/VideoPlayer/VideoPlayerSubtitle.cpp
+-index 6529b0106..1e003fd2d 100644
+---- a/xbmc/cores/VideoPlayer/VideoPlayerSubtitle.cpp
+-+++ b/xbmc/cores/VideoPlayer/VideoPlayerSubtitle.cpp
+-@@ -47,6 +47,7 @@ std::shared_ptr<CDVDOverlayGroup> InitialiseNewOverlayGroup(std::shared_ptr<CDVD
+-   group->bForced = overlay->bForced;
+-   group->replace = overlay->replace;
+-   group->SetOverlayContainerFlushable(overlay->IsOverlayContainerFlushable());
+-+  group->SetSource(overlay->GetSource());
+-   group->m_overlays.emplace_back(overlay);
+-   return group;
+- }
+-@@ -194,8 +195,10 @@ void CVideoPlayerSubtitle::CloseStream(bool bWaitForBuffers)
+- 
+-   m_dvdspus.FlushCurrentPacket();
+- 
+-+  // Only the subtitles: the container is shared with the disc menu, which nothing would
+-+  // draw again if it went with them.
+-   if (!bWaitForBuffers)
+--    m_pOverlayContainer->Clear();
+-+    m_pOverlayContainer->Clear(DVDOverlaySource::SUBTITLE);
+- }
+- 
+- void CVideoPlayerSubtitle::Process(double pts, double offset)
+diff --git a/projects/RPi/devices/RPi5/patches/kodi/0022-VideoPlayer-play-the-second-view-of-a-3D-Blu-ray.patch b/projects/RPi/devices/RPi5/patches/kodi/0022-VideoPlayer-play-the-second-view-of-a-3D-Blu-ray.patch
+index 2710e858cc..f6fd38a4b7 100644
+--- a/projects/RPi/devices/RPi5/patches/kodi/0022-VideoPlayer-play-the-second-view-of-a-3D-Blu-ray.patch
++++ b/projects/RPi/devices/RPi5/patches/kodi/0022-VideoPlayer-play-the-second-view-of-a-3D-Blu-ray.patch
+@@ -1200,7 +1200,7 @@ index 1cb7b3337..c5063fcd4 100644
+  
+  core_add_library(dvdinputstreams)
+ diff --git a/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamBluray.cpp b/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamBluray.cpp
+-index a3934b18f..09a3141f9 100644
++index 0b291384f..95a2d3f9d 100644
+ --- a/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamBluray.cpp
+ +++ b/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamBluray.cpp
+ @@ -10,12 +10,15 @@
+@@ -1232,7 +1232,7 @@ index a3934b18f..09a3141f9 100644
+  #include <string>
+  #include <vector>
+  
+-@@ -189,6 +194,13 @@ bool CDVDInputStreamBluray::Open()
++@@ -196,6 +201,13 @@ bool CDVDInputStreamBluray::Open()
+        return false;
+  
+      openStream = true;
+@@ -1246,7 +1246,7 @@ index a3934b18f..09a3141f9 100644
+    }
+    else if (VIDEO::IsProtectedBlurayDisc(m_item))
+    {
+-@@ -219,6 +231,10 @@ bool CDVDInputStreamBluray::Open()
++@@ -226,6 +238,10 @@ bool CDVDInputStreamBluray::Open()
+      filename = URIUtils::GetFileName(m_item.GetDynPath());
+    }
+  
+@@ -1257,7 +1257,7 @@ index a3934b18f..09a3141f9 100644
+    // root should not have trailing slash
+    URIUtils::RemoveSlashAtEnd(root);
+  
+-@@ -288,6 +304,8 @@ bool CDVDInputStreamBluray::Open()
++@@ -295,6 +311,8 @@ bool CDVDInputStreamBluray::Open()
+      return false;
+    }
+  
+@@ -1266,7 +1266,7 @@ index a3934b18f..09a3141f9 100644
+    if (disc_info->bluray_detected)
+    {
+  #if (BLURAY_VERSION > BLURAY_VERSION_CODE(1,0,0))
+-@@ -407,6 +425,14 @@ bool CDVDInputStreamBluray::Open()
++@@ -414,6 +432,14 @@ bool CDVDInputStreamBluray::Open()
+    while (bd_get_event(m_bd, &m_event))
+      ProcessEvent();
+  
+@@ -1281,7 +1281,7 @@ index a3934b18f..09a3141f9 100644
+    return true;
+  }
+  
+-@@ -584,10 +610,13 @@ void CDVDInputStreamBluray::ProcessEvent() {
++@@ -597,10 +623,13 @@ void CDVDInputStreamBluray::ProcessEvent() {
+      m_playlist = m_event.param;
+      FreeTitleInfo();
+      m_titleInfo = bd_get_playlist_info(m_bd, m_playlist, m_angle);
+@@ -1295,7 +1295,7 @@ index a3934b18f..09a3141f9 100644
+      if (m_titleInfo && m_event.param < m_titleInfo->clip_count)
+      {
+        m_clip = &m_titleInfo->clips[m_event.param];
+-@@ -1122,7 +1151,8 @@ static bool is_first_stream(int pid, const BLURAY_STREAM_INFO* info, int count)
++@@ -1153,7 +1182,8 @@ static bool is_first_stream(int pid, const BLURAY_STREAM_INFO* info, int count)
+  
+  bool CDVDInputStreamBluray::GetPlaylistStreamLanguage(int pid, std::string& language) const
+  {
+@@ -1305,7 +1305,7 @@ index a3934b18f..09a3141f9 100644
+      return find_stream(pid, m_clip->video_streams, m_clip->video_stream_count, language);
+    if (HDMV_PID_AUDIO_FIRST <= pid && pid <= HDMV_PID_AUDIO_LAST)
+      return find_stream(pid, m_clip->audio_streams, m_clip->audio_stream_count, language);
+-@@ -1200,6 +1230,125 @@ bool CDVDInputStreamBluray::IsDefaultStream(int pid) const
++@@ -1231,6 +1261,125 @@ bool CDVDInputStreamBluray::IsDefaultStream(int pid) const
+    return false;
+  }
+  
+@@ -1430,9 +1430,9 @@ index a3934b18f..09a3141f9 100644
+ +
+  CDVDInputStream::ENextStream CDVDInputStreamBluray::NextStream()
+  {
+-   if(!m_navmode || m_hold == HOLD_EXIT || m_hold == HOLD_ERROR)
++   if (!m_navmode || m_aborted || m_hold == HOLD_ERROR || HasGivenUpReading())
+ diff --git a/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamBluray.h b/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamBluray.h
+-index 1d648dbb2..090f06c97 100644
++index 5a0ebf3d1..1359cd82a 100644
+ --- a/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamBluray.h
+ +++ b/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamBluray.h
+ @@ -10,6 +10,7 @@
+@@ -1443,15 +1443,15 @@ index 1d648dbb2..090f06c97 100644
+  #include "threads/CriticalSection.h"
+  #if defined(HAS_UDFREAD)
+  #include "filesystem/UDFContext.h"
+-@@ -17,6 +18,7 @@
+- 
++@@ -18,6 +19,7 @@
++ #include <atomic>
+  #include <chrono>
+  #include <list>
+ +#include <map>
+  #include <memory>
+  #include <optional>
+  #include <string>
+-@@ -38,6 +40,7 @@ extern "C"
++@@ -39,6 +41,7 @@ extern "C"
+  #define BD_EVENT_ENC_ERROR    -3
+  
+  #define HDMV_PID_VIDEO            0x1011
+@@ -1459,7 +1459,7 @@ index 1d648dbb2..090f06c97 100644
+  #define HDMV_PID_AUDIO_FIRST      0x1100
+  #define HDMV_PID_AUDIO_LAST       0x111f
+  #define HDMV_PID_PG_FIRST         0x1200
+-@@ -47,6 +50,7 @@ extern "C"
++@@ -48,6 +51,7 @@ extern "C"
+  #define HDMV_PID_IG_FIRST         0x1400
+  #define HDMV_PID_IG_LAST          0x141f
+  
+@@ -1467,7 +1467,7 @@ index 1d648dbb2..090f06c97 100644
+  class CDVDOverlayImage;
+  class IVideoPlayer;
+  
+-@@ -141,6 +145,57 @@ public:
++@@ -142,6 +146,57 @@ public:
+     */
+    bool IsDefaultStream(int pid) const;
+  
+@@ -1525,7 +1525,7 @@ index 1d648dbb2..090f06c97 100644
+    void OverlayCallback(const BD_OVERLAY * const);
+  #ifdef HAVE_LIBBLURAY_BDJ
+    void OverlayCallbackARGB(const struct bd_argb_overlay_s * const);
+-@@ -232,6 +287,10 @@ protected:
++@@ -244,6 +299,10 @@ protected:
+       * \return True if the clip carries the stream, false otherwise
+       */
+      bool GetClipStreamLanguage(int pid, std::string& language) const;
+@@ -1536,7 +1536,7 @@ index 1d648dbb2..090f06c97 100644
+      std::unique_ptr<CDVDInputStreamFile> m_pstream;
+      std::string m_rootPath;
+  
+-@@ -240,6 +299,24 @@ protected:
++@@ -252,6 +311,24 @@ protected:
+      std::optional<XFILE::CUDFMount> m_udfMount;
+  #endif
+  
+diff --git a/projects/RPi/devices/RPi5/patches/kodi/0023-VideoPlayer-stop-a-title-inheriting-the-last-one-s-s.patch b/projects/RPi/devices/RPi5/patches/kodi/0023-VideoPlayer-stop-a-title-inheriting-the-last-one-s-s.patch
+index c8113b5caf..9ea6d775e6 100644
+--- a/projects/RPi/devices/RPi5/patches/kodi/0023-VideoPlayer-stop-a-title-inheriting-the-last-one-s-s.patch
++++ b/projects/RPi/devices/RPi5/patches/kodi/0023-VideoPlayer-stop-a-title-inheriting-the-last-one-s-s.patch
+@@ -34,17 +34,17 @@ disc it came from.
+ 
+ (cherry picked from commit f2eed157dc824313682df5acc1dce3f7e876ae27)
+ ---
+- xbmc/cores/VideoPlayer/VideoPlayer.cpp             | 14 ++++++++++++++
+- xbmc/cores/VideoPlayer/VideoPlayerVideo.cpp        |  6 ++++++
+- .../VideoPlayer/VideoRenderers/RenderManager.cpp   |  9 +++++++++
+- .../VideoPlayer/VideoRenderers/RenderManager.h     |  8 ++++++++
+- 4 files changed, 37 insertions(+)
++ xbmc/cores/VideoPlayer/VideoPlayer.cpp                  | 9 +++++++++
++ xbmc/cores/VideoPlayer/VideoPlayerVideo.cpp             | 6 ++++++
++ xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.cpp | 9 +++++++++
++ xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.h   | 8 ++++++++
++ 4 files changed, 32 insertions(+)
+ 
+ diff --git a/xbmc/cores/VideoPlayer/VideoPlayer.cpp b/xbmc/cores/VideoPlayer/VideoPlayer.cpp
+-index 1d6705eb3..7ec8cfe98 100644
++index 100ea0d4c..731045bc8 100644
+ --- a/xbmc/cores/VideoPlayer/VideoPlayer.cpp
+ +++ b/xbmc/cores/VideoPlayer/VideoPlayer.cpp
+-@@ -3118,6 +3118,20 @@ void CVideoPlayer::HandleMessages()
++@@ -3124,6 +3124,15 @@ void CVideoPlayer::HandleMessages()
+  
+        FlushBuffers(DVD_NOPTS_VALUE, true, true);
+        m_renderManager.Flush(false, false);
+@@ -56,11 +56,6 @@ index 1d6705eb3..7ec8cfe98 100644
+ +      // for it.
+ +      m_processInfo->ResetVideoCodecInfo();
+ +      m_renderManager.ResetPictureInfo();
+-+
+-+      // A disc menu is kept out of the flush so that a seek does not wipe a page libbluray
+-+      // will not draw again. Nothing draws it again here either, and the disc it belongs to
+-+      // is about to go, so it would be left over the title that follows.
+-+      m_overlayContainer.Clear(DVDOverlaySource::MENU);
+ +
+        m_pDemuxer.reset();
+        m_pSubtitleDemuxer.reset();
+@@ -83,10 +78,10 @@ index c8f609f4a..3880a35ba 100644
+    m_rewindStalled = false;
+    m_packets.clear();
+ diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.cpp
+-index a47cf8673..b7a140b58 100644
++index fc4b4238f..a68143abe 100644
+ --- a/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.cpp
+ +++ b/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.cpp
+-@@ -819,6 +819,15 @@ void CRenderManager::UpdateResolution()
++@@ -828,6 +828,15 @@ void CRenderManager::UpdateResolution()
+    }
+  }
+  
+@@ -103,10 +98,10 @@ index a47cf8673..b7a140b58 100644
+  {
+    if (width)
+ diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.h b/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.h
+-index 91a3fb1ab..9445a4ac8 100644
++index db0f71c77..98048b977 100644
+ --- a/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.h
+ +++ b/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.h
+-@@ -79,6 +79,14 @@ public:
++@@ -80,6 +80,14 @@ public:
+    RESOLUTION GetResolution();
+    void UpdateResolution();
+    void TriggerUpdateResolution(float fps, int width, int height, std::string &stereomode);
