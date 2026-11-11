@@ -135,6 +135,45 @@ int pi_engine_configure(struct pi_engine *e, const struct pi_options *o);
 /* "device, MMR mode, output path", for logs. */
 const char *pi_engine_describe(const struct pi_engine *e);
 
+/* The film's display-management metadata as the TV gets it: the stream's,
+ * or with CroqueMr's optional "CM v2.9 to CM v4.0" blocks appended and its
+ * L2 trims left out (planner/dm_cm4.c, after CB1's cb1_cmv40.c). Metadata
+ * only: no pixel changes. The blocks appended are L3, L9, L11 and L254,
+ * neutral (no L8: trims are never made up).
+ *   OFF     the default: the stream's
+ *   NO_L2   appended where the stream has no L2 trims
+ *   ALWAYS  appended, unless the stream is CM v4.0 already
+ *   AUTO    without L2 trims, or with a mastering peak within the trigger
+ *   AUTO2   without L2 trims, or with the picture's L1 maximum within the
+ *           TV's peak plus the headroom */
+enum pi_cm4_mode { PI_CM4_OFF = 0, PI_CM4_NO_L2 = 1, PI_CM4_ALWAYS = 2, PI_CM4_AUTO = 3, PI_CM4_AUTO2 = 4 };
+struct pi_dm_options {
+    enum pi_cm4_mode cm4;
+    unsigned cm4_trigger;         /* AUTO: 1000, 2000, 4000 or 10000 nits; 0: the TV's peak */
+    unsigned cm4_headroom;        /* AUTO2: percent, 0..50 */
+    int no_l2;                    /* the stream's L2 trims left out (the CM v4.0 decision still sees them) */
+    unsigned tv_peak;             /* the TV's peak in nits, 1..10000; 0: unknown */
+};
+/* From the next pi_render. o NULL: the defaults (the stream's metadata).
+ * PI_E_INVALID for a value out of range. */
+int pi_engine_set_dm(struct pi_engine *e, const struct pi_dm_options *o);
+
+enum pi_cm4_status {
+    PI_CM4_STATUS_OFF = 0,          /* mode OFF */
+    PI_CM4_STATUS_EXISTING = 1,     /* the stream is CM v4.0 already (L3, L8-L11 or L254) */
+    PI_CM4_STATUS_NOT_SELECTED = 2, /* the mode's rule says no */
+    PI_CM4_STATUS_NEEDS_TV = 3,     /* the rule needs the TV's peak, unknown */
+    PI_CM4_STATUS_APPENDED = 4,
+    PI_CM4_STATUS_INVALID = 5,      /* a payload the options can't be applied to: as the stream's */
+    PI_CM4_STATUS_REJECTED = 6,     /* the blocks wouldn't fit the payload: not appended */
+};
+struct pi_dm_status {
+    enum pi_cm4_status cm4;
+    unsigned l2_removed;          /* L2 blocks left out */
+};
+/* Of the last picture pi_render planned. */
+void pi_engine_dm_status(const struct pi_engine *e, struct pi_dm_status *s);
+
 struct pi_stream_info {
     uint32_t width, height;       /* the decoded pictures' (even) */
     int profile;                  /* the Dolby Vision profile (pi_chroma_top_left) */

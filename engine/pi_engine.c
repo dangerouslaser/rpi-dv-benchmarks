@@ -244,6 +244,8 @@ struct pi_engine {
         enum pi_filters filters;
         enum pi_el_upscale el_upscale;
     } pending;
+    uint32_t dm_options;   /* pi_engine_set_dm's, as dvvk_plan_in's */
+    uint32_t dm_status;    /* the last picture's dvvk_plan.dm_status */
     char device[256];   /* the Vulkan device's name */
     char *cache_path;
     char name[320];
@@ -1375,6 +1377,36 @@ int pi_engine_create(const struct pi_options *o, struct pi_engine **out)
 
 const char *pi_engine_describe(const struct pi_engine *e) { return e->name; }
 
+int pi_engine_set_dm(struct pi_engine *e, const struct pi_dm_options *o)
+{
+    static const unsigned triggers[] = {0, 1000, 2000, 4000, 10000};
+    if (!e)
+        return PI_E_INVALID;
+    if (!o) {
+        e->dm_options = 0;
+        return 0;
+    }
+    unsigned t = 0;
+    while (t < 5 && triggers[t] != o->cm4_trigger)
+        t++;
+    if ((unsigned)o->cm4 > PI_CM4_AUTO2 || t == 5 || o->cm4_headroom > 50 || o->tv_peak > 10000)
+        return PI_E_INVALID;
+    /* nothing asked for: 0, the stream's payload untouched */
+    e->dm_options = o->cm4 == PI_CM4_OFF && !o->no_l2
+                        ? 0
+                        : DVVK_DM_OPTIONS((unsigned)o->cm4, t, o->cm4_headroom, o->no_l2, o->tv_peak);
+    return 0;
+}
+
+_Static_assert(PI_CM4_AUTO2 == (int)DVVK_CM4_AUTO2 && PI_CM4_STATUS_REJECTED == (int)DVVK_CM4_STATUS_REJECTED,
+               "pi_engine.h's CM v4.0 codes are the planner's");
+
+void pi_engine_dm_status(const struct pi_engine *e, struct pi_dm_status *s)
+{
+    s->cm4 = (enum pi_cm4_status)(e->dm_status & 255u);
+    s->l2_removed = e->dm_status >> 8 & 255u;
+}
+
 /* ---- renders in flight ----------------------------------------------------------- */
 
 static int fd_signalled(int fd, int timeout);
@@ -1500,6 +1532,7 @@ int pi_stream_open(struct pi_engine *e, const struct pi_stream_info *info)
     for (int k = 0; k < PI_FRAMES_IN_FLIGHT; k++)
         e->c[k].tables_serial = 0;
     e->first = 1;
+    e->dm_status = 0;
     e->pm_found = 1;
     e->overlay_before = 0;
     e->profile_dv = info->profile;
@@ -3098,7 +3131,7 @@ int pi_render(struct pi_engine *e, const struct pi_frame *f, struct pi_output *o
                        .el_scaler = e->o.el_upscale == PI_EL_ANNEX_B ? 1u : 2u,
                        .fel = 1, .refresh = (uint32_t)e->first, .pts = f->pts_us, .white_nits = 203.0,
                        .cb1_contract = e->o.filters == PI_FILTERS_CB1, .overlay = ov != NULL,
-                       .overlay_visible_before = (uint32_t)e->overlay_before};
+                       .overlay_visible_before = (uint32_t)e->overlay_before, .dm_options = e->dm_options};
     overlay_rgb_to_lms(in.rgb_to_lms);
     dvvk_plan *p = e->plan;
     int st = dvvk_plan_frame_state_rpu(&in, NULL, e->state, dovi->data, dovi->size, rpu ? rpu->data : NULL,
@@ -3115,6 +3148,7 @@ int pi_render(struct pi_engine *e, const struct pi_frame *f, struct pi_output *o
         rc = st == -1 ? PI_E_BAD_RPU : PI_E_UNSUPPORTED_PLAN;
         goto out;
     }
+    e->dm_status = p->dm_status;
     struct route rt;
     if (!route_of(e, p, f->el != NULL, &rt)) {
         WARN_ONCE(e, W_PLAN, "plan outside this engine (route %u equal %u el filter %u pack %u)", p->route, p->equal,

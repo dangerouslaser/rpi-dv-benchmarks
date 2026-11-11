@@ -732,6 +732,8 @@ static void usage(void)
                     "               [--el-upscale bilinear|annexb|bicubic|lanczos]\n"
                     "               [--filters cb1|phase] [--mmr exact|split|exact64|float] [--device NAME]\n"
                     "               [--pipeline-cache FILE] [--throughput S] [--play S] [--hash] [--dump DIR] [--output-height H]\n"
+                    "               [--cm4 off|no-l2|always|auto|auto2] [--cm4-trigger source|1000|2000|4000|10000]\n"
+                    "               [--cm4-headroom PERCENT] [--tv-peak NITS] [--no-l2]\n"
                     "               [--overlay WxH [--overlay-bottom-up] [--overlay-top] [--overlay-panel] [--overlay-redraw] [--overlay-check]]\n"
                     "               [--json FILE] [--measure LIST] FILE\n"
                     "       dvbench --probe [--device NAME]\n");
@@ -1539,6 +1541,33 @@ static int selftest(struct pi_options base, struct dv_picture *pics, int count, 
         ok = render(&pics[0], 0, &o[0]) && !pi_output_wait(e, o[0].out);
     st_check(ok && out_hash(&o[0]) == want, "a new stream: imports again, the same output", 0);
 
+    /* pi_engine_set_dm: checked, applied from the next render, and undone by NULL */
+    int refused = 0;
+    refused += pi_engine_set_dm(e, &(struct pi_dm_options){.cm4 = (enum pi_cm4_mode)5}) == PI_E_INVALID;
+    refused += pi_engine_set_dm(e, &(struct pi_dm_options){.cm4 = PI_CM4_AUTO, .cm4_trigger = 3000}) == PI_E_INVALID;
+    refused += pi_engine_set_dm(e, &(struct pi_dm_options){.cm4 = PI_CM4_AUTO2, .cm4_headroom = 51}) == PI_E_INVALID;
+    refused += pi_engine_set_dm(e, &(struct pi_dm_options){.tv_peak = 10001}) == PI_E_INVALID;
+    st_check(refused == 4, "display-management options out of range: PI_E_INVALID", refused);
+    struct pi_dm_status ds = {0};
+    uint64_t with = 0;
+    ok = !pi_engine_set_dm(e, &(struct pi_dm_options){.cm4 = PI_CM4_ALWAYS});
+    for (int k = 0; k < 2 && ok; k++)   /* the second render: past the metadata's change */
+        ok = render(&pics[0], 0, &o[0]) && !pi_output_wait(e, o[0].out);
+    if (ok) {
+        pi_engine_dm_status(e, &ds);
+        with = out_hash(&o[0]);
+    }
+    st_check(ok && (ds.cm4 == PI_CM4_STATUS_APPENDED ? with != want
+                                                      : ds.cm4 == PI_CM4_STATUS_EXISTING && with == want),
+             "CM v4.0 always: blocks appended (another output), or the stream's own (the same)", (int)ds.cm4);
+    /* a new stream, for its packet ids: each change of the metadata advanced them */
+    ok = !pi_engine_set_dm(e, NULL) && !pi_stream_open(e, &si);
+    for (int k = 0; k < 2 && ok; k++)
+        ok = render(&pics[0], 0, &o[0]) && !pi_output_wait(e, o[0].out);
+    pi_engine_dm_status(e, &ds);
+    st_check(ok && ds.cm4 == PI_CM4_STATUS_OFF && out_hash(&o[0]) == want,
+             "display-management options off again: the stream's metadata, the same output", (int)ds.cm4);
+
     /* teardown with renders in flight and outputs still imported */
     for (int i = 0; i < 3 && i < count; i++)
         render(&pics[i], i * period, &o[i & 1]);
@@ -1589,6 +1618,8 @@ int main(int argc, char **argv)
     struct pi_options po;
     pi_options_default(&po);
     po.device = getenv("PI_DEVICE");
+    struct pi_dm_options dm = {.cm4_headroom = 20};
+    int dm_set = 0;
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i], *v = i + 1 < argc ? argv[i + 1] : NULL;
         int ok = 1, takes = v != NULL;
@@ -1690,6 +1721,37 @@ int main(int argc, char **argv)
                 ok = bad_value(a, v);
             i++;
         }
+        else if (!strcmp(a, "--cm4") && takes) {
+            static const char *const modes[] = {"off", "no-l2", "always", "auto", "auto2"};
+            unsigned m = 0;
+            while (m < 5 && strcmp(v, modes[m]))
+                m++;
+            if (m == 5)
+                ok = bad_value(a, v);
+            dm.cm4 = (enum pi_cm4_mode)m;
+            dm_set = 1;
+            i++;
+        } else if (!strcmp(a, "--cm4-trigger") && takes) {
+            int nits = 0;   /* "source": the TV's peak */
+            if (strcmp(v, "source")) {
+                ok = to_int(a, v, 1000, 10000, &nits);
+                if (ok && nits != 1000 && nits != 2000 && nits != 4000 && nits != 10000)
+                    ok = bad_value(a, v);
+            }
+            dm.cm4_trigger = (unsigned)nits;
+            i++;
+        } else if (!strcmp(a, "--cm4-headroom") && takes) {
+            int percent = 0;
+            ok = to_int(a, v, 0, 50, &percent);
+            dm.cm4_headroom = (unsigned)percent;
+            i++;
+        } else if (!strcmp(a, "--tv-peak") && takes) {
+            int nits = 0;
+            ok = to_int(a, v, 0, 10000, &nits);
+            dm.tv_peak = (unsigned)nits;
+            i++;
+        } else if (!strcmp(a, "--no-l2"))
+            dm.no_l2 = dm_set = 1;
         else if (!strcmp(a, "--json") && takes)
             json = argv[++i];
         else if (!strcmp(a, "--measure") && takes)
@@ -1793,6 +1855,10 @@ int main(int argc, char **argv)
         fprintf(stderr, "pi: engine didn't start: %s\n", pi_strerror(rc));
         return 1;
     }
+    if (dm_set && (rc = pi_engine_set_dm(g_pi, &dm))) {
+        fprintf(stderr, "pi: display-management options: %s\n", pi_strerror(rc));
+        return 1;
+    }
     struct pi_stream_info si = {.width = W, .height = H, .profile = g_profile};
     if ((rc = pi_stream_open(g_pi, &si))) {
         fprintf(stderr, "pi: stream %ux%u: %s\n", W, H, pi_strerror(rc));
@@ -1821,9 +1887,21 @@ int main(int argc, char **argv)
         return 1;
     int implicit_busy = 0, implicit_idle = 0, implicit_later = 0, gpu_later = 0;
     uint64_t *first_hash = calloc((size_t)count, sizeof(uint64_t));
+    struct pi_dm_status dm_last = {.cm4 = (enum pi_cm4_status)-1};
     for (int i = 0; i < count; i++) {
         double t0 = now_ms();
         int ok = render(&pics[i], i * period, &out[0]);
+        if (ok && dm_set) {   /* the CM v4.0 and L2 result, where it changes */
+            static const char *const names[] = {"off",          "in the stream already", "not selected",
+                                                "needs --tv-peak", "appended",           "not applicable to the payload",
+                                                "doesn't fit the payload"};
+            struct pi_dm_status ds;
+            pi_engine_dm_status(g_pi, &ds);
+            if (ds.cm4 != dm_last.cm4 || ds.l2_removed != dm_last.l2_removed)
+                printf("metadata %03d: CM v4.0 %s, %u L2 removed\n", i,
+                       (unsigned)ds.cm4 < 7 ? names[ds.cm4] : "?", ds.l2_removed);
+            dm_last = ds;
+        }
         if (ok && g_implicit) {   /* POLLOUT: every fence on the dmabuf (read and write) signalled */
             struct pollfd pf = {.fd = out[0].buf.fd, .events = POLLOUT};
             implicit_busy += poll(&pf, 1, 0) == 0;
