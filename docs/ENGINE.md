@@ -73,6 +73,7 @@ P2  w/2 × h/2   one fragment per 2×2 output block: 4:2:2 vertical filter,
 | `pi_probe(&options, &info)` | for a capability check: the device `pi_engine_create` would use, without creating an engine |
 | `pi_engine_create(&options, &e)` | once: device, MMR mode, filters, EL upscale, pipeline cache file, log callback |
 | `pi_engine_configure(e, &options)` | a change of MMR mode, filters or EL upscale (a player's settings), from the next `pi_stream_open` |
+| `pi_engine_set_dm(e, &options)` | optional (a player's settings): CM v4.0 metadata added to a CM v2.9 stream's, its L2 trims left out, from the next `pi_render`. `pi_engine_dm_status` gives what the last picture got. |
 | `pi_stream_open(e, &info)` | per stream: its size and profile. Resets the planner (packet ids, cached tables). |
 | `pi_output_import(e, fd, w, h, stride, size, &out)` | per scanout buffer the caller owns, of the stream's width and its height or taller (the picture centred); `pi_output_size()` gives the layout |
 | `pi_overlay_import(e, fd, w, h, stride, size, &ov)` | optional: per buffer the caller draws graphics into (subtitles, a GUI; ARGB8888, premultiplied sRGB), named by `frame.overlay` |
@@ -94,6 +95,21 @@ player.
   picture with CM v4.0 blocks and no RPU buffer is refused
   (`PI_E_UNSUPPORTED_PLAN`), unless its metadata repeats the last RPU's,
   as FFmpeg's does for an access unit without one.
+- **The metadata sent can differ from the stream's,** never the picture:
+  `pi_engine_set_dm` adds CroqueMr's "CM v2.9 to CM v4.0" blocks (neutral L3,
+  L9, L11 and L254; no L8, trims are never made up) to a stream without
+  CM v4.0 metadata, and leaves its L2 trims out (`planner/dm_cm4.c`, after
+  CB1's `cb1_cmv40.c`). The planner decides per picture, by the mode:
+  - `NO_L2`: a stream without L2 trims
+  - `ALWAYS`: every stream not CM v4.0 already
+  - `AUTO`: also a stream with L2 trims mastered within the trigger (1000,
+    2000, 4000 or 10000 nits, or the TV's peak)
+  - `AUTO2`: also while the picture's L1 maximum is within the TV's peak
+    plus a headroom (0 to 50%)
+
+  The rules that go by the TV's peak add nothing while it is unknown
+  (`PI_CM4_STATUS_NEEDS_TV`). A change of the metadata advances the packet
+  id, as a change in the stream's own does.
 - **Graphics over the picture (subtitles, a GUI) go into its signal,** not
   over the tunnel frame: the TV decodes every pixel of that frame as the
   packed 12-bit signal, so graphics blended over it at scanout come out in
@@ -294,6 +310,10 @@ nearest-neighbour): every sample of the tunnel frame, metadata included.
   el_out` with `PI_ABLATE=33`) is identical, sample for sample, to the
   planner's CPU reference (`pixel_spatial.c` `dv_annex_b_scale2x`) under
   both filter sets. The golden cases with `--el-upscale annexb` keep that.
+- **The CM v4.0 and L2 options** give CB1 Master Reference's frame with the
+  same options (its `cb1_cmv40`), byte for byte, metadata rows included:
+  every mode and the L2 removal, on FEL, MEL, Profile 8.1 and Profile 5
+  clips and one that is CM v4.0 already. Their golden cases keep that.
 - **The bicubic and Lanczos EL upscales** have no outside reference: each
   one's upscaled EL is identical to a separate C implementation of the
   filter under both filter sets, and their golden cases keep that.
@@ -457,6 +477,10 @@ clocks; don't rely on an overclock.
 - per picture: plan + render + finish
 - flat-out throughput
 - real-time playback at the stream's clock
+
+`--cm4 off|no-l2|always|auto|auto2`, `--cm4-trigger`, `--cm4-headroom`,
+`--tv-peak` and `--no-l2` set `pi_engine_set_dm`'s options (the names of
+yblod's `dvvk-bench`), and print the result wherever it changes.
 
 Extras: `PI_PROFILE=1` gives per-pass GPU times, and `PI_ABLATE=bits` (pack
 pass only, for measurement) stubs out its parts:

@@ -198,3 +198,23 @@ DV FEL Power Rangers Credits Test.mkv | --el-upscale lanczos --filters yblod --m
 DV FEL Power Rangers Credits Test.mkv | --el-upscale lanczos --filters yblod --measure no_quad | 003 | e9f5a6b5a0b2d07a
 DV FEL Power Rangers Credits Test.mkv | --el-upscale lanczos --filters yblod --measure no_quad | 004 | 577e815fda2ac4bd
 DV FEL Power Rangers Credits Test.mkv | --el-upscale lanczos --filters yblod --measure no_quad | 005 | a99c3241e12ac670
+# The CM v4.0 and L2 options (pi_engine_set_dm): each case verified identical to
+# CB1 Master Reference with the same options (its cb1_cmv40), byte for byte.
+DV FEL Power Rangers Credits Test.mkv | --el-upscale annexb --cm4 always | 000 | b0c8be98c223303f
+DV FEL Power Rangers Credits Test.mkv | --el-upscale annexb --cm4 always | 001 | d3e71c97b31b8568
+DV FEL Power Rangers Credits Test.mkv | --el-upscale annexb --cm4 always | 002 | a54a2ea41e92a43f
+DV FEL Power Rangers Credits Test.mkv | --el-upscale annexb --cm4 always | 003 | aa5627e54e0804e2
+DV FEL Power Rangers Credits Test.mkv | --el-upscale annexb --cm4 always | 004 | ec009a57937fe4d1
+DV FEL Power Rangers Credits Test.mkv | --el-upscale annexb --cm4 always | 005 | 14bd1a8f058cc968
+DV FEL Power Rangers Credits Test.mkv | --el-upscale annexb --no-l2 | 000 | 9d96f2366d0a0c3f
+DV FEL Power Rangers Credits Test.mkv | --el-upscale annexb --no-l2 | 001 | 357a806bda5c0a38
+DV FEL Power Rangers Credits Test.mkv | --el-upscale annexb --no-l2 | 002 | 2f35cc0bd05201bf
+DV FEL Power Rangers Credits Test.mkv | --el-upscale annexb --no-l2 | 003 | 4f1c6115bc43fc72
+DV FEL Power Rangers Credits Test.mkv | --el-upscale annexb --no-l2 | 004 | 2c18a733cfefbeb1
+DV FEL Power Rangers Credits Test.mkv | --el-upscale annexb --no-l2 | 005 | f7cfb493629adf78
+DV FEL Power Rangers Credits Test.mkv | --el-upscale annexb --cm4 always --no-l2 | 000 | 36aab4c8fcd97cbf
+DV FEL Power Rangers Credits Test.mkv | --el-upscale annexb --cm4 always --no-l2 | 001 | 6567855ebf89ee58
+DV FEL Power Rangers Credits Test.mkv | --el-upscale annexb --cm4 always --no-l2 | 002 | 7efdea975cae4f7f
+DV FEL Power Rangers Credits Test.mkv | --el-upscale annexb --cm4 always --no-l2 | 003 | b7fe1343977d4b52
+DV FEL Power Rangers Credits Test.mkv | --el-upscale annexb --cm4 always --no-l2 | 004 | de6428e9f1f84851
+DV FEL Power Rangers Credits Test.mkv | --el-upscale annexb --cm4 always --no-l2 | 005 | d49996d7a0614e38
