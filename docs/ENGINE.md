@@ -312,41 +312,43 @@ upscale, MMR `exact`. GPU time per picture (P0 + P1 + P2); 24p allows
 
 | Stream | Route | Per picture |
 |---|---|---|
-| 1917 (UHD BD, P7.6 FEL, MMR, 2.39:1) | dual | 29.1 ms (34 fps) |
-| Gladiator (UHD BD, P7 FEL, MMR, 2.40:1) | dual | 28.6 ms |
-| DV FEL test clips (MMR, 2.40:1) | dual | 27.8 ms |
-| the same, every row (`PI_ALL_ROWS=1`, as a full-height film) | dual | 38.0 ms |
-| Trainspotting (UHD BD, P7 FEL, polynomial chroma, full height) | dual | 23.2 ms |
-| DV FEL CMV4.0 test (polynomial chroma, dual track) | dual | 23.0 ms |
-| Gemini Man (UHD BD, P7 MEL, 1.85:1) | single | 17.4 ms |
-| The Matrix (UHD BD, P7 MEL, 2.40:1) | single | 13.8 ms |
-| Profile 8.1 MMR cut of 1917 | piecewise | 23.7 ms |
-| Sol Levante (Dolby's samples), Profiles 5 and 8.1 | single | 16.1 ms |
-| Sol Levante, Profile 8.4 (HLG base) | piecewise | 27.0–32.5 ms; 41.5 ms with `--filters phase` |
-| Sol Levante 1080p, Profiles 5 and 8.1 | single | 4.0 ms |
+| 1917 (UHD BD, P7.6 FEL, MMR, 2.39:1) | dual | 25.9 ms (39 fps) |
+| Gladiator (UHD BD, P7 FEL, MMR, 2.40:1) | dual | 25.8 ms |
+| DV FEL test clips (MMR, 2.40:1) | dual | 25.2 ms |
+| the same, every row (`PI_ALL_ROWS=1`, as a full-height film) | dual | 34.2 ms |
+| Trainspotting (UHD BD, P7 FEL, polynomial chroma, full height) | dual | 20.9 ms |
+| DV FEL CMV4.0 test (polynomial chroma, dual track) | dual | 20.6 ms |
+| Gemini Man (UHD BD, P7 MEL, 1.85:1, 60 fps) | single | 12.7 ms |
+| The Matrix (UHD BD, P7 MEL, 2.40:1) | single | 10.5 ms |
+| Profile 8.1 MMR cut of 1917 | piecewise | 20.8–23.1 ms |
+| Sol Levante (Dolby's samples), Profiles 5 and 8.1 | single | 12.9 ms |
+| the same with a 4:3 active area (L5 edited) | single | 10.4 ms |
+| Sol Levante, Profile 8.4 (HLG base) | piecewise | 23.9–27.6 ms; 49.1 ms with `--filters phase` |
+| Sol Levante 1080p, Profiles 5 and 8.1 | single | 3.3 ms |
 
 **The EL upscale's cost** (4K FEL, the same measure):
 
 | Clip | `bilinear` | `bicubic` | `annexb` | `lanczos` |
 |---|---|---|---|---|
-| DV FEL test clip, Power Rangers credits (MMR, 2.40:1) | 27.8 ms | 35.0 ms | 38.7 ms | 39.6 ms |
-| the same, every row | 38.0 ms | 46.5 ms | 49.3 ms | 50.6 ms |
-| Trainspotting (polynomial chroma, full height) | 23.2 ms | 29.1 ms | 33.8 ms | 34.7 ms |
-| DV FEL CMV4.0 test (polynomial chroma, dual track) | 23.0 ms | 28.9 ms | 33.5 ms | 34.4 ms |
+| DV FEL test clip, Power Rangers credits (MMR, 2.40:1) | 25.2 ms | 33.3 ms | 31.9 ms | 34.0 ms |
+| the same, every row | 34.2 ms | 41.2 ms | 42.5 ms | 46.2 ms |
+| Trainspotting (polynomial chroma, full height) | 20.9 ms | 26.9 ms | 29.2 ms | 31.8 ms |
+| DV FEL CMV4.0 test (polynomial chroma, dual track) | 20.6 ms | 26.6 ms | 28.6 ms | 31.3 ms |
 
-P0 leaves the sharper upscales' EL chroma 4.2–5.8 ms over bilinear's (P0 +
-P1 on the first clip: 19.4 ms bicubic, 19.7 ms Annex B, 21.0 ms Lanczos,
-against 15.2 ms bilinear); the rest is P2's EL luma, whose gathers already
-share the vertical filter's rows across each 2×2 block. A luma pre-pass of the same kind (P0L: the
-vertical filter at every EL column and output row, 1920 × 2160) measured
-slower for bicubic and Lanczos and at most 2.5 ms faster for Annex B: its
-4 M fragments cost about what P2's gathers save.
+P0 takes the sharper upscales' EL chroma vertical filter, and for Annex B P1
+also takes the EL luma's (its grid is the EL luma's: it writes each column's
+even and odd row as RG16UI), leaving P2 the horizontal 8-tap. Bicubic's
+vertical filter (two column pairs) and Lanczos-3's (a 6-tap, which costs P1
+about what it saves P2) stay in P2, whose gathers share the rows across each
+2×2 block. A luma pre-pass at every output row (P0L: 1920 × 2160 fragments)
+measured slower for bicubic and Lanczos.
 
 **An overlay's cost** (DV FEL Power Rangers credits, a two-line subtitle
 drawn at 1920×1080, one line over a translucent box: 2316 × 316 output
-pixels): P2 + PO 12.0 → 14.1 ms with the bilinear EL upscale, 18.9 →
-21.7 ms with Annex B. Of it: PO's render job 0.6 ms, its colour 0.35 ms,
-the composite in P2 1.1 ms. Nothing while no overlay is shown.
+pixels): 25.2 → 27.0 ms per picture with the bilinear EL upscale, 31.9 →
+33.3 ms with Annex B, nearly all of it P2's composite: skipping PO while the
+overlay is unchanged measured no difference. Nothing while no overlay is
+shown.
 
 Notes:
 - The HEVC decoder alone does 44–79 fps for BL and EL, over SMB.
