@@ -1,0 +1,138 @@
+From c4b55eadd6b3648de2e694a97816098be8bbfd21 Mon Sep 17 00:00:00 2001
+From: Bryan Hoban <bryan.hoban@gmail.com>
+Date: Wed, 11 Nov 2026 06:57:35 -0500
+Subject: [PATCH] [VideoPlayer] DRM PRIME: Dolby Vision for streams cropped to
+ the picture
+
+A stream encoded at the picture's size, such as 3840x2076 for a 1.85:1
+film, played in HDR10 instead: the tunnel frame was the stream's size,
+and no mode is. The tunnel frame is now 16:9 (3840x2160) for such a
+stream, the picture in its middle (libpi_engine 0.4.2 renders into an
+output taller than the stream), and the mode is checked against it.
+---
+ .../HwDecRender/DVTunnelDRMPRIME.cpp          | 23 +++++++++++++------
+ .../HwDecRender/DVTunnelDRMPRIME.h            |  9 ++++++++
+ .../HwDecRender/RendererDRMPRIME.cpp          | 14 +++++------
+ 3 files changed, 32 insertions(+), 14 deletions(-)
+
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.cpp
+index 92c68dc34..a21bea9a6 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.cpp
+@@ -249,9 +249,16 @@ std::unique_ptr<CDVTunnelDRMPRIME> CDVTunnelDRMPRIME::Create(const VideoPicture&
+     return nullptr;
+   }
+ 
++  // a stream cropped to the picture (3840x2076, say) goes out in a 16:9 frame: the tunnel
++  // frame is never scaled, and the TV needs the mode's size
++  const unsigned int width = picture.iWidth;
++  const unsigned int height = std::max<unsigned int>(picture.iHeight, (width * 9 / 16) & ~1u);
++  tunnel->m_outputWidth = width;
++  tunnel->m_outputHeight = height;
++
+   uint32_t stride;
+   uint64_t bytes;
+-  ret = pi_output_size(picture.iWidth, picture.iHeight, &stride, &bytes);
++  ret = pi_output_size(width, height, &stride, &bytes);
+   if (ret != PI_OK)
+     return nullptr;
+   bytes = (bytes + 4095) & ~static_cast<uint64_t>(4095);
+@@ -266,10 +273,8 @@ std::unique_ptr<CDVTunnelDRMPRIME> CDVTunnelDRMPRIME::Create(const VideoPicture&
+       return nullptr;
+     }
+ 
+-    auto output = std::make_unique<CDVTunnelOutput>(i, fd, picture.iWidth, picture.iHeight,
+-                                                    stride, bytes);
+-    ret = pi_output_import(tunnel->m_engine, fd, picture.iWidth, picture.iHeight, stride, bytes,
+-                           &output->m_output);
++    auto output = std::make_unique<CDVTunnelOutput>(i, fd, width, height, stride, bytes);
++    ret = pi_output_import(tunnel->m_engine, fd, width, height, stride, bytes, &output->m_output);
+     if (ret != PI_OK)
+     {
+       CLog::Log(LOGERROR, "CDVTunnelDRMPRIME: output import: {}", pi_strerror(ret));
+@@ -278,8 +283,12 @@ std::unique_ptr<CDVTunnelDRMPRIME> CDVTunnelDRMPRIME::Create(const VideoPicture&
+     tunnel->m_pool->Add(std::move(output));
+   }
+ 
+-  CLog::Log(LOGINFO, "CDVTunnelDRMPRIME: profile {} at {}x{}: {}", picture.doviProfile,
+-            picture.iWidth, picture.iHeight, pi_engine_describe(tunnel->m_engine));
++  CLog::Log(LOGINFO, "CDVTunnelDRMPRIME: profile {} at {}x{}{}: {}", picture.doviProfile,
++            picture.iWidth, picture.iHeight,
++            height != static_cast<unsigned int>(picture.iHeight)
++                ? StringUtils::Format(" in {}x{}", width, height)
++                : "",
++            pi_engine_describe(tunnel->m_engine));
+ 
+   return tunnel;
+ }
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.h b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.h
+index a50735325..5ee1f500f 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.h
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.h
+@@ -60,8 +60,15 @@ public:
+   void Flush();
+   const Options& GetOptions() const { return m_options; }
+ 
++  //! \brief The stream's size
+   unsigned int GetWidth() const { return m_info.width; }
+   unsigned int GetHeight() const { return m_info.height; }
++  /*!
++   * \brief The tunnel frame's size, the mode it needs: the stream's, or 16:9 for a stream
++   * cropped to the picture (3840x2076 in 3840x2160, the picture in the middle)
++   */
++  unsigned int GetOutputWidth() const { return m_outputWidth; }
++  unsigned int GetOutputHeight() const { return m_outputHeight; }
+ 
+   /*!
+    * \brief Renders the picture into a free output.
+@@ -98,6 +105,8 @@ private:
+ 
+   pi_engine* m_engine = nullptr;
+   pi_stream_info m_info{};
++  unsigned int m_outputWidth = 0;
++  unsigned int m_outputHeight = 0;
+   Options m_options;
+   std::string m_pipelineCache;
+   std::shared_ptr<CDVTunnelOutputPool> m_pool;
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIME.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIME.cpp
+index 12ced194d..9cfda236e 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIME.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIME.cpp
+@@ -347,19 +347,19 @@ bool CRendererDRMPRIME::RenderDolbyVision(CVideoBufferDRMPRIME* buffer)
+   if (!m_dolbyVision)
+     return false;
+ 
+-  // the tunnel frame is only decoded 1:1, in a mode of the stream's size
++  // the tunnel frame is only decoded 1:1, in a mode of its size
+   const RESOLUTION_INFO& info = CServiceBroker::GetWinSystem()->GetGfxContext().GetResInfo();
+-  if (static_cast<unsigned int>(info.iScreenWidth) != m_dolbyVision->GetWidth() ||
+-      static_cast<unsigned int>(info.iScreenHeight) != m_dolbyVision->GetHeight())
++  if (static_cast<unsigned int>(info.iScreenWidth) != m_dolbyVision->GetOutputWidth() ||
++      static_cast<unsigned int>(info.iScreenHeight) != m_dolbyVision->GetOutputHeight())
+   {
+     // a refresh rate switch may still be pending
+     if (++m_dolbyVisionMismatches < 100)
+       return true;
+ 
+     CLog::Log(LOGWARNING,
+-              "CRendererDRMPRIME: no Dolby Vision in a {}x{} mode for a {}x{} stream",
+-              info.iScreenWidth, info.iScreenHeight, m_dolbyVision->GetWidth(),
+-              m_dolbyVision->GetHeight());
++              "CRendererDRMPRIME: no Dolby Vision in a {}x{} mode for a {}x{} tunnel frame",
++              info.iScreenWidth, info.iScreenHeight, m_dolbyVision->GetOutputWidth(),
++              m_dolbyVision->GetOutputHeight());
+     ResetDolbyVisionOutput(buffer->GetPicture());
+     return false;
+   }
+@@ -373,7 +373,7 @@ bool CRendererDRMPRIME::RenderDolbyVision(CVideoBufferDRMPRIME* buffer)
+     m_videoLayerBridge->Configure(output);
+ 
+   m_videoLayerBridge->SetVideoPlane(
+-      output, CRect(0, 0, m_dolbyVision->GetWidth(), m_dolbyVision->GetHeight()), fence);
++      output, CRect(0, 0, m_dolbyVision->GetOutputWidth(), m_dolbyVision->GetOutputHeight()), fence);
+   output->Release();
+   return true;
+ #else
+-- 
+2.50.1 (Apple Git-155)
+
