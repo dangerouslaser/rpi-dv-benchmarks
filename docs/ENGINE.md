@@ -289,14 +289,15 @@ MMR is a 3-variable polynomial of up to 3rd order. Computed exactly it needs
 | `float` | 32-bit float | within 2 codes, about 0.001% of samples | 28.4 ms |
 
 **The `exact` bound.** Vulkan's add and multiply are correctly rounded, so
-the float value lies within 20 × 2⁻²⁴ × Σ|terms| of the exact one, with the
-feature powers computed exactly. About 4.6% of 1917's chroma samples fall
-inside that bound of a 12-bit step and take the exact path.
+the float value lies within 9 × 2⁻²⁴ × Σ|terms| of the exact one, with the
+feature powers computed exactly: each term is within 2 × 2⁻²⁴ of itself and
+passes through at most 5 adds, the 16 terms being summed as a balanced tree
+(`precise`, so the compiler keeps that order; a chain of 15 adds needed
+20 × 2⁻²⁴). Samples within the bound of a 12-bit step take the exact path.
 
-**`exact` or `split`** depends on the content: on the DV FEL test clips
-`exact` is 0.7 ms faster (1.0 ms with every row), on 1917 and the 8.1 MMR
-cut `split` by 0.6–0.7 ms, and on Sol Levante 8.4's later scenes, where
-more samples fall back, `split` by 4.6 ms (27.9 against 32.5 ms).
+**`exact` or `split`:** `exact` is faster on every clip measured, by
+1.0 ms on 1917, 1.7 ms on Gladiator and the 8.1 MMR cut of 1917, 1.1 ms on
+Sol Levante 8.4 and 3.0 ms on the DV FEL test clips.
 
 ## Performance
 

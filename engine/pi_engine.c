@@ -1950,7 +1950,7 @@ static void prepare(struct pi_engine *e, const dvvk_plan *p, int has_el)
         memcpy(q->narrow, p->narrow_mask, sizeof(q->narrow));
         q->pw[0] = p->sampling;
     }
-    q->err[0] = 20.0f / 16777216.0f;   /* mode 4: p1_chroma.frag mmr_float_bounded */
+    q->err[0] = 9.0f / 16777216.0f;   /* mode 4: p1_chroma.frag mmr_float_bounded */
     q->err[1] = 32.0f / 16777216.0f;   /* the split's guard: split_ok's bound per sample */
     q->pk[1] = p->mmr_params[0][1];
     q->pk[2] = p->mmr_params[1][1];

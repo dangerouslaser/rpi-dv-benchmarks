@@ -143,47 +143,50 @@ vec2 float_lut(uint t, uint i0, uint i1, bool both)
 }
 
 // One cross feature's powers of the float MMR: exact powers (mode 4) or
-// float floors (mode 0); adds the terms to v and their magnitudes to mag.
-void float_term(uvec2 fa, bool both, bool exact, vec2 c1, vec2 c2, vec2 c3, inout vec2 v, inout vec2 mag)
+// float floors (mode 0); returns their terms' sum, adds their magnitudes to
+// mag. The sums are a balanced tree and precise (no reassociation): the
+// bound in mmr_float_bounded counts each term's adds.
+vec2 float_term(uvec2 fa, bool both, bool exact, vec2 c1, vec2 c2, vec2 c3, inout vec2 mag)
 {
-    vec2 a = vec2(fa), t1 = c1 * a;
-    v += t1;
+    vec2 a = vec2(fa);
+    precise vec2 t1 = c1 * a;
     mag += abs(t1);
+    precise vec2 s = t1;
     if (ORDER > 1u) {
         vec2 b = exact ? vec2(both ? uvec2(fprod_split(fa.x, fa.x)) : uvec2(fprod_split(fa.x, fa.x), fprod_split(fa.y, fa.y)))
                        : floor(a * a * (1.0 / 1048576.0));
-        vec2 t2 = c2 * b;
-        v += t2;
+        precise vec2 t2 = c2 * b;
         mag += abs(t2);
         if (ORDER > 2u) {
             vec2 c = exact ? vec2(both ? uvec2(fprod_split(fa.x, uint(b.x)))
                                        : uvec2(fprod_split(fa.x, uint(b.x)), fprod_split(fa.y, uint(b.y))))
                            : floor(a * b * (1.0 / 1048576.0));
-            vec2 t3 = c3 * c;
-            v += t3;
+            precise vec2 t3 = c3 * c;
             mag += abs(t3);
-        }
+            s = t1 + (t2 + t3);
+        } else
+            s = t1 + t2;
     }
+    return s;
 }
 
 #define FLOAT_TERM(fa, K, EXACT) float_term(fa, both, EXACT, vec2(P.cf[0][K], P.cf[3][K]), \
-                                            vec2(P.cf[1][K], P.cf[4][K]), vec2(P.cf[2][K], P.cf[5][K]), v, mag)
+                                            vec2(P.cf[1][K], P.cf[4][K]), vec2(P.cf[2][K], P.cf[5][K]), mag)
 
 // The float MMR of both channels (Q16, unclamped), s0, s1 its inputs (both:
 // equal, a dual MMR); exact: the feature powers exact (mode 4), and mag the
-// sum of the terms' magnitudes.
+// sum of the terms' magnitudes. A term passes through at most 5 adds: 2 in
+// its feature's sum, then f01 / f23, their sum and the base's.
 vec2 mmr_float_mag(uvec3 s0, uvec3 s1, bool both, bool exact, out vec2 mag)
 {
     uint xy0 = s0.x * s0.y, xy1 = s1.x * s1.y;
-    vec2 v = P.cconst.xy;
-    mag = abs(v);
     vec2 l0 = float_lut(0u, s0.x, s1.x, both), l1 = float_lut(1u, s0.y, s1.y, both), l2 = float_lut(2u, s0.z, s1.z, both);
-    v += l0 + l1 + l2;
-    mag += abs(l0) + abs(l1) + abs(l2);
-    FLOAT_TERM(uvec2(xy0, xy1), 0, exact);
-    FLOAT_TERM(uvec2(s0.x * s0.z, s1.x * s1.z), 1, exact);
-    FLOAT_TERM(uvec2(s0.y * s0.z, s1.y * s1.z), 2, exact);
-    FLOAT_TERM(uvec2((xy0 * s0.z) >> 10, (xy1 * s1.z) >> 10), 3, exact);
+    mag = abs(P.cconst.xy) + abs(l0) + abs(l1) + abs(l2);
+    precise vec2 base = (P.cconst.xy + l0) + (l1 + l2);
+    precise vec2 f01 = FLOAT_TERM(uvec2(xy0, xy1), 0, exact) + FLOAT_TERM(uvec2(s0.x * s0.z, s1.x * s1.z), 1, exact);
+    precise vec2 f23 = FLOAT_TERM(uvec2(s0.y * s0.z, s1.y * s1.z), 2, exact) +
+                       FLOAT_TERM(uvec2((xy0 * s0.z) >> 10, (xy1 * s1.z) >> 10), 3, exact);
+    precise vec2 v = base + (f01 + f23);
     return v;
 }
 
@@ -371,10 +374,12 @@ uvec2 q16(vec2 v) { return uvec2(clamp(floor(v), vec2(0.0), vec2(65535.0))); }
 
 // Mode 4: the float MMR (Q16) with exact feature powers, and a bound on its
 // error. Vulkan's float add and multiply are correctly rounded: each term is
-// a product of a coefficient rounded once (on the CPU) and an exact feature,
-// summed with 16 terms (constant, 3 tables, 12 cross terms), so the sum is
-// within (2 + 15) x 2^-24 of the sum of the terms' magnitudes, to first order;
-// P.err.x carries 20 x 2^-24.
+// a product of a coefficient rounded once (on the CPU) and an exact feature
+// (or a table entry, rounded once), within 2 x 2^-24 of itself, and passes
+// through at most 5 adds of the balanced, precise sum of the 16 terms
+// (constant, 3 tables, 12 cross terms), so the sum is within (2 + 5) x 2^-24
+// of the sum of the terms' magnitudes, to first order; P.err.x carries
+// 9 x 2^-24.
 vec2 mmr_float_bounded(uvec3 s0, uvec3 s1, bool both, out vec2 bound)
 {
     vec2 mag, v = mmr_float_mag(s0, s1, both, true, mag);
