@@ -1,0 +1,658 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Bryan Hoban <bryan.hoban@gmail.com>
+Date: Tue, 10 Nov 2026 21:57:47 -0500
+Subject: [PATCH] [VideoPlayer] DRM PRIME: composite the GUI into the Dolby
+ Vision signal
+
+The sink decodes every pixel of the Dolby Vision tunnel's frame as its
+packed signal, so the GUI plane over it (the OSD, menus) came out green
+and magenta. While the tunnel is on, CWinSystemGbm::SetGuiCapture has
+the GUI rendered into a texture instead of the GUI plane, which stays
+transparent, and the renderer hands that texture to the engine as its
+overlay, subtitles included, under the OSD as on the GUI plane.
+
+The engine's cost follows the overlay's area, so it gets the areas of
+the controls that drew (CGUIWindowManager::GetRenderedRegions) grouped
+in bands of rows, up to PI_OVERLAY_RECTS (engine API 3): an OSD's top
+and bottom bars rather than the screen between them. During playback a
+change of the GUI waits for the next picture instead of rendering the
+one shown again, and the GUI is drawn at most 12 times a second.
+
+Signed-off-by: Bryan Hoban <bryan.hoban@gmail.com>
+---
+ xbmc/application/Application.cpp              |   8 ++
+ .../HwDecRender/DVTunnelDRMPRIME.cpp          |  74 ++++++++++--
+ .../HwDecRender/DVTunnelDRMPRIME.h            |  17 ++-
+ .../HwDecRender/RendererDRMPRIME.cpp          | 113 +++++++++++++++++-
+ .../HwDecRender/RendererDRMPRIME.h            |  13 ++
+ xbmc/guilib/GUIControl.cpp                    |   4 +
+ xbmc/guilib/GUIWindowManager.cpp              |  12 ++
+ xbmc/guilib/GUIWindowManager.h                |  14 +++
+ xbmc/windowing/WinSystem.h                    |   4 +
+ xbmc/windowing/gbm/WinSystemGbm.h             |  13 ++
+ .../windowing/gbm/WinSystemGbmGLESContext.cpp |  33 ++++-
+ xbmc/windowing/gbm/WinSystemGbmGLESContext.h  |   6 +
+ 12 files changed, 285 insertions(+), 26 deletions(-)
+
+diff --git a/xbmc/application/Application.cpp b/xbmc/application/Application.cpp
+index 531130ca7..5afd24c7b 100644
+--- a/xbmc/application/Application.cpp
++++ b/xbmc/application/Application.cpp
+@@ -1636,6 +1636,14 @@ void CApplication::FrameMove(bool processEvents, bool processGUI)
+     if (!m_skipGuiRender && appPlayer->IsRenderingVideoLayer() &&
+         !CServiceBroker::GetGUI()->GetWindowManager().HasDirtyRegions())
+       m_skipGuiRender = true;
++
++    // A GUI composited into each picture by the video's renderer is drawn on the GPU the video
++    // needs: during playback, draw it at most 12 times a second
++    using namespace std::chrono_literals;
++    if (!m_skipGuiRender && CServiceBroker::GetWinSystem()->IsGuiCaptured() &&
++        !appPlayer->IsPausedPlayback() &&
++        std::chrono::steady_clock::now() - m_lastRenderTime < 1000ms / 12)
++      m_skipGuiRender = true;
+     CServiceBroker::GetGUI()->GetWindowManager().FrameMove();
+   }
+ 
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.cpp
+index 4e15290d3..92c68dc34 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.cpp
+@@ -373,6 +373,9 @@ void CDVTunnelDRMPRIME::ReleaseOverlays()
+       close(overlay->busy);
+   }
+   m_overlays.clear();
++  if (m_readFramebuffer)
++    glDeleteFramebuffers(1, &m_readFramebuffer);
++  m_readFramebuffer = 0;
+   m_overlayWidth = m_overlayHeight = 0;
+   m_overlayShown = -1;
+   if (m_overlayFence >= 0)
+@@ -380,7 +383,7 @@ void CDVTunnelDRMPRIME::ReleaseOverlays()
+   m_overlayFence = -1;
+ }
+ 
+-bool CDVTunnelDRMPRIME::DrawOverlay(const std::function<CRect()>& draw)
++bool CDVTunnelDRMPRIME::DrawOverlay(const std::function<std::vector<CRect>()>& draw)
+ {
+   if (m_overlayFailed)
+     return false;
+@@ -424,18 +427,25 @@ bool CDVTunnelDRMPRIME::DrawOverlay(const std::function<CRect()>& draw)
+   glClear(GL_COLOR_BUFFER_BIT);
+   if (scissor)
+     glEnable(GL_SCISSOR_TEST);
+-  CRect area = draw();
++  const std::vector<CRect> drawn = draw();
+   glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+   glClearColor(clear[0], clear[1], clear[2], clear[3]);
+ 
+-  // filtered edges reach a pixel past the area
+-  if (!area.IsEmpty())
++  std::vector<CRect> areas;
++  for (const CRect& d : drawn)
+   {
+-    area = CRect(std::floor(area.x1) - 2, std::floor(area.y1) - 2, std::ceil(area.x2) + 2,
+-                 std::ceil(area.y2) + 2);
++    // filtered edges reach a pixel past the area
++    CRect area(std::floor(d.x1) - 2, std::floor(d.y1) - 2, std::ceil(d.x2) + 2,
++               std::ceil(d.y2) + 2);
+     area.Intersect(CRect(0, 0, static_cast<float>(width), static_cast<float>(height)));
++    if (area.IsEmpty())
++      continue;
++    if (areas.size() < PI_OVERLAY_RECTS)
++      areas.push_back(area);
++    else
++      areas.back().Union(area);
+   }
+-  if (area.IsEmpty())
++  if (areas.empty())
+   {
+     m_overlayChanged |= m_overlayShown >= 0;
+     m_overlayShown = -1;
+@@ -454,15 +464,54 @@ bool CDVTunnelDRMPRIME::DrawOverlay(const std::function<CRect()>& draw)
+     close(m_overlayFence);
+   m_overlayFence = fd;
+ 
+-  m_overlayRect[0] = static_cast<uint32_t>(area.x1);
+-  m_overlayRect[1] = static_cast<uint32_t>(area.y1);
+-  m_overlayRect[2] = static_cast<uint32_t>(area.x2);
+-  m_overlayRect[3] = static_cast<uint32_t>(area.y2);
++  for (size_t i = 0; i < PI_OVERLAY_RECTS; i++)
++  {
++    const CRect area = i < areas.size() ? areas[i] : CRect();
++    m_overlayRect[i][0] = static_cast<uint32_t>(area.x1);
++    m_overlayRect[i][1] = static_cast<uint32_t>(area.y1);
++    m_overlayRect[i][2] = static_cast<uint32_t>(area.x2);
++    m_overlayRect[i][3] = static_cast<uint32_t>(area.y2);
++  }
+   m_overlayShown = next;
+   m_overlayChanged = true;
+   return true;
+ }
+ 
++bool CDVTunnelDRMPRIME::DrawTexture(unsigned int texture, const std::vector<CRect>& areas)
++{
++  return DrawOverlay(
++      [this, texture, &areas]
++      {
++        std::vector<CRect> copied;
++        if (!m_readFramebuffer)
++          glGenFramebuffers(1, &m_readFramebuffer);
++        glBindFramebuffer(GL_READ_FRAMEBUFFER, m_readFramebuffer);
++        glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture,
++                               0);
++        const bool scissor = glIsEnabled(GL_SCISSOR_TEST);
++        glDisable(GL_SCISSOR_TEST);
++        for (const CRect& area : areas)
++        {
++          CRect copy(std::floor(area.x1), std::floor(area.y1), std::ceil(area.x2),
++                     std::ceil(area.y2));
++          copy.Intersect(CRect(0, 0, static_cast<float>(m_overlayWidth),
++                               static_cast<float>(m_overlayHeight)));
++          if (copy.IsEmpty())
++            continue;
++          // both hold GL's rows, bottom first
++          const auto x0 = static_cast<GLint>(copy.x1);
++          const auto x1 = static_cast<GLint>(copy.x2);
++          const auto y0 = static_cast<GLint>(m_overlayHeight - copy.y2);
++          const auto y1 = static_cast<GLint>(m_overlayHeight - copy.y1);
++          glBlitFramebuffer(x0, y0, x1, y1, x0, y0, x1, y1, GL_COLOR_BUFFER_BIT, GL_NEAREST);
++          copied.push_back(copy);
++        }
++        if (scissor)
++          glEnable(GL_SCISSOR_TEST);
++        return copied;
++      });
++}
++
+ bool CDVTunnelDRMPRIME::SetOptions(const Options& options)
+ {
+   if (options == m_options)
+@@ -531,7 +580,8 @@ CVideoBufferDRMPRIME* CDVTunnelDRMPRIME::Render(CVideoBufferDRMPRIME* buffer, in
+   if (m_overlayShown >= 0)
+   {
+     frame.overlay = m_overlays[m_overlayShown]->overlay;
+-    std::copy(std::begin(m_overlayRect), std::end(m_overlayRect), frame.overlay_rect);
++    std::copy(&m_overlayRect[0][0], &m_overlayRect[0][0] + 4 * PI_OVERLAY_RECTS,
++              &frame.overlay_rect[0][0]);
+     // GL's rows are bottom first
+     frame.overlay_bottom_up = 1;
+   }
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.h b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.h
+index a02cfd6d9..a50735325 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.h
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.h
+@@ -73,12 +73,21 @@ public:
+   /*!
+    * \brief Draws the graphics the next renders composite into the picture (subtitles), into an
+    * offscreen buffer of the GUI's size, with the GUI's GL context current.
+-   * \param draw Issues the GL calls, as into the GUI's framebuffer; returns the area drawn
++   * \param draw Issues the GL calls, as into the GUI's framebuffer; returns the areas drawn,
++   * up to PI_OVERLAY_RECTS (the renders' cost follows their area)
+    * \return False if there is no offscreen buffer: draw wasn't called
+    */
+-  bool DrawOverlay(const std::function<CRect()>& draw);
++  bool DrawOverlay(const std::function<std::vector<CRect>()>& draw);
++  /*!
++   * \brief Copies areas of a texture of the GUI's size (the GUI, CWinSystemGbm::SetGuiCapture)
++   * into the offscreen buffer the next renders composite, as DrawOverlay
++   * \param areas GUI pixels, rows top first, up to PI_OVERLAY_RECTS; none: nothing composited
++   */
++  bool DrawTexture(unsigned int texture, const std::vector<CRect>& areas);
+   //! \brief Whether the overlay changed since the last Render
+   bool OverlayChanged() const { return m_overlayChanged; }
++  //! \brief Whether the renders composite an overlay
++  bool HasOverlay() const { return m_overlayShown >= 0; }
+ 
+ private:
+   struct Overlay;
+@@ -101,8 +110,10 @@ private:
+   bool m_overlayFailed = false;
+   //! the overlay the renders composite, -1 none; its area, GUI pixels, rows top first
+   int m_overlayShown = -1;
+-  uint32_t m_overlayRect[4]{};
++  uint32_t m_overlayRect[PI_OVERLAY_RECTS][4]{};
+   //! the overlay's drawing, a sync_file
+   int m_overlayFence = -1;
+   bool m_overlayChanged = false;
++  //! reads DrawTexture's texture
++  unsigned int m_readFramebuffer = 0;
+ };
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIME.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIME.cpp
+index ff6cb3618..12ced194d 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIME.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIME.cpp
+@@ -27,15 +27,22 @@
+ #if defined(HAVE_PIDV)
+ #include "DVTunnelDRMPRIME.h"
+ #include "cores/VideoPlayer/VideoRenderers/OverlayRenderer.h"
++#include "guilib/GUIComponent.h"
++#include "guilib/GUIWindowManager.h"
+ #include "settings/SettingUtils.h"
+ #include "settings/lib/SettingDefinitions.h"
+ #endif
+ 
++#include <algorithm>
++#include <chrono>
++#include <vector>
++
+ using namespace KODI::WINDOWING::GBM;
+ 
+ CRendererDRMPRIME::~CRendererDRMPRIME()
+ {
+ #if defined(HAVE_PIDV)
++  SetGuiCapture(false);
+   m_dolbyVision.reset();
+ #endif
+   Flush(false);
+@@ -165,6 +172,38 @@ void CRendererDRMPRIME::SetHDROutput(const VideoPicture& picture)
+ #if defined(HAVE_PIDV)
+ namespace
+ {
++/*!
++ * \brief Areas in bands of rows that cover the regions: regions sharing rows, or nearly, are one
++ * area; beyond max areas, the two nearest are joined.
++ */
++std::vector<CRect> GroupRows(std::vector<CRect> regions, size_t max)
++{
++  std::erase_if(regions, [](const CRect& region) { return region.IsEmpty(); });
++  std::ranges::sort(regions, {}, &CRect::y1);
++  // regions this close in rows share the engine's margins anyway
++  constexpr float NEAR = 16.0f;
++  std::vector<CRect> areas;
++  for (const CRect& region : regions)
++  {
++    if (!areas.empty() && region.y1 <= areas.back().y2 + NEAR)
++      areas.back().Union(region);
++    else
++      areas.push_back(region);
++  }
++  while (areas.size() > max)
++  {
++    size_t nearest = 0;
++    for (size_t i = 1; i + 1 < areas.size(); i++)
++    {
++      if (areas[i + 1].y1 - areas[i].y2 < areas[nearest + 1].y1 - areas[nearest].y2)
++        nearest = i;
++    }
++    areas[nearest].Union(areas[nearest + 1]);
++    areas.erase(areas.begin() + nearest + 1);
++  }
++  return areas;
++}
++
+ CDVTunnelDRMPRIME::Options GetDolbyVisionOptions(const CVideoSettings& settings)
+ {
+   CDVTunnelDRMPRIME::Options options;
+@@ -250,6 +289,7 @@ bool CRendererDRMPRIME::SetDolbyVisionOutput(const VideoPicture& picture)
+ 
+   m_dolbyVisionMismatches = 0;
+   winSystem->SetGuiCompositing(false);
++  SetGuiCapture(true);
+   winSystem->SetHDR(nullptr);
+   // the bridge configures the plane and connector for the tunnel's frames
+   m_iLastRenderBuffer = -1;
+@@ -262,6 +302,7 @@ bool CRendererDRMPRIME::SetDolbyVisionOutput(const VideoPicture& picture)
+ void CRendererDRMPRIME::ResetDolbyVisionOutput(const VideoPicture& picture)
+ {
+ #if defined(HAVE_PIDV)
++  SetGuiCapture(false);
+   m_dolbyVision.reset();
+   static_cast<CWinSystemGbm*>(CServiceBroker::GetWinSystem())
+       ->SetDolbyVision(DolbyVisionOutput::OFF);
+@@ -438,17 +479,66 @@ void CRendererDRMPRIME::Update()
+   ManageRenderArea();
+ }
+ 
++void CRendererDRMPRIME::SetGuiCapture(bool capture)
++{
++#if defined(HAVE_PIDV)
++  if (capture == m_guiCapture)
++    return;
++
++  auto* winSystem = static_cast<CWinSystemGbm*>(CServiceBroker::GetWinSystem());
++  m_guiCapture = winSystem->SetGuiCapture(capture) && capture;
++  m_guiStale = true;
++  m_subtitleBounds = CRect();
++  // drawn again, into the texture or onto the GUI plane
++  if (CGUIComponent* gui = CServiceBroker::GetGUI())
++    gui->GetWindowManager().MarkDirty();
++#endif
++}
++
++void CRendererDRMPRIME::UpdateGuiOverlay()
++{
++#if defined(HAVE_PIDV)
++  if (!m_dolbyVision || !m_guiCapture)
++    return;
++
++  const CGUIWindowManager& windowManager = CServiceBroker::GetGUI()->GetWindowManager();
++  const unsigned int frames = windowManager.GetRenderedFrames();
++  if (frames == m_guiFrames && !m_guiStale)
++    return;
++
++  auto* winSystem = static_cast<CWinSystemGbm*>(CServiceBroker::GetWinSystem());
++  const unsigned int texture = winSystem->GetGuiCaptureTexture();
++  if (!texture)
++    return;
++
++  m_guiFrames = frames;
++  m_guiStale = false;
++  std::vector<CRect> regions = windowManager.GetRenderedRegions();
++  regions.push_back(m_subtitleBounds);
++  const std::vector<CRect> areas = GroupRows(std::move(regions), PI_OVERLAY_RECTS);
++  if (!areas.empty() || m_dolbyVision->HasOverlay())
++    m_dolbyVision->DrawTexture(texture, areas);
++#endif
++}
++
+ void CRendererDRMPRIME::RenderUpdate(
+     int index, int index2, bool clear, unsigned int flags, unsigned int alpha)
+ {
+   if (m_iLastRenderBuffer == index && m_videoLayerBridge)
+   {
+ #if defined(HAVE_PIDV)
+-    // the subtitles changed over the picture shown (paused)
+-    auto* shown = dynamic_cast<CVideoBufferDRMPRIME*>(m_buffers[index].videoBuffer);
+-    if (m_dolbyVision && m_dolbyVision->OverlayChanged() && shown && shown->IsValid() &&
+-        RenderDolbyVision(shown))
+-      return;
++    // A picture held (paused) is rendered again when the GUI or the subtitles over it change.
++    // During playback they wait for the next picture: rendering the one shown again too would
++    // render twice as many.
++    using namespace std::chrono_literals;
++    if (m_dolbyVision && std::chrono::steady_clock::now() - m_pictureTime > 100ms)
++    {
++      UpdateGuiOverlay();
++      auto* shown = dynamic_cast<CVideoBufferDRMPRIME*>(m_buffers[index].videoBuffer);
++      if (m_dolbyVision->OverlayChanged() && shown && shown->IsValid() &&
++          RenderDolbyVision(shown))
++        return;
++    }
+ #endif
+     m_videoLayerBridge->UpdateVideoPlane();
+     return;
+@@ -469,6 +559,10 @@ void CRendererDRMPRIME::RenderUpdate(
+     winSystem->RegisterVideoLayerBridge(m_videoLayerBridge);
+   }
+ 
++#if defined(HAVE_PIDV)
++  UpdateGuiOverlay();
++  m_pictureTime = std::chrono::steady_clock::now();
++#endif
+   if (!RenderDolbyVision(buffer))
+   {
+     if (m_iLastRenderBuffer == -1)
+@@ -484,12 +578,19 @@ bool CRendererDRMPRIME::RenderOverlays(OVERLAY::CRenderer& overlays, int index)
+ {
+ #if defined(HAVE_PIDV)
+   // composited into the tunnel's signal: over it, the sink would decode them as signal
++  if (m_dolbyVision && m_guiCapture)
++  {
++    // into the GUI, which the tunnel composites, under the OSD
++    overlays.Render(index);
++    m_subtitleBounds = overlays.GetRenderedBounds();
++    return true;
++  }
+   if (m_dolbyVision)
+     return m_dolbyVision->DrawOverlay(
+         [&overlays, index]
+         {
+           overlays.Render(index);
+-          return overlays.GetRenderedBounds();
++          return std::vector<CRect>{overlays.GetRenderedBounds()};
+         });
+ #endif
+   return false;
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIME.h b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIME.h
+index b3a0106b8..21a1edafa 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIME.h
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIME.h
+@@ -10,6 +10,7 @@
+ 
+ #include "cores/VideoPlayer/VideoRenderers/BaseRenderer.h"
+ 
++#include <chrono>
+ #include <memory>
+ 
+ class CDVTunnelDRMPRIME;
+@@ -59,6 +60,9 @@ private:
+   void ResetDolbyVisionOutput(const VideoPicture& picture);
+   void UpdateDolbyVisionOutput(const VideoPicture& picture);
+   bool RenderDolbyVision(CVideoBufferDRMPRIME* buffer);
++  void SetGuiCapture(bool capture);
++  //! \brief Hands the tunnel the GUI drawn since the last call, with the subtitles in it
++  void UpdateGuiOverlay();
+ 
+   bool m_bConfigured = false;
+   int m_iLastRenderBuffer = -1;
+@@ -71,6 +75,15 @@ private:
+ #if defined(HAVE_PIDV)
+   std::unique_ptr<CDVTunnelDRMPRIME> m_dolbyVision;
+   unsigned int m_dolbyVisionMismatches = 0;
++  //! the GUI is rendered into a texture the tunnel composites, not over its frames
++  bool m_guiCapture = false;
++  //! CGUIWindowManager::GetRenderedFrames when the tunnel was last handed the GUI
++  unsigned int m_guiFrames = 0;
++  bool m_guiStale = false;
++  //! the area of the subtitles drawn into the GUI, GUI pixels
++  CRect m_subtitleBounds;
++  //! when the picture shown was first rendered
++  std::chrono::steady_clock::time_point m_pictureTime;
+ #endif
+ 
+   struct BUFFER
+diff --git a/xbmc/guilib/GUIControl.cpp b/xbmc/guilib/GUIControl.cpp
+index 5f5fefab8..ab7278fec 100644
+--- a/xbmc/guilib/GUIControl.cpp
++++ b/xbmc/guilib/GUIControl.cpp
+@@ -21,6 +21,7 @@
+ #include "input/actions/ActionIDs.h"
+ #include "input/mouse/MouseEvent.h"
+ #include "input/mouse/MouseStat.h"
++#include "rendering/RenderSystem.h"
+ #include "utils/log.h"
+ #include "windowing/WinSystem.h"
+ 
+@@ -218,7 +219,10 @@ void CGUIControl::DoRender()
+       CGUITexture::DrawQuad(CServiceBroker::GetWinSystem()->GetGfxContext().GenerateAABB(m_hitRect), color);
+     }
+ 
++    const unsigned int elements = CRenderSystemBase::m_GUIElementCount;
+     Render();
++    if (!IsGroup() && CRenderSystemBase::m_GUIElementCount != elements)
++      CServiceBroker::GetGUI()->GetWindowManager().AddRenderedRegion(m_renderRegion);
+ 
+     GUIPROFILER_RENDER_END(this);
+ 
+diff --git a/xbmc/guilib/GUIWindowManager.cpp b/xbmc/guilib/GUIWindowManager.cpp
+index 137a7ddf9..1bedf1bc9 100644
+--- a/xbmc/guilib/GUIWindowManager.cpp
++++ b/xbmc/guilib/GUIWindowManager.cpp
+@@ -1445,6 +1445,8 @@ bool CGUIWindowManager::Render()
+   CDirtyRegionList dirtyRegions = m_tracker.GetDirtyRegions(bufferAge + 1);
+ 
+   bool hasRendered = false;
++  bool wholeViewport = true;
++  m_renderingRegions.clear();
+   // If we visualize the regions we will always render the entire viewport
+   // If the buffer age is zero, the current content is undefined and has to be rendered
+   if (visualizeDirtyRegions || bufferAge == 0 ||
+@@ -1478,6 +1480,7 @@ bool CGUIWindowManager::Render()
+       CServiceBroker::GetWinSystem()->GetGfxContext().SetScissors(i);
+       RenderPass();
+       hasRendered = true;
++      wholeViewport = false;
+     }
+     CServiceBroker::GetWinSystem()->GetGfxContext().ResetScissors();
+   }
+@@ -1493,6 +1496,15 @@ bool CGUIWindowManager::Render()
+   }
+ 
+   m_presentedFrame |= hasRendered;
++  if (hasRendered)
++  {
++    m_renderedFrames++;
++    // a frame drawn in parts keeps what it didn't draw
++    if (!wholeViewport)
++      m_renderingRegions.insert(m_renderingRegions.end(), m_renderedRegions.begin(),
++                                m_renderedRegions.end());
++    m_renderedRegions.swap(m_renderingRegions);
++  }
+   return hasRendered;
+ }
+ 
+diff --git a/xbmc/guilib/GUIWindowManager.h b/xbmc/guilib/GUIWindowManager.h
+index 4c5f70feb..8fbf1669b 100644
+--- a/xbmc/guilib/GUIWindowManager.h
++++ b/xbmc/guilib/GUIWindowManager.h
+@@ -114,6 +114,17 @@ public:
+    */
+   bool Render();
+ 
++  /*! \brief The number of times Render has drawn something, which changes whenever the frame
++   it draws into changes
++   */
++  unsigned int GetRenderedFrames() const { return m_renderedFrames; }
++
++  /*! \brief The areas of the controls the last frame Render drew drew into, in GUI pixels
++   */
++  const std::vector<CRect>& GetRenderedRegions() const { return m_renderedRegions; }
++  //! \brief Adds the area of a control that drew something to the frame's
++  void AddRenderedRegion(const CRect& region) { m_renderingRegions.push_back(region); }
++
+   void RenderEx() const;
+ 
+   /*! \brief Do any post render activities.
+@@ -307,4 +318,7 @@ private:
+   CDirtyRegionList m_dirtyregions;
+   CDirtyRegionTracker m_tracker;
+   bool m_presentedFrame{false};
++  unsigned int m_renderedFrames{0};
++  std::vector<CRect> m_renderingRegions;
++  std::vector<CRect> m_renderedRegions;
+ };
+diff --git a/xbmc/windowing/WinSystem.h b/xbmc/windowing/WinSystem.h
+index 477632da4..9186ff16c 100644
+--- a/xbmc/windowing/WinSystem.h
++++ b/xbmc/windowing/WinSystem.h
+@@ -281,6 +281,10 @@ public:
+   // alpha blend (see CGUIFontTTFGLES::FirstBegin).
+   virtual bool IsHdrComposite() const { return false; }
+ 
++  // True when the GUI is rendered into a texture a video renderer composites into each picture
++  // itself (CWinSystemGbm::SetGuiCapture), on the GPU the video needs
++  virtual bool IsGuiCaptured() const { return false; }
++
+   /*!
+    * \brief Gets debug info from video renderer for use in "Debug Info OSD" (Alt + O)
+    *
+diff --git a/xbmc/windowing/gbm/WinSystemGbm.h b/xbmc/windowing/gbm/WinSystemGbm.h
+index 39931d90a..4621803e6 100644
+--- a/xbmc/windowing/gbm/WinSystemGbm.h
++++ b/xbmc/windowing/gbm/WinSystemGbm.h
+@@ -89,6 +89,19 @@ public:
+   //! \brief The infoframe the sink's EDID suggests: Dolby's for a version 2 data block
+   DolbyVisionOutput GetDolbyVisionDefaultOutput() const;
+ 
++  /*!
++   * \brief Render the GUI into a texture and leave it out of the GUI plane, for a renderer
++   * that composites it into the video itself (the Dolby Vision tunnel: graphics over the
++   * tunnel's frame would be decoded as its signal)
++   * \return false if the GUI can't be rendered into a texture
++   */
++  virtual bool SetGuiCapture(bool capture) { return false; }
++  /*!
++   * \brief The texture the GUI is rendered into while captured, the GUI's size, 0 without one.
++   * It holds the GUI of the last frame CGUIWindowManager::Render drew.
++   */
++  virtual unsigned int GetGuiCaptureTexture() const { return 0; }
++
+   // holding the returned reference defers video plane teardown until it is released
+   std::shared_ptr<CVideoLayerBridge> GetVideoLayerBridge() const { return m_videoLayerBridge; }
+   void RegisterVideoLayerBridge(std::shared_ptr<CVideoLayerBridge> bridge)
+diff --git a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+index b3eb401fd..15910f55d 100644
+--- a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
++++ b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+@@ -220,18 +220,41 @@ bool CWinSystemGbmGLESContext::SetGuiCompositing(int colorTransfer)
+   }
+   else
+   {
+-    m_guiFbo.Cleanup();
+-    m_guiFboWidth = 0;
+-    m_guiFboHeight = 0;
++    if (!m_guiCapture)
++    {
++      m_guiFbo.Cleanup();
++      m_guiFboWidth = 0;
++      m_guiFboHeight = 0;
++    }
+     m_compositeShader.reset();
+   }
+ 
+   return m_guiCompositing;
+ }
+ 
++bool CWinSystemGbmGLESContext::SetGuiCapture(bool capture)
++{
++  if (capture == m_guiCapture)
++    return true;
++
++  if (capture)
++    SetGuiCompositing(0);
++  m_guiCapture = capture;
++  // the FBO's content is the GUI only from the next frame drawn into it
++  m_guiFbo.Cleanup();
++  m_guiFboWidth = 0;
++  m_guiFboHeight = 0;
++  return true;
++}
++
++unsigned int CWinSystemGbmGLESContext::GetGuiCaptureTexture() const
++{
++  return m_guiCapture && m_guiFbo.IsValid() ? m_guiFbo.Texture() : 0;
++}
++
+ bool CWinSystemGbmGLESContext::BeginGuiComposite(bool guiWillRender)
+ {
+-  if (!m_guiCompositing)
++  if (!m_guiCompositing && !m_guiCapture)
+     return false;
+ 
+   m_guiWillRender = guiWillRender;
+@@ -327,7 +350,7 @@ void CWinSystemGbmGLESContext::EndGuiComposite()
+ // the next frame's rendering sets its own state.
+ void CWinSystemGbmGLESContext::CompositeGui()
+ {
+-  if (!m_guiFbo.IsValid() || !m_guiFbo.IsBound() || !m_compositeShader)
++  if (m_guiCapture || !m_guiFbo.IsValid() || !m_guiFbo.IsBound() || !m_compositeShader)
+     return;
+ 
+   // Only update m_guiFboClean when GUI render fired this frame; otherwise the
+diff --git a/xbmc/windowing/gbm/WinSystemGbmGLESContext.h b/xbmc/windowing/gbm/WinSystemGbmGLESContext.h
+index 7c6a04f28..7de9c793b 100644
+--- a/xbmc/windowing/gbm/WinSystemGbmGLESContext.h
++++ b/xbmc/windowing/gbm/WinSystemGbmGLESContext.h
+@@ -49,6 +49,10 @@ public:
+   void CompositeGui() override;
+   bool IsHdrComposite() const override { return m_guiCompositing; }
+ 
++  bool SetGuiCapture(bool capture) override;
++  unsigned int GetGuiCaptureTexture() const override;
++  bool IsGuiCaptured() const override { return m_guiCapture; }
++
+ protected:
+   void SetVSyncImpl(bool enable) override {}
+   void PresentRenderImpl(bool rendered) override {};
+@@ -56,6 +60,8 @@ protected:
+ 
+ private:
+   bool m_guiCompositing{false};
++  // the GUI is rendered into m_guiFbo for a renderer, and not composited
++  bool m_guiCapture{false};
+   CFrameBufferObject m_guiFbo;
+   int m_guiFboWidth{0};
+   int m_guiFboHeight{0};
+-- 
+2.50.1 (Apple Git-155)
+
