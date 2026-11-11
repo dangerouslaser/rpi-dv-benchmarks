@@ -1,0 +1,135 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Bryan Hoban <bryan.hoban@gmail.com>
+Date: Tue, 10 Nov 2026 20:45:03 -0500
+Subject: [PATCH 12/12] RPi5: LibreELEC-settings: update from this repository's
+ releases
+
+The update menu reads the channels in releases.json on main, and the
+update check offers the newest build of the running build's channel
+instead of asking LibreELEC's update server.
+
+Signed-off-by: Bryan Hoban <bryan.hoban@gmail.com>
+---
+ ...rom-the-Raspberry-Pi-5-Dolby-Vision-.patch | 110 ++++++++++++++++++
+ 1 file changed, 110 insertions(+)
+ create mode 100644 projects/RPi/devices/RPi5/patches/LibreELEC-settings/0001-updates-Update-from-the-Raspberry-Pi-5-Dolby-Vision-.patch
+
+diff --git a/projects/RPi/devices/RPi5/patches/LibreELEC-settings/0001-updates-Update-from-the-Raspberry-Pi-5-Dolby-Vision-.patch b/projects/RPi/devices/RPi5/patches/LibreELEC-settings/0001-updates-Update-from-the-Raspberry-Pi-5-Dolby-Vision-.patch
+new file mode 100644
+index 0000000000..83b3e87d88
+--- /dev/null
++++ b/projects/RPi/devices/RPi5/patches/LibreELEC-settings/0001-updates-Update-from-the-Raspberry-Pi-5-Dolby-Vision-.patch
+@@ -0,0 +1,110 @@
++From cd551529c5a993fba39a64190bac6a10592ba458 Mon Sep 17 00:00:00 2001
++From: Bryan Hoban <bryan.hoban@gmail.com>
++Date: Tue, 10 Nov 2026 20:42:22 -0500
++Subject: [PATCH] updates: Update from the Raspberry Pi 5 Dolby Vision releases
++
++Read the channels from the releases.json of
++dangerouslaser/libreelec-rpi-dv instead of LibreELEC's, and don't ask
++LibreELEC's update server: it would offer an official build, which has
++no Dolby Vision. The update check instead offers the newest build of
++the channel that the running build belongs to.
++
++Signed-off-by: Bryan Hoban <bryan.hoban@gmail.com>
++---
++ resources/lib/defaults.py        |  4 ++-
++ resources/lib/modules/updates.py | 42 +++++++++++++++++++++++++++-----
++ 2 files changed, 39 insertions(+), 7 deletions(-)
++
++diff --git a/resources/lib/defaults.py b/resources/lib/defaults.py
++index f7b4bd1..48043b5 100644
++--- a/resources/lib/defaults.py
+++++ b/resources/lib/defaults.py
++@@ -96,8 +96,10 @@ system = {
++ 
++ updates = {
++     'ENABLED': not os.path.exists('/dev/.update_disabled'),
++-    'UPDATE_REQUEST_URL': 'https://update.libreelec.tv/updates.php',
+++    # no update server: updates come from the builds in RELEASES_URL
+++    'UPDATE_REQUEST_URL': None,
++     'UPDATE_DOWNLOAD_URL': 'http://%s.libreelec.tv/%s',
+++    'RELEASES_URL': 'https://raw.githubusercontent.com/dangerouslaser/libreelec-rpi-dv/main/releases.json',
++     'LOCAL_UPDATE_DIR': '/storage/.update/',
++     }
++ 
++diff --git a/resources/lib/modules/updates.py b/resources/lib/modules/updates.py
++index b1e1442..b217204 100644
++--- a/resources/lib/modules/updates.py
+++++ b/resources/lib/modules/updates.py
++@@ -28,6 +28,7 @@ class updates(modules.Module):
++     KERNEL_CMD = None
++     UPDATE_REQUEST_URL = None
++     UPDATE_DOWNLOAD_URL = None
+++    RELEASES_URL = None
++     LOCAL_UPDATE_DIR = None
++     menu = {'2': {
++         'name': 32005,
++@@ -444,6 +445,8 @@ class updates(modules.Module):
++     @log.log_function()
++     def get_json(self, url=None):
++         """Download and extract data from a releases.json file. Complete the URL if necessary."""
+++        if not url and self.RELEASES_URL:
+++            url = self.RELEASES_URL
++         if not url:
++             url = self.UPDATE_DOWNLOAD_URL % ('releases', 'releases.json')
++         if not url.startswith(('http://', 'https://', 'file://')):
++@@ -550,6 +553,9 @@ class updates(modules.Module):
++         if hasattr(self, 'update_in_progress'):
++             log.log('Update in progress (exit)', log.DEBUG)
++             return
+++        if not self.UPDATE_REQUEST_URL:
+++            self.check_releases(force)
+++            return
++         if self.struct['update']['settings']['SubmitStats']['value'] == '1':
++             systemid = oe.SYSTEMID
++         else:
++@@ -570,12 +576,36 @@ class updates(modules.Module):
++             self.last_update_check = time.time()
++             if 'update' in update_json['data'] and 'folder' in update_json['data']:
++                 self.update_file = self.UPDATE_DOWNLOAD_URL % (update_json['data']['folder'], update_json['data']['update'])
++-                if self.struct['update']['settings']['UpdateNotify']['value'] == '1':
++-                    # update available message
++-                    oe.notify(oe._(32363), oe._(32364))
++-                if self.struct['update']['settings']['AutoUpdate']['value'] == 'auto' and force == False:
++-                    self.update_in_progress = True
++-                    self.do_autoupdate(None, True)
+++                self.offer_update(force)
+++
+++    @log.log_function()
+++    def check_releases(self, force=False):
+++        """Offer the newest build of the channel that the running build belongs to."""
+++        update_json = self.build_json()
+++        if not update_json:
+++            return
+++        self.last_update_check = time.time()
+++        running = f'{oe.DISTRIBUTION}-{oe.ARCHITECTURE}-{oe.VERSION_ID}-{oe.VERSION}.tar'
+++        for channel in update_json.values():
+++            releases = channel.get('project', {}).get(oe.ARCHITECTURE, {}).get('releases', {})
+++            files = [releases[i]['file'] for i in sorted(releases, key=int, reverse=True) if 'file' in releases[i]]
+++            if running not in [file['name'] for file in files]:
+++                continue
+++            newest = files[0]
+++            if newest['name'] != running:
+++                subpath = f"{newest['subpath']}/" if newest.get('subpath') else ''
+++                self.update_file = f"{channel['url']}{subpath}{newest['name']}"
+++                self.offer_update(force)
+++            return
+++
+++    @log.log_function()
+++    def offer_update(self, force=False):
+++        if self.struct['update']['settings']['UpdateNotify']['value'] == '1':
+++            # update available message
+++            oe.notify(oe._(32363), oe._(32364))
+++        if self.struct['update']['settings']['AutoUpdate']['value'] == 'auto' and force == False:
+++            self.update_in_progress = True
+++            self.do_autoupdate(None, True)
++ 
++     @log.log_function()
++     def do_autoupdate(self, listItem=None, silent=False):
++-- 
++2.50.1 (Apple Git-155)
++
+-- 
+2.43.0
+

@@ -1,0 +1,388 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Bryan Hoban <bryan.hoban@gmail.com>
+Date: Tue, 10 Nov 2026 20:45:03 -0500
+Subject: [PATCH 11/12] RPi5: kodi: the Dolby Vision options as settings in
+ Player / Videos
+
+Signed-off-by: Bryan Hoban <bryan.hoban@gmail.com>
+---
+ ...lby-Vision-defaults-to-Player-Videos.patch | 367 ++++++++++++++++++
+ 1 file changed, 367 insertions(+)
+ create mode 100644 projects/RPi/devices/RPi5/patches/kodi/0047-settings-Add-Dolby-Vision-defaults-to-Player-Videos.patch
+
+diff --git a/projects/RPi/devices/RPi5/patches/kodi/0047-settings-Add-Dolby-Vision-defaults-to-Player-Videos.patch b/projects/RPi/devices/RPi5/patches/kodi/0047-settings-Add-Dolby-Vision-defaults-to-Player-Videos.patch
+new file mode 100644
+index 0000000000..6a6aaaabf4
+--- /dev/null
++++ b/projects/RPi/devices/RPi5/patches/kodi/0047-settings-Add-Dolby-Vision-defaults-to-Player-Videos.patch
+@@ -0,0 +1,367 @@
++From c50b969d2734ef0b4526bda780a7394626ae6c64 Mon Sep 17 00:00:00 2001
++From: Bryan Hoban <bryan.hoban@gmail.com>
++Date: Tue, 10 Nov 2026 20:34:59 -0500
++Subject: [PATCH] [settings] Add Dolby Vision defaults to Player / Videos
++
++The Dolby Vision options could only be set from the video settings
++dialog during playback, so they could not be found or set from Kodi's
++settings. Add a Dolby Vision group to Player / Videos with the
++enhancement layer, the infoframe and, at the Expert level, the
++enhancement layer upscale, the chroma MMR and the filters. Every video
++starts with them, and "Set as default for all media" in the video
++settings dialog stores its choices there.
++
++The video database does not store the Dolby Vision options, so a file
++with stored video settings now takes them, and the Dolby Vision output
++toggle, from the defaults rather than from CVideoSettings' own.
++
++Signed-off-by: Bryan Hoban <bryan.hoban@gmail.com>
++---
++ .../resources/strings.po                      | 32 +++++-
++ system/settings/settings.xml                  | 97 +++++++++++++++++++
++ .../application/ApplicationPlayerCallback.cpp |  3 +
++ xbmc/settings/MediaSettings.cpp               | 65 ++++++++-----
++ xbmc/settings/MediaSettings.h                 | 11 +++
++ xbmc/settings/Settings.cpp                    |  7 +-
++ xbmc/settings/Settings.h                      |  6 ++
++ xbmc/video/dialogs/GUIDialogVideoSettings.cpp |  1 +
++ 8 files changed, 198 insertions(+), 24 deletions(-)
++
++diff --git a/addons/resource.language.en_gb/resources/strings.po b/addons/resource.language.en_gb/resources/strings.po
++index 6b0e8e279..56f923b64 100644
++--- a/addons/resource.language.en_gb/resources/strings.po
+++++ b/addons/resource.language.en_gb/resources/strings.po
++@@ -23270,7 +23270,37 @@ msgctxt "#36658"
++ msgid "Dolby VSIF"
++ msgstr ""
++ 
++-#empty strings from id 36659 to 36898
+++#. Description of setting with label #36645 "Enhancement layer"
+++#: system/settings/settings.xml
+++msgctxt "#36659"
+++msgid "Render the enhancement layer of a Profile 7 video where its metadata needs it (full enhancement layer), or Off to show the base layer alone. Every video starts with this; the video settings during playback change it for that video."
+++msgstr ""
+++
+++#. Description of setting with label #36656 "Infoframe"
+++#: system/settings/settings.xml
+++msgctxt "#36660"
+++msgid "The infoframe that tells the display the signal is Dolby Vision. Auto chooses from the Dolby Vision version in the display's EDID. Try another if the display does not switch to Dolby Vision."
+++msgstr ""
+++
+++#. Description of setting with label #36646 "Enhancement layer upscale"
+++#: system/settings/settings.xml
+++msgctxt "#36661"
+++msgid "The filter that scales the enhancement layer up to the base layer's size. Bilinear is the default; the others are sharper but too slow for a 4K 24 fps enhancement layer on a Raspberry Pi 5."
+++msgstr ""
+++
+++#. Description of setting with label #36648 "Chroma MMR"
+++#: system/settings/settings.xml
+++msgctxt "#36662"
+++msgid "The arithmetic of the chroma reshaping (MMR). Exact, Split and Exact (64-bit) give the same picture at different speeds; Float is the fastest and can be off by up to 2 code values."
+++msgstr ""
+++
+++#. Description of setting with label #36653 "Filters"
+++#: system/settings/settings.xml
+++msgctxt "#36663"
+++msgid "The spatial filters of the reconstruction. CB1 matches the CB1 Master Reference. Phase adds chroma phase filters and is slower: Profile 8.1 with MMR chroma and Profile 8.4 may not play in real time."
+++msgstr ""
+++
+++#empty strings from id 36664 to 36898
++ 
++ #. Description of setting with label #729 "Enable SSL"
++ #: system/settings/settings.xml
++diff --git a/system/settings/settings.xml b/system/settings/settings.xml
++index 9b2215a07..339ff7240 100755
++--- a/system/settings/settings.xml
+++++ b/system/settings/settings.xml
++@@ -296,6 +296,103 @@
++           <control type="toggle" />
++         </setting>
++       </group>
+++      <group id="6" label="36643">
+++        <setting id="videoplayer.dolbyvisionel" type="integer" label="36645" help="36659">
+++          <requirement>HAVE_PIDV</requirement>
+++          <dependencies>
+++            <dependency type="visible">
+++              <condition on="property" name="supportsdolbyvision" />
+++            </dependency>
+++            <dependency type="enable" setting="videoplayer.allowedhdrformats" operator="contains">0</dependency>
+++          </dependencies>
+++          <level>1</level>
+++          <default>0</default>
+++          <constraints>
+++            <options>
+++              <option label="16316">0</option>
+++              <option label="16039">1</option>
+++            </options>
+++          </constraints>
+++          <control type="spinner" format="string" />
+++        </setting>
+++        <setting id="videoplayer.dolbyvisioninfoframe" type="integer" label="36656" help="36660">
+++          <requirement>HAVE_PIDV</requirement>
+++          <dependencies>
+++            <dependency type="visible">
+++              <condition on="property" name="supportsdolbyvision" />
+++            </dependency>
+++            <dependency type="enable" setting="videoplayer.allowedhdrformats" operator="contains">0</dependency>
+++          </dependencies>
+++          <level>1</level>
+++          <default>0</default>
+++          <constraints>
+++            <options>
+++              <option label="16316">0</option>
+++              <option label="36657">1</option>
+++              <option label="36658">2</option>
+++            </options>
+++          </constraints>
+++          <control type="spinner" format="string" />
+++        </setting>
+++        <setting id="videoplayer.dolbyvisionupscale" type="integer" label="36646" help="36661">
+++          <requirement>HAVE_PIDV</requirement>
+++          <dependencies>
+++            <dependency type="visible">
+++              <condition on="property" name="supportsdolbyvision" />
+++            </dependency>
+++            <dependency type="enable" setting="videoplayer.allowedhdrformats" operator="contains">0</dependency>
+++          </dependencies>
+++          <level>3</level>
+++          <default>0</default>
+++          <constraints>
+++            <options>
+++              <option label="16302">0</option>
+++              <option label="16321">2</option>
+++              <option label="16305">3</option>
+++              <option label="36647">1</option>
+++            </options>
+++          </constraints>
+++          <control type="spinner" format="string" />
+++        </setting>
+++        <setting id="videoplayer.dolbyvisionmmr" type="integer" label="36648" help="36662">
+++          <requirement>HAVE_PIDV</requirement>
+++          <dependencies>
+++            <dependency type="visible">
+++              <condition on="property" name="supportsdolbyvision" />
+++            </dependency>
+++            <dependency type="enable" setting="videoplayer.allowedhdrformats" operator="contains">0</dependency>
+++          </dependencies>
+++          <level>3</level>
+++          <default>0</default>
+++          <constraints>
+++            <options>
+++              <option label="36649">0</option>
+++              <option label="36650">1</option>
+++              <option label="36651">2</option>
+++              <option label="36652">3</option>
+++            </options>
+++          </constraints>
+++          <control type="spinner" format="string" />
+++        </setting>
+++        <setting id="videoplayer.dolbyvisionfilters" type="integer" label="36653" help="36663">
+++          <requirement>HAVE_PIDV</requirement>
+++          <dependencies>
+++            <dependency type="visible">
+++              <condition on="property" name="supportsdolbyvision" />
+++            </dependency>
+++            <dependency type="enable" setting="videoplayer.allowedhdrformats" operator="contains">0</dependency>
+++          </dependencies>
+++          <level>3</level>
+++          <default>0</default>
+++          <constraints>
+++            <options>
+++              <option label="36654">0</option>
+++              <option label="36655">1</option>
+++            </options>
+++          </constraints>
+++          <control type="spinner" format="string" />
+++        </setting>
+++      </group>
++       <group id="4" label="14232">
++         <setting id="videoplayer.stereoscopicplaybackmode" type="integer" label="36520" help="36537">
++           <level>2</level>
++diff --git a/xbmc/application/ApplicationPlayerCallback.cpp b/xbmc/application/ApplicationPlayerCallback.cpp
++index d4ff73f20..28fcc7dba 100644
++--- a/xbmc/application/ApplicationPlayerCallback.cpp
+++++ b/xbmc/application/ApplicationPlayerCallback.cpp
++@@ -517,6 +517,9 @@ void CApplicationPlayerCallback::RequestVideoSettings(const CFileItem& fileItem)
++     CVideoSettings vs;
++     if (!dbs.GetVideoSettings(fileItem, vs))
++       vs = CMediaSettings::GetInstance().GetDefaultVideoSettings();
+++    else // the Dolby Vision options are not stored per file
+++      vs.m_DolbyVision = CMediaSettings::GetInstance().GetDefaultVideoSettings().m_DolbyVision;
+++    CMediaSettings::GetDolbyVisionSettings(vs);
++ 
++     auto& components = CServiceBroker::GetAppComponents();
++     const auto appPlayer = components.GetComponent<CApplicationPlayer>();
++diff --git a/xbmc/settings/MediaSettings.cpp b/xbmc/settings/MediaSettings.cpp
++index c6768e8ef..336f2d5c8 100644
++--- a/xbmc/settings/MediaSettings.cpp
+++++ b/xbmc/settings/MediaSettings.cpp
++@@ -21,6 +21,7 @@
++ #include "resources/LocalizeStrings.h"
++ #include "resources/ResourcesComponent.h"
++ #include "settings/Settings.h"
+++#include "settings/SettingsComponent.h"
++ #include "settings/dialogs/GUIDialogLibExportSettings.h"
++ #include "settings/lib/Setting.h"
++ #include "storage/MediaManager.h"
++@@ -111,22 +112,6 @@ bool CMediaSettings::Load(const TiXmlNode *settings)
++       m_defaultVideoSettings.m_ToneMapParam = 1.0f;
++ 
++     XMLUtils::GetBoolean(pElement, "dolbyvision", m_defaultVideoSettings.m_DolbyVision);
++-    int value;
++-    if (XMLUtils::GetInt(pElement, "dolbyvisionel", value, VS_DOLBYVISION_EL_AUTO,
++-                         VS_DOLBYVISION_EL_OFF))
++-      m_defaultVideoSettings.m_DolbyVisionEL = static_cast<EDOLBYVISIONEL>(value);
++-    if (XMLUtils::GetInt(pElement, "dolbyvisionupscale", value, VS_DOLBYVISION_UPSCALE_BILINEAR,
++-                         VS_DOLBYVISION_UPSCALE_LANCZOS))
++-      m_defaultVideoSettings.m_DolbyVisionUpscale = static_cast<EDOLBYVISIONUPSCALE>(value);
++-    if (XMLUtils::GetInt(pElement, "dolbyvisionmmr", value, VS_DOLBYVISION_MMR_EXACT,
++-                         VS_DOLBYVISION_MMR_FLOAT))
++-      m_defaultVideoSettings.m_DolbyVisionMMR = static_cast<EDOLBYVISIONMMR>(value);
++-    if (XMLUtils::GetInt(pElement, "dolbyvisionfilters", value, VS_DOLBYVISION_FILTERS_CB1,
++-                         VS_DOLBYVISION_FILTERS_PHASE))
++-      m_defaultVideoSettings.m_DolbyVisionFilters = static_cast<EDOLBYVISIONFILTERS>(value);
++-    if (XMLUtils::GetInt(pElement, "dolbyvisioninfoframe", value, VS_DOLBYVISION_INFOFRAME_AUTO,
++-                         VS_DOLBYVISION_INFOFRAME_DOLBY))
++-      m_defaultVideoSettings.m_DolbyVisionInfoframe = static_cast<EDOLBYVISIONINFOFRAME>(value);
++   }
++ 
++   m_defaultGameSettings.Reset();
++@@ -243,11 +228,6 @@ bool CMediaSettings::Save(TiXmlNode *settings) const
++   XMLUtils::SetInt(pNode, "tonemapmethod", m_defaultVideoSettings.m_ToneMapMethod);
++   XMLUtils::SetFloat(pNode, "tonemapparam", m_defaultVideoSettings.m_ToneMapParam);
++   XMLUtils::SetBoolean(pNode, "dolbyvision", m_defaultVideoSettings.m_DolbyVision);
++-  XMLUtils::SetInt(pNode, "dolbyvisionel", m_defaultVideoSettings.m_DolbyVisionEL);
++-  XMLUtils::SetInt(pNode, "dolbyvisionupscale", m_defaultVideoSettings.m_DolbyVisionUpscale);
++-  XMLUtils::SetInt(pNode, "dolbyvisionmmr", m_defaultVideoSettings.m_DolbyVisionMMR);
++-  XMLUtils::SetInt(pNode, "dolbyvisionfilters", m_defaultVideoSettings.m_DolbyVisionFilters);
++-  XMLUtils::SetInt(pNode, "dolbyvisioninfoframe", m_defaultVideoSettings.m_DolbyVisionInfoframe);
++ 
++   // default audio settings for dsp addons
++   TiXmlElement audioSettingsNode("defaultaudiosettings");
++@@ -395,8 +375,49 @@ void CMediaSettings::OnSettingChanged(const std::shared_ptr<const CSetting>& set
++   if (!setting)
++     return;
++ 
++-  if (setting->GetId() == CSettings::SETTING_VIDEOLIBRARY_SHOWUNWATCHEDPLOTS)
+++  const std::string& settingId = setting->GetId();
+++  if (settingId == CSettings::SETTING_VIDEOLIBRARY_SHOWUNWATCHEDPLOTS)
++     CServiceBroker::GetAnnouncementManager()->Announce(ANNOUNCEMENT::VideoLibrary, "OnRefresh");
+++  else if (settingId == CSettings::SETTING_VIDEOPLAYER_DOLBYVISIONEL ||
+++           settingId == CSettings::SETTING_VIDEOPLAYER_DOLBYVISIONINFOFRAME ||
+++           settingId == CSettings::SETTING_VIDEOPLAYER_DOLBYVISIONUPSCALE ||
+++           settingId == CSettings::SETTING_VIDEOPLAYER_DOLBYVISIONMMR ||
+++           settingId == CSettings::SETTING_VIDEOPLAYER_DOLBYVISIONFILTERS)
+++    GetDolbyVisionSettings(m_defaultVideoSettings);
+++}
+++
+++void CMediaSettings::OnSettingsLoaded()
+++{
+++  GetDolbyVisionSettings(m_defaultVideoSettings);
+++}
+++
+++void CMediaSettings::GetDolbyVisionSettings(CVideoSettings& settings)
+++{
+++#if defined(HAVE_PIDV)
+++  const auto s = CServiceBroker::GetSettingsComponent()->GetSettings();
+++  settings.m_DolbyVisionEL =
+++      static_cast<EDOLBYVISIONEL>(s->GetInt(CSettings::SETTING_VIDEOPLAYER_DOLBYVISIONEL));
+++  settings.m_DolbyVisionInfoframe = static_cast<EDOLBYVISIONINFOFRAME>(
+++      s->GetInt(CSettings::SETTING_VIDEOPLAYER_DOLBYVISIONINFOFRAME));
+++  settings.m_DolbyVisionUpscale = static_cast<EDOLBYVISIONUPSCALE>(
+++      s->GetInt(CSettings::SETTING_VIDEOPLAYER_DOLBYVISIONUPSCALE));
+++  settings.m_DolbyVisionMMR =
+++      static_cast<EDOLBYVISIONMMR>(s->GetInt(CSettings::SETTING_VIDEOPLAYER_DOLBYVISIONMMR));
+++  settings.m_DolbyVisionFilters = static_cast<EDOLBYVISIONFILTERS>(
+++      s->GetInt(CSettings::SETTING_VIDEOPLAYER_DOLBYVISIONFILTERS));
+++#endif
+++}
+++
+++void CMediaSettings::SetDolbyVisionSettings(const CVideoSettings& settings)
+++{
+++#if defined(HAVE_PIDV)
+++  const auto s = CServiceBroker::GetSettingsComponent()->GetSettings();
+++  s->SetInt(CSettings::SETTING_VIDEOPLAYER_DOLBYVISIONEL, settings.m_DolbyVisionEL);
+++  s->SetInt(CSettings::SETTING_VIDEOPLAYER_DOLBYVISIONINFOFRAME, settings.m_DolbyVisionInfoframe);
+++  s->SetInt(CSettings::SETTING_VIDEOPLAYER_DOLBYVISIONUPSCALE, settings.m_DolbyVisionUpscale);
+++  s->SetInt(CSettings::SETTING_VIDEOPLAYER_DOLBYVISIONMMR, settings.m_DolbyVisionMMR);
+++  s->SetInt(CSettings::SETTING_VIDEOPLAYER_DOLBYVISIONFILTERS, settings.m_DolbyVisionFilters);
+++#endif
++ }
++ 
++ WatchedMode CMediaSettings::GetWatchedMode(const std::string& content) const
++diff --git a/xbmc/settings/MediaSettings.h b/xbmc/settings/MediaSettings.h
++index 65f8f6639..ea486c67a 100644
++--- a/xbmc/settings/MediaSettings.h
+++++ b/xbmc/settings/MediaSettings.h
++@@ -42,9 +42,20 @@ public:
++   bool Load(const TiXmlNode *settings) override;
++   bool Save(TiXmlNode *settings) const override;
++ 
+++  void OnSettingsLoaded() override;
+++
++   void OnSettingAction(const std::shared_ptr<const CSetting>& setting) override;
++   void OnSettingChanged(const std::shared_ptr<const CSetting>& setting) override;
++ 
+++  /*! \brief Set the Dolby Vision options of video settings from the settings in
+++   Player / Videos, which every video starts with
+++   */
+++  static void GetDolbyVisionSettings(CVideoSettings& settings);
+++  /*! \brief Store the Dolby Vision options of video settings as the settings in
+++   Player / Videos
+++   */
+++  static void SetDolbyVisionSettings(const CVideoSettings& settings);
+++
++   const CVideoSettings& GetDefaultVideoSettings() const { return m_defaultVideoSettings; }
++   CVideoSettings& GetDefaultVideoSettings() { return m_defaultVideoSettings; }
++ 
++diff --git a/xbmc/settings/Settings.cpp b/xbmc/settings/Settings.cpp
++index d26cd00c0..a9763e186 100644
++--- a/xbmc/settings/Settings.cpp
+++++ b/xbmc/settings/Settings.cpp
++@@ -591,7 +591,12 @@ void CSettings::InitializeISettingCallbacks()
++        CSettings::SETTING_VIDEOLIBRARY_GROUPMOVIESETS, CSettings::SETTING_VIDEOLIBRARY_CLEANUP,
++        CSettings::SETTING_VIDEOLIBRARY_IMPORT, CSettings::SETTING_VIDEOLIBRARY_EXPORT,
++        CSettings::SETTING_VIDEOLIBRARY_SHOWUNWATCHEDPLOTS,
++-       CSettings::SETTING_MAINTENANCE_CLEANIMAGECACHE});
+++       CSettings::SETTING_MAINTENANCE_CLEANIMAGECACHE,
+++       CSettings::SETTING_VIDEOPLAYER_DOLBYVISIONEL,
+++       CSettings::SETTING_VIDEOPLAYER_DOLBYVISIONINFOFRAME,
+++       CSettings::SETTING_VIDEOPLAYER_DOLBYVISIONUPSCALE,
+++       CSettings::SETTING_VIDEOPLAYER_DOLBYVISIONMMR,
+++       CSettings::SETTING_VIDEOPLAYER_DOLBYVISIONFILTERS});
++ 
++   GetSettingsManager()->RegisterCallback(
++       &CDisplaySettings::GetInstance(),
++diff --git a/xbmc/settings/Settings.h b/xbmc/settings/Settings.h
++index 44d55d70c..d7708bb1b 100644
++--- a/xbmc/settings/Settings.h
+++++ b/xbmc/settings/Settings.h
++@@ -145,6 +145,12 @@ public:
++   static constexpr auto SETTING_VIDEOPLAYER_CONVERTDOVI = "videoplayer.convertdovi";
++   static constexpr auto SETTING_VIDEOPLAYER_ALLOWEDHDRFORMATS = "videoplayer.allowedhdrformats";
++   static constexpr auto SETTING_VIDEOPLAYER_DOVIZEROLEVEL5 = "videoplayer.dovizerolevel5";
+++  static constexpr auto SETTING_VIDEOPLAYER_DOLBYVISIONEL = "videoplayer.dolbyvisionel";
+++  static constexpr auto SETTING_VIDEOPLAYER_DOLBYVISIONINFOFRAME =
+++      "videoplayer.dolbyvisioninfoframe";
+++  static constexpr auto SETTING_VIDEOPLAYER_DOLBYVISIONUPSCALE = "videoplayer.dolbyvisionupscale";
+++  static constexpr auto SETTING_VIDEOPLAYER_DOLBYVISIONMMR = "videoplayer.dolbyvisionmmr";
+++  static constexpr auto SETTING_VIDEOPLAYER_DOLBYVISIONFILTERS = "videoplayer.dolbyvisionfilters";
++   static constexpr auto SETTING_VIDEOPLAYER_FILESTREAMDISPLAYORDER =
++       "videoplayer.filestreamdisplayorder";
++   static constexpr auto SETTING_VIDEOPLAYER_QUEUETIMESIZE = "videoplayer.queuetimesize";
++diff --git a/xbmc/video/dialogs/GUIDialogVideoSettings.cpp b/xbmc/video/dialogs/GUIDialogVideoSettings.cpp
++index d635a795b..0c274026b 100644
++--- a/xbmc/video/dialogs/GUIDialogVideoSettings.cpp
+++++ b/xbmc/video/dialogs/GUIDialogVideoSettings.cpp
++@@ -305,6 +305,7 @@ bool CGUIDialogVideoSettings::Save()
++     CMediaSettings::GetInstance().GetDefaultVideoSettings() = appPlayer->GetVideoSettings();
++     CMediaSettings::GetInstance().GetDefaultVideoSettings().m_SubtitleStream = -1;
++     CMediaSettings::GetInstance().GetDefaultVideoSettings().m_AudioStream = -1;
+++    CMediaSettings::SetDolbyVisionSettings(appPlayer->GetVideoSettings());
++     CServiceBroker::GetSettingsComponent()->GetSettings()->Save();
++   }
++ 
++-- 
++2.50.1 (Apple Git-155)
++
+-- 
+2.43.0
+
