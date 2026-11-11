@@ -1,0 +1,32 @@
+From 86218483351d2939380316d21b6556471d712ab7 Mon Sep 17 00:00:00 2001
+From: dangerouslaser <bryan.hoban@gmail.com>
+Date: Wed, 11 Nov 2026 05:45:45 -0500
+Subject: [PATCH] pi-dv-engine: update to 0.4.1
+
+Faster, with the same output and API (libpi_engine.so.3): about 10%
+for 4K FEL, 20-28% for single-layer and MEL, more for pillarboxed
+pictures and the Annex B upscale.
+
+Signed-off-by: dangerouslaser <bryan.hoban@gmail.com>
+---
+ packages/multimedia/pi-dv-engine/package.mk | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/packages/multimedia/pi-dv-engine/package.mk b/packages/multimedia/pi-dv-engine/package.mk
+index aa3b3349cd..e41f23e49f 100644
+--- a/packages/multimedia/pi-dv-engine/package.mk
++++ b/packages/multimedia/pi-dv-engine/package.mk
+@@ -2,8 +2,8 @@
+ # Copyright (C) 2026-present Team LibreELEC (https://libreelec.tv)
+ 
+ PKG_NAME="pi-dv-engine"
+-PKG_VERSION="0.4.0"
+-PKG_SHA256="2f8629abf76500f3e924ca1cc030b8724df969f60260727250fcb8591024467a"
++PKG_VERSION="0.4.1"
++PKG_SHA256="02c61aad79f7c9378b73bebb61f11e8fa9c8a404aeb432fb49e1808793b7e6e6"
+ PKG_LICENSE="GPL-2.0-or-later"
+ PKG_SITE="https://github.com/dangerouslaser/libreelec-rpi-dv"
+ PKG_URL="https://github.com/dangerouslaser/libreelec-rpi-dv/releases/download/engine-${PKG_VERSION}/${PKG_NAME}-${PKG_VERSION}.tar.xz"
+-- 
+2.43.0
+

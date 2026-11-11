@@ -21,6 +21,7 @@ with `git am`.
 | `0012` RPi5: LibreELEC-settings: update from this repository's releases | `projects/RPi/devices/RPi5/patches/LibreELEC-settings/0001-…`: the update menu reads its channels from `releases.json` on the LibreELEC tree's `main` (DV-13.0: the releases, DVbeta-13.0: the pre-releases; `scripts/releases-json.py` writes it), and the update check offers the newest build of the running build's channel instead of asking LibreELEC's update server. Builds are named `…-13.0-dv-<version>` (`CUSTOM_VERSION=dv-<version>` for `make image`), which its `prettyname_regex` reads. |
 | `0013` pi-dv-engine: update to 0.4.0 | `PKG_VERSION` / `PKG_SHA256` of the 0.4.0 tarball (`libpi_engine.so.3`, overlay areas), which now downloads from the release `engine-<version>`. |
 | `0014` RPi5: kodi: composite the GUI into the Dolby Vision signal | `../kodi/0009` as `projects/RPi/devices/RPi5/patches/kodi/0048-…`. |
+| `0015` pi-dv-engine: update to 0.4.1 | `PKG_VERSION` / `PKG_SHA256` of the 0.4.1 tarball: faster, the same output and API (`libpi_engine.so.3`). |
 
 **Building:** `make image` as usual (`PROJECT=RPi DEVICE=RPi5 ARCH=aarch64`).
 The engine tarball downloads from the release. To build an engine version
