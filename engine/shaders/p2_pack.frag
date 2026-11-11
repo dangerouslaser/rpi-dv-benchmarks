@@ -297,7 +297,12 @@ void block(uint x, uint y, uvec4 b, uvec4 e, uvec4 c, out uvec2 top, out uvec2 b
 
 void main()
 {
-    uint px = uint(gl_FragCoord.x), k = uint(gl_FragCoord.y), x = 2u * px, y0 = 2u * k;
+    // (px, k): the block in the output; x, y0 its first pixel. The picture
+    // starts at the output's block row P.el_size.z (a taller output: bars
+    // above and below it), so k is its row in the source's planes: the
+    // area, the packets and the overlay are the output's.
+    uint px = uint(gl_FragCoord.x), x = 2u * px, y0 = 2u * uint(gl_FragCoord.y);
+    uint k = uint(gl_FragCoord.y) - P.el_size.z;
     if ((ABLATE & 16u) != 0u) {
         o_even = uvec2(px, k);
         o_odd = uvec2(k, px);
@@ -347,5 +352,5 @@ void main()
         vec2 at = vec2(float(px + 1u), float(k)) * P.inv.xy;   // rows k-1, k
         el = el_block(textureGather(el_luma, at, 0), textureGather(el_luma, at + vec2(0.0, P.inv.y), 0));
     }
-    block(x, y0, bl_block(px, y0), el, uvec4(e, d), o_even, o_odd);
+    block(x, y0, bl_block(px, 2u * k), el, uvec4(e, d), o_even, o_odd);
 }

@@ -1937,8 +1937,7 @@ static int route_of(const struct pi_engine *e, const dvvk_plan *p, int has_el, s
         rt->piece = 1 + (int)p->layout;
     if ((!rt->single && !rt->piece &&
          (p->route != DVVK_ROUTE_DUAL || !has_el || p->equal || (p->nearest != 2 && p->nearest != 0))) ||
-        (!rt->piece && p->pack != DVVK_PACK_SITED) || p->placement[0] || p->placement[1] ||
-        p->placement[2] != e->w || p->placement[3] != e->h)
+        (!rt->piece && p->pack != DVVK_PACK_SITED) || p->placement[0] || p->placement[2] != e->w || p->placement[3] != e->h)
         return 0;
     return 1;
 }
@@ -2115,7 +2114,7 @@ static int bind_inputs(struct pi_engine *e, struct ctx *c, const AVFrame *bl, co
 }
 
 /* The frame's own Params over the generation's. */
-static void frame_params(struct pi_engine *e, const dvvk_plan *p, const AVFrame *el, struct params *q)
+static void frame_params(struct pi_engine *e, const dvvk_plan *p, const AVFrame *el, uint32_t oy, struct params *q)
 {
     uint32_t w = e->w, h = e->h;
     q->size[0] = w;
@@ -2124,6 +2123,7 @@ static void frame_params(struct pi_engine *e, const dvvk_plan *p, const AVFrame 
     q->size[3] = h / 2;
     q->el_size[0] = el ? (uint32_t)el->width / 2 : w / 4;
     q->el_size[1] = el ? (uint32_t)el->height / 2 : h / 4;
+    q->el_size[2] = oy / 2;   /* P2: the picture's first block row in the output */
     memcpy(q->active, p->active, sizeof(q->active));
     memcpy(q->black, p->black, sizeof(q->black));
     q->pk[0] = p->packet_count;
@@ -2322,7 +2322,9 @@ static int record(struct pi_engine *e, struct ctx *c, const dvvk_plan *p, struct
                   VkPipeline p1, VkPipeline p2, VkPipeline p2i, VkPipeline pb, const struct overlay_pass *ov,
                   int el_unread, int el_pairs)
 {
-    uint32_t w = e->w, h = e->h, cw = w / 2, ch = h / 2;
+    /* P0, P1: the stream's w x h; P2: the output's och block rows, the
+     * picture's from block row py */
+    uint32_t w = e->w, h = e->h, cw = w / 2, ch = h / 2, och = o->h / 2, py = c->pmap->el_size[2];
     VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
                                    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
     VKC(e, vkResetCommandBuffer(c->cmd, 0));
@@ -2439,17 +2441,17 @@ static int record(struct pi_engine *e, struct ctx *c, const dvvk_plan *p, struct
      * rows of the bars are drawn. The block rows the overlay may touch (r0 ..
      * r1 - 1) take the pipelines that composite it, bars included. */
     uint32_t a0 = p->active[1] / 2, a1 = (p->active[3] + 1) / 2;
-    if (all || a1 <= a0 || a1 > ch)
-        a0 = 0, a1 = ch;
+    if (all || a1 <= a0 || a0 < py || a1 > py + ch)
+        a0 = py, a1 = py + ch;
     uint32_t prow = (c->pmap->pk[3] + 1) / 2;   /* block rows the packets reach */
-    uint32_t top = a0 < prow ? a0 : prow, bottom = prow > a1 ? (prow < ch ? prow : ch) : a1;
+    uint32_t top = a0 < prow ? a0 : prow, bottom = prow > a1 ? (prow < och ? prow : och) : a1;
     if (e->o.measure & PI_MEASURE_DRAW_BARS)
-        top = a0, bottom = ch;
+        top = a0, bottom = och;
     uint32_t r[PI_OVERLAY_RECTS][4];   /* the overlay's blocks: rows r0 .. r1 - 1, columns c0 .. c1 - 1 */
     for (int i = 0; i < ov->n; i++) {
         const uint32_t *orect = ov->orect[i];
         r[i][0] = orect[1] / 2;
-        r[i][1] = (orect[3] + 1) / 2 < ch ? (orect[3] + 1) / 2 : ch;
+        r[i][1] = (orect[3] + 1) / 2 < och ? (orect[3] + 1) / 2 : och;
         r[i][2] = orect[0] / 2;
         r[i][3] = (orect[2] + 1) / 2 < cw ? (orect[2] + 1) / 2 : cw;
     }
@@ -2492,17 +2494,17 @@ static int record(struct pi_engine *e, struct ctx *c, const dvvk_plan *p, struct
         region(b, &nb, p2i, overlay ? ov->p2 : NULL, i0, i1, i1, r, ov->n, cw);
         region(b, &nb, p2, overlay ? ov->p2 : NULL, i1, a1, a1, r, ov->n, cw);
     }
-    region(b, &nb, pb, overlay ? ov->bars : NULL, a1, ch, bottom, r, ov->n, cw);
+    region(b, &nb, pb, overlay ? ov->bars : NULL, a1, och, bottom, r, ov->n, cw);
     VkClearValue black;
     for (int l = 0; l < 2; l++)
         black.color.uint32[l] = PI_PACK(p->black[0], l ? p->black[2] : p->black[1]);
     black.color.uint32[2] = black.color.uint32[3] = 0;
-    pass(e, c, 1, e->rp[1], o->fb, cw, ch, 0, cw, 0, ch, b, nb, &black);
+    pass(e, c, 1, e->rp[1], o->fb, cw, och, 0, cw, 0, och, b, nb, &black);
     if (o->copy_buf)
         for (int half = 0; half < 2; half++) {
             VkBufferImageCopy cp = {.bufferOffset = (VkDeviceSize)half * o->stride, .bufferRowLength = o->stride / 4,
                                     .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-                                    .imageExtent = {cw, ch, 1}};
+                                    .imageExtent = {cw, och, 1}};
             if (half) {   /* the halves interleave rows: disjoint, but syncval sees overlapping ranges */
                 VkBufferMemoryBarrier bb = {.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
                                             .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
@@ -2642,11 +2644,11 @@ static void rect_union(uint32_t a[4], const uint32_t b[4])
  * the filter's reach at the scale. Rectangles whose P2 block rows meet are
  * merged, so op's are in order and apart in block rows; Params' orect is
  * their union. */
-static void overlay_params(const struct pi_engine *e, const struct pi_frame *f, uint32_t r[PI_OVERLAY_RECTS][4],
+static void overlay_params(const struct pi_output *out, const struct pi_frame *f, uint32_t r[PI_OVERLAY_RECTS][4],
                            int n, const dvvk_plan *p, struct params *q, struct overlay_pass *op)
 {
     const struct pi_overlay *ov = f->overlay;
-    uint32_t w = e->w, h = e->h, ow = ov->w, oh = ov->h;
+    uint32_t w = out->w, h = out->h, ow = ov->w, oh = ov->h;
     for (int i = 0; i < 31; i++)
         q->oc[i] = p->gui_coeff[i];
     uint32_t mx = 2 + 2 * ((w + ow - 1) / ow), my = 2 + 2 * ((h + oh - 1) / oh);   /* output pixels */
@@ -2707,7 +2709,7 @@ int pi_render(struct pi_engine *e, const struct pi_frame *f, struct pi_output *o
     int acquire_fd = f ? f->acquire_fd : -1;
     int drawn_fd = f && f->overlay ? f->overlay_fd : -1;
     int rc = PI_E_INVALID;
-    if (!e->open || !f || !f->bl || !o || o->w != e->w || o->h != e->h)
+    if (!e->open || !f || !f->bl || !o || o->w != e->w || o->h < e->h)
         goto out;
     rc = PI_E_UNSUPPORTED_FORMAT;
     if ((uint32_t)f->bl->width != e->w || (uint32_t)f->bl->height != e->h ||
@@ -2735,7 +2737,9 @@ int pi_render(struct pi_engine *e, const struct pi_frame *f, struct pi_output *o
 
     /* plan */
     double t0 = now_ms();
-    dvvk_plan_in in = {.width = e->w, .height = e->h, .x = 0, .y = 0, .dw = e->w, .dh = e->h,
+    /* a taller output: the picture in its middle (an even row), bars above and below */
+    const uint32_t oy = (o->h - e->h) / 2 & ~1u;
+    dvvk_plan_in in = {.width = e->w, .height = e->h, .x = 0, .y = oy, .dw = e->w, .dh = e->h,
                        .chroma_top_left = (uint32_t)f->chroma_top_left, .has_el = f->el != NULL,
                        .el_scaler = e->o.el_upscale == PI_EL_ANNEX_B ? 1u : 2u,
                        .fel = 1, .refresh = (uint32_t)e->first, .pts = f->pts_us, .white_nits = 203.0,
@@ -2776,10 +2780,10 @@ int pi_render(struct pi_engine *e, const struct pi_frame *f, struct pi_output *o
     memcpy(q, &e->tmpl, sizeof(*q));
     if ((rc = bind_inputs(e, c, f->bl, f->el ? f->el : f->bl, q)))
         goto release;
-    frame_params(e, p, f->el, q);
+    frame_params(e, p, f->el, oy, q);
     struct overlay_pass op = {0};
     if (ov) {
-        overlay_params(e, f, orc, norc, p, q, &op);
+        overlay_params(o, f, orc, norc, p, q, &op);
         VkWriteDescriptorSet wr = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = c->ds, .dstBinding = 15,
                                    .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER,
                                    .pTexelBufferView = &ov->view};
@@ -2810,8 +2814,8 @@ int pi_render(struct pi_engine *e, const struct pi_frame *f, struct pi_output *o
      * last overlay imported's, to build ahead) */
     const struct pi_overlay *scale = ov ? ov : e->overlays;
     uint32_t mode = !scale                                          ? 1u
-                    : scale->w == e->w && scale->h == e->h          ? 3u
-                    : 2 * scale->w == e->w && 2 * scale->h == e->h ? 2u
+                    : scale->w == o->w && scale->h == o->h          ? 3u
+                    : 2 * scale->w == o->w && 2 * scale->h == o->h ? 2u
                                                                     : 1u;
     uint32_t k2o[K2_N], kbo[K2_N] = {[K2_BARS] = 1, [K2_OVERLAY] = mode};
     memcpy(k2o, k2, sizeof(k2o));

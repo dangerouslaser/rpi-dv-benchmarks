@@ -192,8 +192,12 @@ struct pi_frame {
     int overlay_bottom_up;        /* the overlay's rows are stored bottom first (a GL framebuffer) */
     int overlay_fd;               /* with an overlay: a sync_file it is drawn by; -1 none. Taken. */
 };
-/* Plans and renders f into out. The engine holds references to bl and el
- * until the GPU is done with them. release_fd (may be NULL): a sync_file
+/* Plans and renders f into out. out is of the stream's width and its
+ * height or taller: a taller one (a stream cropped to the picture, such as
+ * 3840x2076, in a 3840x2160 tunnel frame) gets the picture in its middle,
+ * from an even row, with black bars above and below, the metadata packets in
+ * its first rows and the active area (L5) placed. The engine holds
+ * references to bl and el until the GPU is done with them. release_fd (may be NULL): a sync_file
  * signalled when the output is complete, or -1 where the device can't
  * export one (then pi_output_wait). */
 int pi_render(struct pi_engine *e, const struct pi_frame *f, struct pi_output *out, int *release_fd);

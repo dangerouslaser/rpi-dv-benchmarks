@@ -13,7 +13,7 @@ layout(std140, binding = 0) uniform Params {
     uvec4 size;        // w, h (luma), cw, ch (chroma = EL luma)
     uvec4 bl;          // luma word offset, chroma word offset, luma colh, chroma colh
     uvec4 el;          // the same for the EL
-    uvec4 el_size;     // EL chroma w, h; -, -
+    uvec4 el_size;     // EL chroma w, h; P2: the picture's first block row in the output; -
     uvec4 area;        // x0, y0, x1, y1
     uvec4 black;       // y, cb, cr
     uvec4 pk;          // packet count, MMR shift Cb, Cr, rows the packets reach

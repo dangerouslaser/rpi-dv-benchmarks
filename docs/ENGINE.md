@@ -8,7 +8,10 @@ It is TV-led, as in Kodi's DV engines for other platforms:
    enhancement layer (EL) and the RPU.
 2. It packs that signal, with the display-management metadata, into the HDMI
    "tunnel" frame: RGB 8-bit carrying 12-bit 4:2:2, at the stream's size
-   (3840×2160 or 1920×1080).
+   (3840×2160 or 1920×1080). A stream cropped to the picture (3840×2076,
+   say) goes into a taller frame of the mode's size: the picture in its
+   middle, black bars above and below, the metadata in the first rows and
+   the active area (L5) moved with the picture.
 3. The TV does the display mapping. There is no tone mapping on the Pi.
 
 ## Pipeline
@@ -68,7 +71,7 @@ P2  w/2 × h/2   one fragment per 2×2 output block: 4:2:2 vertical filter,
 | `pi_engine_create(&options, &e)` | once: device, MMR mode, filters, EL upscale, pipeline cache file, log callback |
 | `pi_engine_configure(e, &options)` | a change of MMR mode, filters or EL upscale (a player's settings), from the next `pi_stream_open` |
 | `pi_stream_open(e, &info)` | per stream: its size and profile. Resets the planner (packet ids, cached tables). |
-| `pi_output_import(e, fd, w, h, stride, size, &out)` | per scanout buffer the caller owns; `pi_output_size()` gives the layout |
+| `pi_output_import(e, fd, w, h, stride, size, &out)` | per scanout buffer the caller owns, of the stream's width and its height or taller (the picture centred); `pi_output_size()` gives the layout |
 | `pi_overlay_import(e, fd, w, h, stride, size, &ov)` | optional: per buffer the caller draws graphics into (subtitles, a GUI; ARGB8888, premultiplied sRGB), named by `frame.overlay` |
 | `pi_render(e, &frame, out, &release_fd)` | per picture: its BL and EL frames. Returns a sync_file signalled when `out` is complete; `frame.acquire_fd` is one the output is busy until (KMS's). |
 | `pi_output_done` / `pi_output_wait` | without sync_files |

@@ -62,6 +62,9 @@
  *                        composite over it (the planner's overlay colour)
  *     --hash             print a hash of every output picture
  *     --dump DIR         write each output as DIR/pi-N.bgra
+ *     --output-height H  outputs H rows tall (at least the stream's): the
+ *                        picture centred in them, as a cropped stream in a
+ *                        16:9 mode (not with --overlay-check or --kms-*)
  *     --json FILE        machine-readable summary
  *     --measure LIST     measurement switches, comma-separated: all_rows,
  *                        draw_bars, piece_general, mark, copy_output,
@@ -708,7 +711,7 @@ static void usage(void)
     fprintf(stderr, "usage: dvbench [--source sw|v4l2] [--el-sw] [--frames N] [--warmup N] [--start S] [--fel 0|1]\n"
                     "               [--el-upscale bilinear|annexb|bicubic|lanczos]\n"
                     "               [--filters cb1|phase] [--mmr exact|split|exact64|float] [--device NAME]\n"
-                    "               [--pipeline-cache FILE] [--throughput S] [--play S] [--hash] [--dump DIR]\n"
+                    "               [--pipeline-cache FILE] [--throughput S] [--play S] [--hash] [--dump DIR] [--output-height H]\n"
                     "               [--overlay WxH [--overlay-bottom-up] [--overlay-top] [--overlay-check]]\n"
                     "               [--json FILE] [--measure LIST] FILE\n"
                     "       dvbench --probe [--device NAME]\n");
@@ -1560,7 +1563,7 @@ int main(int argc, char **argv)
 {
     struct dv_source_options so = {.kind = DV_SOURCE_SW};
     int frames = 48, warmup = 8, hash = 0, probe_only = 0, frames_set = 0, ov_bottom_up = 0, ov_check = 0;
-    unsigned ovw = 0, ovh = 0;
+    unsigned ovw = 0, ovh = 0, out_h = 0;
     double throughput = 0, play_seconds = 0;
     const char *file = NULL, *dump = NULL, *json = NULL;
     struct pi_options po;
@@ -1658,6 +1661,11 @@ int main(int argc, char **argv)
             ov_check = 1;
         else if (!strcmp(a, "--dump") && takes)
             dump = argv[++i];
+        else if (!strcmp(a, "--output-height") && takes) {
+            if (sscanf(v, "%u", &out_h) != 1 || out_h < 16 || out_h > 4320 || out_h & 1)
+                ok = bad_value(a, v);
+            i++;
+        }
         else if (!strcmp(a, "--json") && takes)
             json = argv[++i];
         else if (!strcmp(a, "--measure") && takes)
@@ -1768,8 +1776,12 @@ int main(int argc, char **argv)
     }
     struct out_buf out[3];
     memset(out, 0, sizeof(out));
+    if (out_h && out_h < H) {
+        fprintf(stderr, "dvbench: --output-height %u is below the stream's %u\n", out_h, H);
+        return 1;
+    }
     for (unsigned i = 0; i < 3; i++)
-        if (out_alloc(g_pi, &out[i], W, H)) {
+        if (out_alloc(g_pi, &out[i], W, out_h ? out_h : H)) {
             fprintf(stderr, "pi: output %u failed\n", i);
             return 1;
         }
