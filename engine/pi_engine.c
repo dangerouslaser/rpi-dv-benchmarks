@@ -2232,26 +2232,33 @@ static void band_add(struct band *b, int *n, VkPipeline p, uint32_t lo, uint32_t
 }
 
 /* A region of P2's block rows, lo .. hi - 1, of which base draws lo ..
- * drawn - 1; where the overlay may touch (block rows r0 .. r1 - 1, columns
- * c0 .. c1 - 1 of cw) over draws instead, and also in rows base leaves. */
+ * drawn - 1; where the overlay may touch (per rectangle, in order and
+ * apart: block rows r0 .. r1 - 1, columns c0 .. c1 - 1 of cw) over draws
+ * instead, and also in rows base leaves. */
 static void region(struct band *b, int *n, VkPipeline base, VkPipeline over, uint32_t lo, uint32_t hi,
-                   uint32_t drawn, const uint32_t r[4], uint32_t cw)
+                   uint32_t drawn, uint32_t (*r)[4], int nr, uint32_t cw)
 {
-    uint32_t r0 = over ? r[0] : 0, r1 = over ? r[1] : 0;
-    band_add(b, n, base, lo, drawn < r0 ? drawn : r0, 0, cw);
-    band_add(b, n, base, lo > r1 ? lo : r1, drawn, 0, cw);
-    if (!over)
-        return;
-    uint32_t o0 = lo > r0 ? lo : r0, o1 = hi < r1 ? hi : r1, d1 = drawn < o1 ? drawn : o1;
-    band_add(b, n, over, o0, o1, r[2], r[3]);
-    band_add(b, n, base, o0, d1, 0, r[2]);
-    band_add(b, n, base, o0, d1, r[3], cw);
+    uint32_t y = lo;   /* base has drawn the rows before y */
+    for (int i = 0; over && i < nr; i++) {
+        uint32_t o0 = lo > r[i][0] ? lo : r[i][0], o1 = hi < r[i][1] ? hi : r[i][1];
+        if (o1 <= o0)
+            continue;
+        uint32_t d1 = drawn < o1 ? drawn : o1;
+        band_add(b, n, base, y, drawn < o0 ? drawn : o0, 0, cw);
+        band_add(b, n, over, o0, o1, r[i][2], r[i][3]);
+        band_add(b, n, base, o0, d1, 0, r[i][2]);
+        band_add(b, n, base, o0, d1, r[i][3], cw);
+        y = o1;
+    }
+    band_add(b, n, base, y, drawn, 0, cw);
 }
 
-/* A frame's overlay: PO's area (overlay pixels) and P2's pipelines for the
- * blocks it may touch; none: area empty. */
+/* A frame's overlay: per rectangle, PO's area (overlay pixels) and the
+ * output pixels P2 composites, in order and apart in P2's block rows; their
+ * PO areas' union; P2's pipelines for the blocks it may touch. None: n 0. */
 struct overlay_pass {
-    uint32_t area[4];
+    int n;
+    uint32_t area[PI_OVERLAY_RECTS][4], orect[PI_OVERLAY_RECTS][4], bound[4];
     VkPipeline p2, bars;
 };
 
@@ -2307,20 +2314,24 @@ static int record(struct pi_engine *e, struct ctx *c, const dvvk_plan *p, struct
     }
     struct band b1 = {p1, c0, crows, 0, 0};
     pass(e, c, 0, c->fb, cw, ch, c0, crows, &b1, 1, NULL);
-    /* PO: the overlay's area as the source's signal, for P2 */
-    const uint32_t *oa = ov->area;
-    int overlay = oa[2] > oa[0] && oa[3] > oa[1];
+    /* PO: the overlay's rectangles as the source's signal, for P2 */
+    int overlay = ov->n > 0;
     if (overlay) {
+        const uint32_t *ob = ov->bound;
         VkRenderPassBeginInfo rbi = {.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, .renderPass = e->rp[3],
                                      .framebuffer = e->codes_fb,
-                                     .renderArea = {{(int32_t)oa[0], (int32_t)oa[1]}, {oa[2] - oa[0], oa[3] - oa[1]}}};
+                                     .renderArea = {{(int32_t)ob[0], (int32_t)ob[1]}, {ob[2] - ob[0], ob[3] - ob[1]}}};
         vkCmdBeginRenderPass(c->cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
         vkCmdBindDescriptorSets(c->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, e->pl, 0, 1, &c->ds, 0, NULL);
         VkViewport vp = {0, 0, (float)e->codes_w, (float)e->codes_h, 0, 1};
         vkCmdSetViewport(c->cmd, 0, 1, &vp);
         vkCmdBindPipeline(c->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, e->po);
-        vkCmdSetScissor(c->cmd, 0, 1, &rbi.renderArea);
-        vkCmdDraw(c->cmd, 3, 1, 0, 0);
+        for (int i = 0; i < ov->n; i++) {
+            const uint32_t *oa = ov->area[i];
+            VkRect2D sc = {{(int32_t)oa[0], (int32_t)oa[1]}, {oa[2] - oa[0], oa[3] - oa[1]}};
+            vkCmdSetScissor(c->cmd, 0, 1, &sc);
+            vkCmdDraw(c->cmd, 3, 1, 0, 0);
+        }
         vkCmdEndRenderPass(c->cmd);
         e->codes_read = 1;
     } else if (!e->codes_read) {
@@ -2350,19 +2361,19 @@ static int record(struct pi_engine *e, struct ctx *c, const dvvk_plan *p, struct
     uint32_t top = a0 < prow ? a0 : prow, bottom = prow > a1 ? (prow < ch ? prow : ch) : a1;
     if (e->o.measure & PI_MEASURE_DRAW_BARS)
         top = a0, bottom = ch;
-    uint32_t r[4] = {0};   /* the overlay's blocks: rows r0 .. r1 - 1, columns c0 .. c1 - 1 */
-    if (overlay) {
-        const uint32_t *orect = c->pmap->orect;
-        r[0] = orect[1] / 2;
-        r[1] = (orect[3] + 1) / 2 < ch ? (orect[3] + 1) / 2 : ch;
-        r[2] = orect[0] / 2;
-        r[3] = (orect[2] + 1) / 2 < cw ? (orect[2] + 1) / 2 : cw;
+    uint32_t r[PI_OVERLAY_RECTS][4];   /* the overlay's blocks: rows r0 .. r1 - 1, columns c0 .. c1 - 1 */
+    for (int i = 0; i < ov->n; i++) {
+        const uint32_t *orect = ov->orect[i];
+        r[i][0] = orect[1] / 2;
+        r[i][1] = (orect[3] + 1) / 2 < ch ? (orect[3] + 1) / 2 : ch;
+        r[i][2] = orect[0] / 2;
+        r[i][3] = (orect[2] + 1) / 2 < cw ? (orect[2] + 1) / 2 : cw;
     }
-    struct band b[16];
+    struct band b[3 * (1 + 4 * PI_OVERLAY_RECTS)];
     int nb = 0;
-    region(b, &nb, pb, overlay ? ov->bars : NULL, 0, a0, top, r, cw);
-    region(b, &nb, p2, overlay ? ov->p2 : NULL, a0, a1, a1, r, cw);
-    region(b, &nb, pb, overlay ? ov->bars : NULL, a1, ch, bottom, r, cw);
+    region(b, &nb, pb, overlay ? ov->bars : NULL, 0, a0, top, r, ov->n, cw);
+    region(b, &nb, p2, overlay ? ov->p2 : NULL, a0, a1, a1, r, ov->n, cw);
+    region(b, &nb, pb, overlay ? ov->bars : NULL, a1, ch, bottom, r, ov->n, cw);
     VkClearValue black;
     for (int l = 0; l < 2; l++)
         black.color.uint32[l] = PI_PACK(p->black[0], l ? p->black[2] : p->black[1]);
@@ -2481,39 +2492,87 @@ static void overlay_rgb_to_lms(double m[9])
         }
 }
 
-/* The overlay's rectangle clamped to it; 0 empty. */
-static int overlay_rect(const struct pi_frame *f, uint32_t r[4])
+/* The overlay's rectangles clamped to it, the empty ones left out; their
+ * number. */
+static int overlay_rects(const struct pi_frame *f, uint32_t r[PI_OVERLAY_RECTS][4])
 {
     const struct pi_overlay *ov = f->overlay;
-    r[0] = f->overlay_rect[0];
-    r[1] = f->overlay_rect[1];
-    r[2] = f->overlay_rect[2] < ov->w ? f->overlay_rect[2] : ov->w;
-    r[3] = f->overlay_rect[3] < ov->h ? f->overlay_rect[3] : ov->h;
-    return r[2] > r[0] && r[3] > r[1];
+    int n = 0;
+    for (int i = 0; i < PI_OVERLAY_RECTS; i++) {
+        const uint32_t *s = f->overlay_rect[i];
+        uint32_t x1 = s[2] < ov->w ? s[2] : ov->w, y1 = s[3] < ov->h ? s[3] : ov->h;
+        if (x1 > s[0] && y1 > s[1]) {
+            r[n][0] = s[0], r[n][1] = s[1], r[n][2] = x1, r[n][3] = y1;
+            n++;
+        }
+    }
+    return n;
 }
 
-/* The overlay's Params (the colour: the planner's) and PO's area: P2 samples
- * the codes bilinearly at its pixels and their horizontal neighbours, so
- * both areas have a margin for the filter's reach at the scale. */
-static void overlay_params(const struct pi_engine *e, const struct pi_frame *f, const uint32_t r[4],
-                           const dvvk_plan *p, struct params *q, uint32_t area[4])
+static void rect_union(uint32_t a[4], const uint32_t b[4])
+{
+    a[0] = b[0] < a[0] ? b[0] : a[0];
+    a[1] = b[1] < a[1] ? b[1] : a[1];
+    a[2] = b[2] > a[2] ? b[2] : a[2];
+    a[3] = b[3] > a[3] ? b[3] : a[3];
+}
+
+/* The overlay's Params (the colour: the planner's) and, per rectangle, PO's
+ * area and the output pixels P2 composites: P2 samples the codes bilinearly
+ * at its pixels and their horizontal neighbours, so both have a margin for
+ * the filter's reach at the scale. Rectangles whose P2 block rows meet are
+ * merged, so op's are in order and apart in block rows; Params' orect is
+ * their union. */
+static void overlay_params(const struct pi_engine *e, const struct pi_frame *f, uint32_t r[PI_OVERLAY_RECTS][4],
+                           int n, const dvvk_plan *p, struct params *q, struct overlay_pass *op)
 {
     const struct pi_overlay *ov = f->overlay;
     uint32_t w = e->w, h = e->h, ow = ov->w, oh = ov->h;
     for (int i = 0; i < 31; i++)
         q->oc[i] = p->gui_coeff[i];
     uint32_t mx = 2 + 2 * ((w + ow - 1) / ow), my = 2 + 2 * ((h + oh - 1) / oh);   /* output pixels */
-    uint64_t x0 = (uint64_t)r[0] * w / ow, y0 = (uint64_t)r[1] * h / oh;
-    uint64_t x1 = ((uint64_t)r[2] * w + ow - 1) / ow + mx, y1 = ((uint64_t)r[3] * h + oh - 1) / oh + my;
-    q->orect[0] = x0 > mx ? (uint32_t)x0 - mx : 0;
-    q->orect[1] = y0 > my ? (uint32_t)y0 - my : 0;
-    q->orect[2] = x1 < w ? (uint32_t)x1 : w;
-    q->orect[3] = y1 < h ? (uint32_t)y1 : h;
     uint32_t ax = (mx + 1) * ((ow + w - 1) / w) + 2, ay = (my + 1) * ((oh + h - 1) / h) + 2;   /* overlay pixels */
-    area[0] = r[0] > ax ? r[0] - ax : 0;
-    area[1] = r[1] > ay ? r[1] - ay : 0;
-    area[2] = r[2] + ax < ow ? r[2] + ax : ow;
-    area[3] = r[3] + ay < oh ? r[3] + ay : oh;
+    uint32_t orect[PI_OVERLAY_RECTS][4], area[PI_OVERLAY_RECTS][4];
+    for (int i = 0; i < n; i++) {
+        uint64_t x0 = (uint64_t)r[i][0] * w / ow, y0 = (uint64_t)r[i][1] * h / oh;
+        uint64_t x1 = ((uint64_t)r[i][2] * w + ow - 1) / ow + mx, y1 = ((uint64_t)r[i][3] * h + oh - 1) / oh + my;
+        orect[i][0] = x0 > mx ? (uint32_t)x0 - mx : 0;
+        orect[i][1] = y0 > my ? (uint32_t)y0 - my : 0;
+        orect[i][2] = x1 < w ? (uint32_t)x1 : w;
+        orect[i][3] = y1 < h ? (uint32_t)y1 : h;
+        area[i][0] = r[i][0] > ax ? r[i][0] - ax : 0;
+        area[i][1] = r[i][1] > ay ? r[i][1] - ay : 0;
+        area[i][2] = r[i][2] + ax < ow ? r[i][2] + ax : ow;
+        area[i][3] = r[i][3] + ay < oh ? r[i][3] + ay : oh;
+    }
+    /* in order of their first output row (n is at most 4) */
+    for (int i = 1; i < n; i++)
+        for (int j = i; j > 0 && orect[j][1] < orect[j - 1][1]; j--)
+            for (int k = 0; k < 4; k++) {
+                uint32_t t = orect[j][k];
+                orect[j][k] = orect[j - 1][k], orect[j - 1][k] = t;
+                t = area[j][k];
+                area[j][k] = area[j - 1][k], area[j - 1][k] = t;
+            }
+    op->n = 0;
+    for (int i = 0; i < n; i++) {
+        int m = op->n - 1;
+        /* block rows (pairs of output rows) meet: one rectangle */
+        if (m >= 0 && orect[i][1] / 2 < (op->orect[m][3] + 1) / 2) {
+            rect_union(op->orect[m], orect[i]);
+            rect_union(op->area[m], area[i]);
+            continue;
+        }
+        memcpy(op->orect[op->n], orect[i], sizeof(orect[i]));
+        memcpy(op->area[op->n], area[i], sizeof(area[i]));
+        op->n++;
+    }
+    memcpy(q->orect, op->orect[0], sizeof(q->orect));
+    memcpy(op->bound, op->area[0], sizeof(op->bound));
+    for (int i = 1; i < op->n; i++) {
+        rect_union(q->orect, op->orect[i]);
+        rect_union(op->bound, op->area[i]);
+    }
     q->osrc[0] = ow;
     q->osrc[1] = oh;
     q->osrc[2] = ov->stride / 4;
@@ -2551,8 +2610,9 @@ int pi_render(struct pi_engine *e, const struct pi_frame *f, struct pi_output *o
     struct ctx *c = &e->c[e->next];
     ctx_retire(e, c, 1);
     imports_trim(e);
-    uint32_t orc[4] = {0};
-    struct pi_overlay *ov = f->overlay && overlay_rect(f, orc) ? f->overlay : NULL;
+    uint32_t orc[PI_OVERLAY_RECTS][4];
+    int norc = f->overlay ? overlay_rects(f, orc) : 0;
+    struct pi_overlay *ov = norc ? f->overlay : NULL;
 
     /* plan */
     double t0 = now_ms();
@@ -2598,9 +2658,9 @@ int pi_render(struct pi_engine *e, const struct pi_frame *f, struct pi_output *o
     if ((rc = bind_inputs(e, c, f->bl, f->el ? f->el : f->bl, q)))
         goto release;
     frame_params(e, p, f->el, q);
-    struct overlay_pass op = {{0}};
+    struct overlay_pass op = {0};
     if (ov) {
-        overlay_params(e, f, orc, p, q, op.area);
+        overlay_params(e, f, orc, norc, p, q, &op);
         VkWriteDescriptorSet wr = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = c->ds, .dstBinding = 15,
                                    .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER,
                                    .pTexelBufferView = &ov->view};

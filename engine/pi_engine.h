@@ -28,10 +28,11 @@ extern "C" {
 /* This header's version: bumped by every change that breaks a caller built
  * against the last (libpi_engine.so.PI_API_VERSION). pi_api_version() is
  * the library's. */
-#define PI_API_VERSION 2
+#define PI_API_VERSION 3
 int pi_api_version(void);
 
 #define PI_FRAMES_IN_FLIGHT 3
+#define PI_OVERLAY_RECTS 4
 
 struct pi_engine;
 struct pi_output;
@@ -179,11 +180,15 @@ struct pi_frame {
     int64_t pts_us;
     int acquire_fd;               /* a sync_file the output is busy until (KMS); -1 none. Taken. */
     /* The overlay (pi_overlay_import) composited over the picture; NULL or
-     * an empty rectangle: none. The engine reads it until the render's
+     * only empty rectangles: none. The engine reads it until the render's
      * release sync_file signals: draw into another one meanwhile. */
     struct pi_overlay *overlay;
-    uint32_t overlay_rect[4];     /* x0, y0, x1, y1 (exclusive), the overlay's pixels, rows top first:
-                                   * where it may be other than transparent (it is ignored outside) */
+    /* Up to PI_OVERLAY_RECTS rectangles, x0, y0, x1, y1 (exclusive), the
+     * overlay's pixels, rows top first: where it may be other than
+     * transparent (it is ignored outside). Empty ones are skipped; the
+     * composite's cost follows their area (a GUI's top and bottom bars:
+     * two). */
+    uint32_t overlay_rect[PI_OVERLAY_RECTS][4];
     int overlay_bottom_up;        /* the overlay's rows are stored bottom first (a GL framebuffer) */
     int overlay_fd;               /* with an overlay: a sync_file it is drawn by; -1 none. Taken. */
 };

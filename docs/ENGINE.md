@@ -65,7 +65,7 @@ P2  w/2 × h/2   one fragment per 2×2 output block: 4:2:2 vertical filter,
 | `pi_engine_configure(e, &options)` | a change of MMR mode, filters or EL upscale (a player's settings), from the next `pi_stream_open` |
 | `pi_stream_open(e, &info)` | per stream: its size and profile. Resets the planner (packet ids, cached tables). |
 | `pi_output_import(e, fd, w, h, stride, size, &out)` | per scanout buffer the caller owns; `pi_output_size()` gives the layout |
-| `pi_overlay_import(e, fd, w, h, stride, size, &ov)` | optional: per buffer the caller draws subtitles into (ARGB8888, premultiplied sRGB), named by `frame.overlay` |
+| `pi_overlay_import(e, fd, w, h, stride, size, &ov)` | optional: per buffer the caller draws graphics into (subtitles, a GUI; ARGB8888, premultiplied sRGB), named by `frame.overlay` |
 | `pi_render(e, &frame, out, &release_fd)` | per picture: its BL and EL frames. Returns a sync_file signalled when `out` is complete; `frame.acquire_fd` is one the output is busy until (KMS's). |
 | `pi_output_done` / `pi_output_wait` | without sync_files |
 | `pi_stream_close`, `pi_overlay_release`, `pi_output_release`, `pi_engine_destroy` | release everything, in reverse |
@@ -84,13 +84,19 @@ player.
   picture with CM v4.0 blocks and no RPU buffer is refused
   (`PI_E_UNSUPPORTED_PLAN`), unless its metadata repeats the last RPU's,
   as FFmpeg's does for an access unit without one.
-- **Graphics over the picture (subtitles) go into its signal,** not over
-  the tunnel frame: the TV decodes every pixel of that frame as the packed
-  12-bit signal, so graphics blended over it at scanout come out in the
-  wrong colours (white text turns purple). `frame.overlay` names an
-  overlay, `frame.overlay_rect` the area it may cover (its pixels, rows top
-  first; nothing outside it is read), `overlay_bottom_up` a GL
-  framebuffer's row order and `overlay_fd` a sync_file for its drawing.
+- **Graphics over the picture (subtitles, a GUI) go into its signal,** not
+  over the tunnel frame: the TV decodes every pixel of that frame as the
+  packed 12-bit signal, so graphics blended over it at scanout come out in
+  the wrong colours (white text turns purple). `frame.overlay` names an
+  overlay, `frame.overlay_rect` up to `PI_OVERLAY_RECTS` (4) areas it may
+  cover (its pixels, rows top first; nothing outside them is read; empty
+  ones are skipped), `overlay_bottom_up` a GL framebuffer's row order and
+  `overlay_fd` a sync_file for its drawing.
+  - **Areas:** PO renders each area's pixels, and P2 takes the compositing
+    pipeline only on the blocks of the areas (with the filter's margin),
+    so the cost follows their area: a GUI's top and bottom bars are two
+    areas, not the screen between them. Areas whose P2 block rows meet are
+    merged into one.
   - **Colour:** yblod's (`planner/source_overlay.c`): sRGB, white at 203
     nits, BT.709 to BT.2020, then the source's LMS, PQ and its signal
     matrix, from the planner's coefficients for the picture.
@@ -160,7 +166,7 @@ player.
     that gives no pictures by the 8th BL is given up (BLs alone). Flushed on
     a seek.
   `bench/source.c` is the reference for decoding the layers around them.
-- **Build:** `libpi_engine.so.2` (the SONAME follows `PI_API_VERSION`;
+- **Build:** `libpi_engine.so.3` (the SONAME follows `PI_API_VERSION`;
   `pi_api_version()` is the library's), exporting the `pi_*` API only
   (`engine/pi_engine.map`), with `pi_engine.h` and `pi_engine.pc`
   (requires `libavutil`); `-DPI_SHARED=OFF` builds `libpi_engine.a` and
@@ -445,8 +451,10 @@ reads no environment. `--measure` takes the same names, comma-separated.
 
 `dvbench --overlay WxH` composites a synthetic subtitle (two outlined lines,
 white and yellow, the second over a translucent box) drawn at WxH into every
-picture, `--overlay-bottom-up` stores its rows bottom first, and
-`--overlay-check` renders each of the first pictures again without it and
+picture, `--overlay-bottom-up` stores its rows bottom first,
+`--overlay-top` adds a line near the top as a second area, `--overlay-bars`
+a GUI's top and bottom bars (full width, a dark band fading out) as two
+areas, and `--overlay-check` renders each of the first pictures again without it and
 compares the overlaid output with a CPU reference of the composite over that
 (the planner's colour coefficients): within 1 code at 1:1 and 2×, 16 at
 other scales.

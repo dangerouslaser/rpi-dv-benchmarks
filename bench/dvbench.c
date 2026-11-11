@@ -54,6 +54,9 @@
  *                        yellow, outlined, the second over a translucent box)
  *                        drawn at WxH into every picture (pi_overlay_import)
  *     --overlay-bottom-up  its rows stored bottom first (as a GL framebuffer)
+ *     --overlay-top      also a line near the top, as a second rectangle
+ *     --overlay-bars     also a GUI's top and bottom bars (full width, fading), as two
+ *                        rectangles
  *     --overlay-check    then each picture again without the overlay, and the
  *                        overlaid output compared with a CPU reference of the
  *                        composite over it (the planner's overlay colour)
@@ -239,8 +242,8 @@ static const AVFrame *rpu_frame(const struct dv_picture *q)
 /* ---- the synthetic overlay (--overlay) --------------------------------------- */
 
 static struct {
-    uint32_t w, h, stride, rect[4];
-    int bottom_up, on;
+    uint32_t w, h, stride, rect[4], top_rect[4];
+    int bottom_up, on, top, bars;
     struct dv_dmabuf buf;
     uint8_t *rgba;   /* top-down premultiplied B, G, R, A: the CPU reference's */
     struct pi_overlay *ov;
@@ -268,10 +271,11 @@ static int overlay_make(uint32_t w, uint32_t h, int bottom_up)
     g_ov.bottom_up = bottom_up;
     if (dv_dmabuf_alloc(&g_ov.buf, (size_t)g_ov.stride * h) || !(g_ov.rgba = calloc((size_t)w * h, 4)))
         return -1;
-    uint32_t x0 = w, y0 = h, x1 = 0, y1 = 0;
+    uint32_t bounds[2][4] = {{w, h, 0, 0}, {w, h, 0, 0}};   /* the subtitle's, the top line's */
     double line = h * 0.05, cell = line * 0.62, stroke = line * 0.11, edge = line * 0.06;
-    for (int l = 0; l < 2; l++) {
-        double cy = h * (l ? 0.905 : 0.835);
+    for (int l = 0; l < (g_ov.top ? 3 : 2); l++) {
+        double cy = h * (l == 2 ? 0.1 : l ? 0.905 : 0.835);
+        uint32_t *bb = bounds[l == 2];
         int n = 34 - 8 * l;
         double left = w * 0.5 - n * cell * 0.5;
         int bx0 = (int)(left - cell * 0.5), bx1 = (int)(left + n * cell + cell * 0.5);
@@ -297,15 +301,31 @@ static int overlay_make(uint32_t w, uint32_t h, int bottom_up)
                 p[2] = (uint8_t)lround(r * 255);
                 p[3] = (uint8_t)lround(a * 255);
                 if (p[3]) {
-                    x0 = (uint32_t)x < x0 ? (uint32_t)x : x0;
-                    y0 = (uint32_t)y < y0 ? (uint32_t)y : y0;
-                    x1 = (uint32_t)x + 1 > x1 ? (uint32_t)x + 1 : x1;
-                    y1 = (uint32_t)y + 1 > y1 ? (uint32_t)y + 1 : y1;
+                    bb[0] = (uint32_t)x < bb[0] ? (uint32_t)x : bb[0];
+                    bb[1] = (uint32_t)y < bb[1] ? (uint32_t)y : bb[1];
+                    bb[2] = (uint32_t)x + 1 > bb[2] ? (uint32_t)x + 1 : bb[2];
+                    bb[3] = (uint32_t)y + 1 > bb[3] ? (uint32_t)y + 1 : bb[3];
                 }
             }
     }
-    uint32_t r[4] = {x0, y0, x1, y1};
-    memcpy(g_ov.rect, r, sizeof(r));
+    if (g_ov.bars) {   /* a GUI's top and bottom bars: full width, a dark band fading out */
+        uint32_t t1 = h * 170 / 1080, b0 = h * 890 / 1080;
+        for (uint32_t y = 0; y < h; y++) {
+            double a = y < t1 ? 0.8 * (1.0 - (double)y / t1) : y >= b0 ? 0.8 * (double)(y - b0) / (h - b0) : 0;
+            if (a <= 0)
+                continue;
+            for (uint32_t x = 0; x < w; x++) {
+                uint8_t *q = g_ov.rgba + ((size_t)y * w + x) * 4;
+                double qa = q[3] / 255.0;   /* the band under what is drawn: black adds no colour */
+                q[3] = (uint8_t)lround((qa + a * (1 - qa)) * 255);
+            }
+        }
+        bounds[0][0] = 0, bounds[0][1] = b0 < bounds[0][1] ? b0 : bounds[0][1], bounds[0][2] = w, bounds[0][3] = h;
+        bounds[1][0] = 0, bounds[1][1] = 0, bounds[1][2] = w, bounds[1][3] = t1;
+        g_ov.top = 1;
+    }
+    memcpy(g_ov.rect, bounds[0], sizeof(g_ov.rect));
+    memcpy(g_ov.top_rect, bounds[1], sizeof(g_ov.top_rect));
     dv_dmabuf_cpu(&g_ov.buf, 1, 1);
     for (uint32_t y = 0; y < h; y++)
         memcpy(g_ov.buf.map + (size_t)(bottom_up ? h - 1 - y : y) * g_ov.stride, g_ov.rgba + (size_t)y * w * 4, w * 4);
@@ -316,7 +336,11 @@ static int overlay_make(uint32_t w, uint32_t h, int bottom_up)
         return -1;
     }
     g_ov.on = 1;
-    printf("overlay: %ux%u%s, drawn in x %u..%u, y %u..%u\n", w, h, bottom_up ? " bottom-up" : "", x0, x1, y0, y1);
+    printf("overlay: %ux%u%s, drawn in x %u..%u, y %u..%u", w, h, bottom_up ? " bottom-up" : "", bounds[0][0],
+           bounds[0][2], bounds[0][1], bounds[0][3]);
+    if (g_ov.top)
+        printf("; x %u..%u, y %u..%u", bounds[1][0], bounds[1][2], bounds[1][1], bounds[1][3]);
+    printf("\n");
     return 0;
 }
 
@@ -328,7 +352,9 @@ static int render_fenced(const struct dv_picture *q, double pts, struct out_buf 
                          .acquire_fd = acquire_fd, .overlay_fd = -1};
     if (g_ov.on) {
         f.overlay = g_ov.ov;
-        memcpy(f.overlay_rect, g_ov.rect, sizeof(f.overlay_rect));
+        memcpy(f.overlay_rect[0], g_ov.rect, sizeof(f.overlay_rect[0]));
+        if (g_ov.top)
+            memcpy(f.overlay_rect[1], g_ov.top_rect, sizeof(f.overlay_rect[1]));
         f.overlay_bottom_up = g_ov.bottom_up;
     }
     int rc = pi_render(g_pi, &f, o->out, release_fd);
@@ -683,7 +709,7 @@ static void usage(void)
                     "               [--el-upscale bilinear|annexb|bicubic|lanczos]\n"
                     "               [--filters cb1|phase] [--mmr exact|split|exact64|float] [--device NAME]\n"
                     "               [--pipeline-cache FILE] [--throughput S] [--play S] [--hash] [--dump DIR]\n"
-                    "               [--overlay WxH [--overlay-bottom-up] [--overlay-check]]\n"
+                    "               [--overlay WxH [--overlay-bottom-up] [--overlay-top] [--overlay-check]]\n"
                     "               [--json FILE] [--measure LIST] FILE\n"
                     "       dvbench --probe [--device NAME]\n");
 }
@@ -1624,6 +1650,10 @@ int main(int argc, char **argv)
             i++;
         } else if (!strcmp(a, "--overlay-bottom-up"))
             ov_bottom_up = 1;
+        else if (!strcmp(a, "--overlay-top"))
+            g_ov.top = 1;
+        else if (!strcmp(a, "--overlay-bars"))
+            g_ov.bars = 1;
         else if (!strcmp(a, "--overlay-check"))
             ov_check = 1;
         else if (!strcmp(a, "--dump") && takes)
