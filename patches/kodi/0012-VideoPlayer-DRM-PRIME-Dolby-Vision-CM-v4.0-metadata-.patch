@@ -1,0 +1,711 @@
+From 229cae9094d0881f4cdab0f9f5f9aff4a1216f4b Mon Sep 17 00:00:00 2001
+From: Bryan Hoban <bryan.hoban@gmail.com>
+Date: Wed, 11 Nov 2026 11:42:15 -0500
+Subject: [PATCH] [VideoPlayer] DRM PRIME: Dolby Vision CM v4.0 metadata and L2
+ trims
+
+The engine can add neutral CM v4.0 blocks (L3, L9, L11 and L254) to
+the metadata of a CM v2.9 stream and leave its L2 trims out, as the
+libreelec-x86-DV build does (CB1's cb1_cmv40). Add the settings for
+it to the Dolby Vision group of Player / Videos and of the video
+settings: Add CM v4.0 metadata (Off, Without L2 trims only, Always,
+Auto, Auto 2), Auto's trigger, Auto 2's headroom, the TV peak
+luminance those rules go by, and Remove L2 trims.
+
+They apply from the next picture, without reopening the engine's
+stream. Player information shows what was sent where they ask for
+anything.
+
+Signed-off-by: Bryan Hoban <bryan.hoban@gmail.com>
+---
+ .../resources/strings.po                      | 101 ++++++++++++++++-
+ .../xml/Includes_PlayerProcessInfo.xml        |   4 +
+ system/settings/settings.xml                  | 105 ++++++++++++++++++
+ .../HwDecRender/DVTunnelDRMPRIME.cpp          |  52 +++++++++
+ .../HwDecRender/DVTunnelDRMPRIME.h            |  18 ++-
+ .../HwDecRender/RendererDRMPRIME.cpp          |  14 +++
+ xbmc/cores/VideoSettings.cpp                  |  10 ++
+ xbmc/cores/VideoSettings.h                    |  15 +++
+ xbmc/settings/MediaSettings.cpp               |  23 +++-
+ xbmc/settings/Settings.cpp                    |   7 +-
+ xbmc/settings/Settings.h                      |   8 ++
+ xbmc/video/dialogs/GUIDialogVideoSettings.cpp |  76 ++++++++++++-
+ 12 files changed, 428 insertions(+), 5 deletions(-)
+
+diff --git a/addons/resource.language.en_gb/resources/strings.po b/addons/resource.language.en_gb/resources/strings.po
+index 56f923b64..eddd01921 100644
+--- a/addons/resource.language.en_gb/resources/strings.po
++++ b/addons/resource.language.en_gb/resources/strings.po
+@@ -23300,7 +23300,106 @@ msgctxt "#36663"
+ msgid "The spatial filters of the reconstruction. CB1 matches the CB1 Master Reference. Phase adds chroma phase filters and is slower: Profile 8.1 with MMR chroma and Profile 8.4 may not play in real time."
+ msgstr ""
+ 
+-#empty strings from id 36664 to 36898
++#. Dolby Vision: content mapping version 4.0 metadata added to a video without it
++#: xbmc/video/dialogs/GUIDialogVideoSettings.cpp
++msgctxt "#36664"
++msgid "Add CM v4.0 metadata"
++msgstr ""
++
++#. Value of setting with label #36664 "Add CM v4.0 metadata"
++#: xbmc/video/dialogs/GUIDialogVideoSettings.cpp
++msgctxt "#36665"
++msgid "Without L2 trims only"
++msgstr ""
++
++#. Value of setting with label #36664 "Add CM v4.0 metadata"
++#: xbmc/video/dialogs/GUIDialogVideoSettings.cpp
++msgctxt "#36667"
++msgid "Auto 2"
++msgstr ""
++
++#: xbmc/video/dialogs/GUIDialogVideoSettings.cpp
++msgctxt "#36668"
++msgid "CM v4.0 Auto trigger"
++msgstr ""
++
++#. Value of setting with label #36668 "CM v4.0 Auto trigger": the display's peak luminance
++#: xbmc/video/dialogs/GUIDialogVideoSettings.cpp
++msgctxt "#36669"
++msgid "TV peak"
++msgstr ""
++
++#. Value of setting with label #36668 "CM v4.0 Auto trigger"
++#: xbmc/video/dialogs/GUIDialogVideoSettings.cpp
++msgctxt "#36670"
++msgid "1000 nits"
++msgstr ""
++
++#. Value of setting with label #36668 "CM v4.0 Auto trigger"
++#: xbmc/video/dialogs/GUIDialogVideoSettings.cpp
++msgctxt "#36671"
++msgid "2000 nits"
++msgstr ""
++
++#. Value of setting with label #36668 "CM v4.0 Auto trigger"
++#: xbmc/video/dialogs/GUIDialogVideoSettings.cpp
++msgctxt "#36672"
++msgid "4000 nits"
++msgstr ""
++
++#. Value of setting with label #36668 "CM v4.0 Auto trigger"
++#: xbmc/video/dialogs/GUIDialogVideoSettings.cpp
++msgctxt "#36673"
++msgid "10000 nits"
++msgstr ""
++
++#: xbmc/video/dialogs/GUIDialogVideoSettings.cpp
++msgctxt "#36674"
++msgid "CM v4.0 Auto 2 headroom"
++msgstr ""
++
++#. Dolby Vision: the level 2 trims of the metadata left out
++#: xbmc/video/dialogs/GUIDialogVideoSettings.cpp
++msgctxt "#36675"
++msgid "Remove L2 trims"
++msgstr ""
++
++#: xbmc/video/dialogs/GUIDialogVideoSettings.cpp
++msgctxt "#36676"
++msgid "TV peak luminance (nits)"
++msgstr ""
++
++#. Description of setting with label #36664 "Add CM v4.0 metadata"
++#: system/settings/settings.xml
++msgctxt "#36677"
++msgid "Adds neutral CM v4.0 metadata to a video that only has CM v2.9 metadata, so the display uses its CM v4.0 processing. The picture is not changed; how the display renders it may be. Without L2 trims only: videos without L2 trims. Always: every CM v2.9 video. Auto and Auto 2 also add it to a video with L2 trims that is not too bright for the display. Every video starts with this; the video settings during playback change it for that video."
++msgstr ""
++
++#. Description of setting with label #36668 "CM v4.0 Auto trigger"
++#: system/settings/settings.xml
++msgctxt "#36678"
++msgid "Auto adds the CM v4.0 metadata to a video without L2 trims, and to one mastered no brighter than this. TV peak uses the TV peak luminance setting."
++msgstr ""
++
++#. Description of setting with label #36674 "CM v4.0 Auto 2 headroom"
++#: system/settings/settings.xml
++msgctxt "#36679"
++msgid "Auto 2 adds the CM v4.0 metadata to a video without L2 trims, and while the scene's peak is within the TV peak luminance plus this margin."
++msgstr ""
++
++#. Description of setting with label #36675 "Remove L2 trims"
++#: system/settings/settings.xml
++msgctxt "#36680"
++msgid "Leaves the video's L2 trims out of the metadata sent to the display. L8 trims stay."
++msgstr ""
++
++#. Description of setting with label #36676 "TV peak luminance (nits)"
++#: system/settings/settings.xml
++msgctxt "#36681"
++msgid "The display's peak luminance, 1 to 10000 nits, for the Auto rules of the CM v4.0 metadata. 0: not known, and the rules that need it add nothing."
++msgstr ""
++
++#empty strings from id 36682 to 36898
+ 
+ #. Description of setting with label #729 "Enable SSL"
+ #: system/settings/settings.xml
+diff --git a/addons/skin.estuary/xml/Includes_PlayerProcessInfo.xml b/addons/skin.estuary/xml/Includes_PlayerProcessInfo.xml
+index 61d222fc7..ca2181ac8 100644
+--- a/addons/skin.estuary/xml/Includes_PlayerProcessInfo.xml
++++ b/addons/skin.estuary/xml/Includes_PlayerProcessInfo.xml
+@@ -491,6 +491,10 @@
+ 				<param name="label" value="Infoframe"/>
+ 				<param name="property" value="Info.Infoframe"/>
+ 			</include>
++			<include content="PlayerInfoPropertyRow">
++				<param name="label" value="Metadata sent"/>
++				<param name="property" value="Info.DV.Metadata"/>
++			</include>
+ 			<include content="PlayerInfoRow">
+ 				<param name="label" value="Subtitles"/>
+ 				<param name="value" value="$VAR[SubtitleCodecVar]$INFO[VideoPlayer.SubtitlesLanguage, · ]"/>
+diff --git a/system/settings/settings.xml b/system/settings/settings.xml
+index 339ff7240..43d274a88 100755
+--- a/system/settings/settings.xml
++++ b/system/settings/settings.xml
+@@ -392,6 +392,111 @@
+           </constraints>
+           <control type="spinner" format="string" />
+         </setting>
++        <setting id="videoplayer.dolbyvisioncm4" type="integer" label="36664" help="36677">
++          <requirement>HAVE_PIDV</requirement>
++          <dependencies>
++            <dependency type="visible">
++              <condition on="property" name="supportsdolbyvision" />
++            </dependency>
++            <dependency type="enable" setting="videoplayer.allowedhdrformats" operator="contains">0</dependency>
++          </dependencies>
++          <level>2</level>
++          <default>0</default>
++          <constraints>
++            <options>
++              <option label="16039">0</option>
++              <option label="36665">1</option>
++              <option label="20422">2</option>
++              <option label="16316">3</option>
++              <option label="36667">4</option>
++            </options>
++          </constraints>
++          <control type="spinner" format="string" />
++        </setting>
++        <setting id="videoplayer.dolbyvisioncm4trigger" type="integer" parent="videoplayer.dolbyvisioncm4" label="36668" help="36678">
++          <requirement>HAVE_PIDV</requirement>
++          <dependencies>
++            <dependency type="visible">
++              <and>
++                <condition on="property" name="supportsdolbyvision" />
++                <condition setting="videoplayer.dolbyvisioncm4" operator="is">3</condition>
++              </and>
++            </dependency>
++            <dependency type="enable" setting="videoplayer.allowedhdrformats" operator="contains">0</dependency>
++          </dependencies>
++          <level>2</level>
++          <default>0</default>
++          <constraints>
++            <options>
++              <option label="36669">0</option>
++              <option label="36670">1000</option>
++              <option label="36671">2000</option>
++              <option label="36672">4000</option>
++              <option label="36673">10000</option>
++            </options>
++          </constraints>
++          <control type="spinner" format="string" />
++        </setting>
++        <setting id="videoplayer.dolbyvisioncm4headroom" type="integer" parent="videoplayer.dolbyvisioncm4" label="36674" help="36679">
++          <requirement>HAVE_PIDV</requirement>
++          <dependencies>
++            <dependency type="visible">
++              <and>
++                <condition on="property" name="supportsdolbyvision" />
++                <condition setting="videoplayer.dolbyvisioncm4" operator="is">4</condition>
++              </and>
++            </dependency>
++            <dependency type="enable" setting="videoplayer.allowedhdrformats" operator="contains">0</dependency>
++          </dependencies>
++          <level>2</level>
++          <default>20</default>
++          <constraints>
++            <minimum>0</minimum>
++            <step>5</step>
++            <maximum>50</maximum>
++          </constraints>
++          <control type="spinner" format="string">
++            <formatlabel>14047</formatlabel>
++          </control>
++        </setting>
++        <setting id="videoplayer.dolbyvisionpeak" type="integer" parent="videoplayer.dolbyvisioncm4" label="36676" help="36681">
++          <requirement>HAVE_PIDV</requirement>
++          <dependencies>
++            <dependency type="visible">
++              <and>
++                <condition on="property" name="supportsdolbyvision" />
++                <or>
++                  <condition setting="videoplayer.dolbyvisioncm4" operator="is">4</condition>
++                  <and>
++                    <condition setting="videoplayer.dolbyvisioncm4" operator="is">3</condition>
++                    <condition setting="videoplayer.dolbyvisioncm4trigger" operator="is">0</condition>
++                  </and>
++                </or>
++              </and>
++            </dependency>
++            <dependency type="enable" setting="videoplayer.allowedhdrformats" operator="contains">0</dependency>
++          </dependencies>
++          <level>2</level>
++          <default>0</default>
++          <constraints>
++            <minimum>0</minimum>
++            <step>1</step>
++            <maximum>10000</maximum>
++          </constraints>
++          <control type="edit" format="integer" />
++        </setting>
++        <setting id="videoplayer.dolbyvisionremovel2" type="boolean" label="36675" help="36680">
++          <requirement>HAVE_PIDV</requirement>
++          <dependencies>
++            <dependency type="visible">
++              <condition on="property" name="supportsdolbyvision" />
++            </dependency>
++            <dependency type="enable" setting="videoplayer.allowedhdrformats" operator="contains">0</dependency>
++          </dependencies>
++          <level>3</level>
++          <default>false</default>
++          <control type="toggle" />
++        </setting>
+       </group>
+       <group id="4" label="14232">
+         <setting id="videoplayer.stereoscopicplaybackmode" type="integer" label="36520" help="36537">
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.cpp
+index 9bab58611..cae6a0035 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.cpp
+@@ -284,6 +284,7 @@ std::unique_ptr<CDVTunnelDRMPRIME> CDVTunnelDRMPRIME::Create(const VideoPicture&
+     CLog::Log(LOGERROR, "CDVTunnelDRMPRIME: engine: {}", pi_strerror(ret));
+     return nullptr;
+   }
++  tunnel->SetMetadata(options.metadata);
+ 
+   tunnel->m_info.width = picture.iWidth;
+   tunnel->m_info.height = picture.iHeight;
+@@ -568,8 +569,29 @@ bool CDVTunnelDRMPRIME::DrawTexture(unsigned int texture, const std::vector<CRec
+       });
+ }
+ 
++void CDVTunnelDRMPRIME::SetMetadata(const Options::Metadata& metadata)
++{
++  pi_dm_options o{};
++  o.cm4 = metadata.cm4;
++  o.cm4_trigger = metadata.cm4Trigger;
++  o.cm4_headroom = metadata.cm4Headroom;
++  o.no_l2 = metadata.removeL2;
++  o.tv_peak = metadata.displayPeak;
++
++  const int ret = pi_engine_set_dm(m_engine, &o);
++  if (ret != PI_OK)
++    CLog::Log(LOGERROR, "CDVTunnelDRMPRIME: metadata options: {}", pi_strerror(ret));
++  else
++    CLog::Log(LOGINFO, "CDVTunnelDRMPRIME: metadata: CM v4.0 mode {}, L2 trims {}",
++              static_cast<int>(metadata.cm4), metadata.removeL2 ? "removed" : "kept");
++  m_options.metadata = metadata;
++}
++
+ bool CDVTunnelDRMPRIME::SetOptions(const Options& options)
+ {
++  // the metadata's apply from the next picture
++  if (options.metadata != m_options.metadata)
++    SetMetadata(options.metadata);
+   if (options == m_options)
+     return true;
+ 
+@@ -678,6 +700,7 @@ CVideoBufferDRMPRIME* CDVTunnelDRMPRIME::Render(CVideoBufferDRMPRIME* buffer, in
+   else
+     m_layers = m_options.enhancementLayer ? Layers::MINIMAL : Layers::OFF;
+   m_mmr = UsesMMR(frame.rpu_frame ? frame.rpu_frame : frame.bl);
++  pi_engine_dm_status(m_engine, &m_metadata);
+ 
+   if (m_overlayShown >= 0 && fence >= 0)
+   {
+@@ -717,6 +740,35 @@ void CDVTunnelDRMPRIME::Describe(DRMPRIME::PlayerInfo& info, float fps) const
+   info["Info.Filters"] = m_options.filters == PI_FILTERS_PHASE ? "Phase" : "CB1";
+   info["Info.Link"] = "RGB 8-bit tunnel";
+ 
++  // what Options::Metadata made of the stream's, where they ask for anything
++  std::string metadata;
++  switch (m_metadata.cm4)
++  {
++    case PI_CM4_STATUS_APPENDED:
++      metadata = "CM v4.0 added";
++      break;
++    case PI_CM4_STATUS_NOT_SELECTED:
++      if (m_options.metadata.cm4 == PI_CM4_NO_L2)
++        metadata = "CM v2.9 (has L2 trims)";
++      else if (m_options.metadata.cm4 == PI_CM4_AUTO2)
++        metadata = "CM v2.9 (above the TV peak)";
++      else
++        metadata = "CM v2.9 (above the trigger)";
++      break;
++    case PI_CM4_STATUS_NEEDS_TV:
++      metadata = "CM v2.9 (TV peak not set)";
++      break;
++    case PI_CM4_STATUS_REJECTED:
++      metadata = "CM v2.9 (no room for CM v4.0)";
++      break;
++    default:
++      break;
++  }
++  if (m_metadata.l2_removed > 0)
++    metadata += metadata.empty() ? "L2 trims removed" : " · L2 trims removed";
++  if (!metadata.empty())
++    info["Info.DV.Metadata"] = metadata;
++
+   if (m_gpuMs > 0 && fps > 0)
+   {
+     const double frameMs = 1000.0 / static_cast<double>(fps);
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.h b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.h
+index d296141b4..bd88a9669 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.h
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/DVTunnelDRMPRIME.h
+@@ -35,11 +35,24 @@ class CDVTunnelDRMPRIME
+ public:
+   struct Options
+   {
++    //! The stream's display-management metadata as the sink gets it (pi_dm_options)
++    struct Metadata
++    {
++      pi_cm4_mode cm4 = PI_CM4_OFF; //!< CM v4.0 blocks added to a CM v2.9 stream's
++      unsigned int cm4Trigger = 0; //!< PI_CM4_AUTO: nits; 0: the display's peak
++      unsigned int cm4Headroom = 20; //!< PI_CM4_AUTO2: percent above the display's peak
++      bool removeL2 = false; //!< the stream's L2 trims left out
++      unsigned int displayPeak = 0; //!< nits; 0: not known
++
++      bool operator==(const Metadata& other) const = default;
++    };
++
+     pi_mmr_mode mmr = PI_MMR_EXACT;
+     pi_filters filters = PI_FILTERS_CB1;
+     pi_el_upscale elUpscale = PI_EL_BILINEAR;
+     //! render the enhancement layer where the RPU needs it (FEL); false: the base layer alone
+     bool enhancementLayer = true;
++    Metadata metadata;
+ 
+     bool operator==(const Options& other) const = default;
+   };
+@@ -52,7 +65,7 @@ public:
+   static std::unique_ptr<CDVTunnelDRMPRIME> Create(const VideoPicture& picture,
+                                                    const Options& options);
+ 
+-  //! \brief Applies changed options, reopening the engine's stream
++  //! \brief Applies changed options, reopening the engine's stream for all but the metadata's
+   bool SetOptions(const Options& options);
+   /*!
+    * \brief Reopens the engine's stream: it releases its imports of the decoder's buffers,
+@@ -108,6 +121,7 @@ private:
+   struct Overlay;
+ 
+   CDVTunnelDRMPRIME() = default;
++  void SetMetadata(const Options::Metadata& metadata);
+   bool AllocateOverlays(unsigned int width, unsigned int height);
+   void ReleaseOverlays();
+ 
+@@ -133,6 +147,8 @@ private:
+   double m_gpuMs = 0;
+   //! whether the last render's RPU maps chroma with MMR
+   bool m_mmr = false;
++  //! what Options::Metadata made of the last render's metadata
++  pi_dm_status m_metadata{};
+ 
+   std::vector<std::unique_ptr<Overlay>> m_overlays;
+   unsigned int m_overlayWidth = 0;
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIME.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIME.cpp
+index adfa98e16..509333249 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIME.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIME.cpp
+@@ -246,6 +246,20 @@ CDVTunnelDRMPRIME::Options GetDolbyVisionOptions(const CVideoSettings& settings)
+       break;
+   }
+   options.enhancementLayer = settings.m_DolbyVisionEL != VS_DOLBYVISION_EL_OFF;
++
++  // EDOLBYVISIONCM4's values are pi_cm4_mode's; out of range: off
++  CDVTunnelDRMPRIME::Options::Metadata& metadata = options.metadata;
++  if (settings.m_DolbyVisionCM4 >= VS_DOLBYVISION_CM4_OFF &&
++      settings.m_DolbyVisionCM4 <= VS_DOLBYVISION_CM4_AUTO2)
++    metadata.cm4 = static_cast<pi_cm4_mode>(settings.m_DolbyVisionCM4);
++  const int trigger = settings.m_DolbyVisionCM4Trigger;
++  if (trigger == 1000 || trigger == 2000 || trigger == 4000 || trigger == 10000)
++    metadata.cm4Trigger = static_cast<unsigned int>(trigger);
++  metadata.cm4Headroom =
++      static_cast<unsigned int>(std::clamp(settings.m_DolbyVisionCM4Headroom, 0, 50));
++  metadata.removeL2 = settings.m_DolbyVisionRemoveL2;
++  metadata.displayPeak =
++      static_cast<unsigned int>(std::clamp(settings.m_DolbyVisionPeak, 0, 10000));
+   return options;
+ }
+ 
+diff --git a/xbmc/cores/VideoSettings.cpp b/xbmc/cores/VideoSettings.cpp
+index a9028d34e..b52515a73 100644
+--- a/xbmc/cores/VideoSettings.cpp
++++ b/xbmc/cores/VideoSettings.cpp
+@@ -49,6 +49,11 @@ CVideoSettings::CVideoSettings()
+   m_DolbyVisionMMR = VS_DOLBYVISION_MMR_EXACT;
+   m_DolbyVisionFilters = VS_DOLBYVISION_FILTERS_CB1;
+   m_DolbyVisionInfoframe = VS_DOLBYVISION_INFOFRAME_AUTO;
++  m_DolbyVisionCM4 = VS_DOLBYVISION_CM4_OFF;
++  m_DolbyVisionCM4Trigger = 0;
++  m_DolbyVisionCM4Headroom = 20;
++  m_DolbyVisionRemoveL2 = false;
++  m_DolbyVisionPeak = 0;
+ }
+ 
+ bool CVideoSettings::operator!=(const CVideoSettings &right) const
+@@ -86,6 +91,11 @@ bool CVideoSettings::operator!=(const CVideoSettings &right) const
+   if (m_DolbyVisionMMR != right.m_DolbyVisionMMR) return true;
+   if (m_DolbyVisionFilters != right.m_DolbyVisionFilters) return true;
+   if (m_DolbyVisionInfoframe != right.m_DolbyVisionInfoframe) return true;
++  if (m_DolbyVisionCM4 != right.m_DolbyVisionCM4) return true;
++  if (m_DolbyVisionCM4Trigger != right.m_DolbyVisionCM4Trigger) return true;
++  if (m_DolbyVisionCM4Headroom != right.m_DolbyVisionCM4Headroom) return true;
++  if (m_DolbyVisionRemoveL2 != right.m_DolbyVisionRemoveL2) return true;
++  if (m_DolbyVisionPeak != right.m_DolbyVisionPeak) return true;
+   return false;
+ }
+ 
+diff --git a/xbmc/cores/VideoSettings.h b/xbmc/cores/VideoSettings.h
+index 5b635d017..366ce330f 100644
+--- a/xbmc/cores/VideoSettings.h
++++ b/xbmc/cores/VideoSettings.h
+@@ -232,6 +232,16 @@ enum EDOLBYVISIONINFOFRAME
+   VS_DOLBYVISION_INFOFRAME_DOLBY = 2,
+ };
+ 
++//! CM v4.0 metadata added to a CM v2.9 stream's (pi_cm4_mode)
++enum EDOLBYVISIONCM4
++{
++  VS_DOLBYVISION_CM4_OFF = 0,
++  VS_DOLBYVISION_CM4_NO_L2 = 1, //!< a stream without L2 trims
++  VS_DOLBYVISION_CM4_ALWAYS = 2,
++  VS_DOLBYVISION_CM4_AUTO = 3, //!< by the mastering peak
++  VS_DOLBYVISION_CM4_AUTO2 = 4, //!< by the scene's peak (L1)
++};
++
+ enum ViewMode
+ {
+   ViewModeNormal = 0,
+@@ -289,6 +299,11 @@ public:
+   EDOLBYVISIONMMR m_DolbyVisionMMR;
+   EDOLBYVISIONFILTERS m_DolbyVisionFilters;
+   EDOLBYVISIONINFOFRAME m_DolbyVisionInfoframe;
++  EDOLBYVISIONCM4 m_DolbyVisionCM4;
++  int m_DolbyVisionCM4Trigger; //!< Auto: nits; 0: the display's peak
++  int m_DolbyVisionCM4Headroom; //!< Auto 2: percent above the display's peak
++  bool m_DolbyVisionRemoveL2; //!< the stream's L2 trims left out
++  int m_DolbyVisionPeak; //!< the display's peak, nits; 0: not known
+   std::optional<bool>
+       m_isDefaultVideoSettings; //!< true: default video settings, false: video specific
+ };
+diff --git a/xbmc/settings/MediaSettings.cpp b/xbmc/settings/MediaSettings.cpp
+index 336f2d5c8..f1560f39d 100644
+--- a/xbmc/settings/MediaSettings.cpp
++++ b/xbmc/settings/MediaSettings.cpp
+@@ -382,7 +382,12 @@ void CMediaSettings::OnSettingChanged(const std::shared_ptr<const CSetting>& set
+            settingId == CSettings::SETTING_VIDEOPLAYER_DOLBYVISIONINFOFRAME ||
+            settingId == CSettings::SETTING_VIDEOPLAYER_DOLBYVISIONUPSCALE ||
+            settingId == CSettings::SETTING_VIDEOPLAYER_DOLBYVISIONMMR ||
+-           settingId == CSettings::SETTING_VIDEOPLAYER_DOLBYVISIONFILTERS)
++           settingId == CSettings::SETTING_VIDEOPLAYER_DOLBYVISIONFILTERS ||
++           settingId == CSettings::SETTING_VIDEOPLAYER_DOLBYVISIONCM4 ||
++           settingId == CSettings::SETTING_VIDEOPLAYER_DOLBYVISIONCM4TRIGGER ||
++           settingId == CSettings::SETTING_VIDEOPLAYER_DOLBYVISIONCM4HEADROOM ||
++           settingId == CSettings::SETTING_VIDEOPLAYER_DOLBYVISIONREMOVEL2 ||
++           settingId == CSettings::SETTING_VIDEOPLAYER_DOLBYVISIONPEAK)
+     GetDolbyVisionSettings(m_defaultVideoSettings);
+ }
+ 
+@@ -405,6 +410,15 @@ void CMediaSettings::GetDolbyVisionSettings(CVideoSettings& settings)
+       static_cast<EDOLBYVISIONMMR>(s->GetInt(CSettings::SETTING_VIDEOPLAYER_DOLBYVISIONMMR));
+   settings.m_DolbyVisionFilters = static_cast<EDOLBYVISIONFILTERS>(
+       s->GetInt(CSettings::SETTING_VIDEOPLAYER_DOLBYVISIONFILTERS));
++  settings.m_DolbyVisionCM4 =
++      static_cast<EDOLBYVISIONCM4>(s->GetInt(CSettings::SETTING_VIDEOPLAYER_DOLBYVISIONCM4));
++  settings.m_DolbyVisionCM4Trigger =
++      s->GetInt(CSettings::SETTING_VIDEOPLAYER_DOLBYVISIONCM4TRIGGER);
++  settings.m_DolbyVisionCM4Headroom =
++      s->GetInt(CSettings::SETTING_VIDEOPLAYER_DOLBYVISIONCM4HEADROOM);
++  settings.m_DolbyVisionRemoveL2 =
++      s->GetBool(CSettings::SETTING_VIDEOPLAYER_DOLBYVISIONREMOVEL2);
++  settings.m_DolbyVisionPeak = s->GetInt(CSettings::SETTING_VIDEOPLAYER_DOLBYVISIONPEAK);
+ #endif
+ }
+ 
+@@ -417,6 +431,13 @@ void CMediaSettings::SetDolbyVisionSettings(const CVideoSettings& settings)
+   s->SetInt(CSettings::SETTING_VIDEOPLAYER_DOLBYVISIONUPSCALE, settings.m_DolbyVisionUpscale);
+   s->SetInt(CSettings::SETTING_VIDEOPLAYER_DOLBYVISIONMMR, settings.m_DolbyVisionMMR);
+   s->SetInt(CSettings::SETTING_VIDEOPLAYER_DOLBYVISIONFILTERS, settings.m_DolbyVisionFilters);
++  s->SetInt(CSettings::SETTING_VIDEOPLAYER_DOLBYVISIONCM4, settings.m_DolbyVisionCM4);
++  s->SetInt(CSettings::SETTING_VIDEOPLAYER_DOLBYVISIONCM4TRIGGER,
++            settings.m_DolbyVisionCM4Trigger);
++  s->SetInt(CSettings::SETTING_VIDEOPLAYER_DOLBYVISIONCM4HEADROOM,
++            settings.m_DolbyVisionCM4Headroom);
++  s->SetBool(CSettings::SETTING_VIDEOPLAYER_DOLBYVISIONREMOVEL2, settings.m_DolbyVisionRemoveL2);
++  s->SetInt(CSettings::SETTING_VIDEOPLAYER_DOLBYVISIONPEAK, settings.m_DolbyVisionPeak);
+ #endif
+ }
+ 
+diff --git a/xbmc/settings/Settings.cpp b/xbmc/settings/Settings.cpp
+index a9763e186..93871d914 100644
+--- a/xbmc/settings/Settings.cpp
++++ b/xbmc/settings/Settings.cpp
+@@ -596,7 +596,12 @@ void CSettings::InitializeISettingCallbacks()
+        CSettings::SETTING_VIDEOPLAYER_DOLBYVISIONINFOFRAME,
+        CSettings::SETTING_VIDEOPLAYER_DOLBYVISIONUPSCALE,
+        CSettings::SETTING_VIDEOPLAYER_DOLBYVISIONMMR,
+-       CSettings::SETTING_VIDEOPLAYER_DOLBYVISIONFILTERS});
++       CSettings::SETTING_VIDEOPLAYER_DOLBYVISIONFILTERS,
++       CSettings::SETTING_VIDEOPLAYER_DOLBYVISIONCM4,
++       CSettings::SETTING_VIDEOPLAYER_DOLBYVISIONCM4TRIGGER,
++       CSettings::SETTING_VIDEOPLAYER_DOLBYVISIONCM4HEADROOM,
++       CSettings::SETTING_VIDEOPLAYER_DOLBYVISIONREMOVEL2,
++       CSettings::SETTING_VIDEOPLAYER_DOLBYVISIONPEAK});
+ 
+   GetSettingsManager()->RegisterCallback(
+       &CDisplaySettings::GetInstance(),
+diff --git a/xbmc/settings/Settings.h b/xbmc/settings/Settings.h
+index d7708bb1b..4166cf3b0 100644
+--- a/xbmc/settings/Settings.h
++++ b/xbmc/settings/Settings.h
+@@ -151,6 +151,14 @@ public:
+   static constexpr auto SETTING_VIDEOPLAYER_DOLBYVISIONUPSCALE = "videoplayer.dolbyvisionupscale";
+   static constexpr auto SETTING_VIDEOPLAYER_DOLBYVISIONMMR = "videoplayer.dolbyvisionmmr";
+   static constexpr auto SETTING_VIDEOPLAYER_DOLBYVISIONFILTERS = "videoplayer.dolbyvisionfilters";
++  static constexpr auto SETTING_VIDEOPLAYER_DOLBYVISIONCM4 = "videoplayer.dolbyvisioncm4";
++  static constexpr auto SETTING_VIDEOPLAYER_DOLBYVISIONCM4TRIGGER =
++      "videoplayer.dolbyvisioncm4trigger";
++  static constexpr auto SETTING_VIDEOPLAYER_DOLBYVISIONCM4HEADROOM =
++      "videoplayer.dolbyvisioncm4headroom";
++  static constexpr auto SETTING_VIDEOPLAYER_DOLBYVISIONREMOVEL2 =
++      "videoplayer.dolbyvisionremovel2";
++  static constexpr auto SETTING_VIDEOPLAYER_DOLBYVISIONPEAK = "videoplayer.dolbyvisionpeak";
+   static constexpr auto SETTING_VIDEOPLAYER_FILESTREAMDISPLAYORDER =
+       "videoplayer.filestreamdisplayorder";
+   static constexpr auto SETTING_VIDEOPLAYER_QUEUETIMESIZE = "videoplayer.queuetimesize";
+diff --git a/xbmc/video/dialogs/GUIDialogVideoSettings.cpp b/xbmc/video/dialogs/GUIDialogVideoSettings.cpp
+index 0c274026b..88c86bf17 100644
+--- a/xbmc/video/dialogs/GUIDialogVideoSettings.cpp
++++ b/xbmc/video/dialogs/GUIDialogVideoSettings.cpp
+@@ -24,6 +24,7 @@
+ #include "settings/SettingsComponent.h"
+ #include "settings/lib/Setting.h"
+ #include "settings/lib/SettingDefinitions.h"
++#include "settings/lib/SettingDependency.h"
+ #include "settings/lib/SettingsManager.h"
+ #include "utils/StringUtils.h"
+ #include "utils/Variant.h"
+@@ -61,6 +62,11 @@
+ #define SETTING_VIDEO_DOLBYVISION_MMR     "video.dolbyvision.mmr"
+ #define SETTING_VIDEO_DOLBYVISION_FILTERS "video.dolbyvision.filters"
+ #define SETTING_VIDEO_DOLBYVISION_INFOFRAME "video.dolbyvision.infoframe"
++#define SETTING_VIDEO_DOLBYVISION_CM4     "video.dolbyvision.cm4"
++#define SETTING_VIDEO_DOLBYVISION_CM4_TRIGGER "video.dolbyvision.cm4trigger"
++#define SETTING_VIDEO_DOLBYVISION_CM4_HEADROOM "video.dolbyvision.cm4headroom"
++#define SETTING_VIDEO_DOLBYVISION_PEAK    "video.dolbyvision.peak"
++#define SETTING_VIDEO_DOLBYVISION_REMOVE_L2 "video.dolbyvision.removel2"
+ 
+ #define SETTING_VIDEO_STEREOSCOPICMODE    "video.stereoscopicmode"
+ #define SETTING_VIDEO_STEREOSCOPICINVERT  "video.stereoscopicinvert"
+@@ -212,7 +218,11 @@ void CGUIDialogVideoSettings::OnSettingChanged(const std::shared_ptr<const CSett
+            settingId == SETTING_VIDEO_DOLBYVISION_UPSCALE ||
+            settingId == SETTING_VIDEO_DOLBYVISION_MMR ||
+            settingId == SETTING_VIDEO_DOLBYVISION_FILTERS ||
+-           settingId == SETTING_VIDEO_DOLBYVISION_INFOFRAME)
++           settingId == SETTING_VIDEO_DOLBYVISION_INFOFRAME ||
++           settingId == SETTING_VIDEO_DOLBYVISION_CM4 ||
++           settingId == SETTING_VIDEO_DOLBYVISION_CM4_TRIGGER ||
++           settingId == SETTING_VIDEO_DOLBYVISION_CM4_HEADROOM ||
++           settingId == SETTING_VIDEO_DOLBYVISION_PEAK)
+   {
+     CVideoSettings vs = appPlayer->GetVideoSettings();
+     const int value = std::static_pointer_cast<const CSettingInt>(setting)->GetValue();
+@@ -224,10 +234,24 @@ void CGUIDialogVideoSettings::OnSettingChanged(const std::shared_ptr<const CSett
+       vs.m_DolbyVisionMMR = static_cast<EDOLBYVISIONMMR>(value);
+     else if (settingId == SETTING_VIDEO_DOLBYVISION_FILTERS)
+       vs.m_DolbyVisionFilters = static_cast<EDOLBYVISIONFILTERS>(value);
++    else if (settingId == SETTING_VIDEO_DOLBYVISION_CM4)
++      vs.m_DolbyVisionCM4 = static_cast<EDOLBYVISIONCM4>(value);
++    else if (settingId == SETTING_VIDEO_DOLBYVISION_CM4_TRIGGER)
++      vs.m_DolbyVisionCM4Trigger = value;
++    else if (settingId == SETTING_VIDEO_DOLBYVISION_CM4_HEADROOM)
++      vs.m_DolbyVisionCM4Headroom = value;
++    else if (settingId == SETTING_VIDEO_DOLBYVISION_PEAK)
++      vs.m_DolbyVisionPeak = value;
+     else
+       vs.m_DolbyVisionInfoframe = static_cast<EDOLBYVISIONINFOFRAME>(value);
+     appPlayer->SetVideoSettings(vs);
+   }
++  else if (settingId == SETTING_VIDEO_DOLBYVISION_REMOVE_L2)
++  {
++    CVideoSettings vs = appPlayer->GetVideoSettings();
++    vs.m_DolbyVisionRemoveL2 = std::static_pointer_cast<const CSettingBool>(setting)->GetValue();
++    appPlayer->SetVideoSettings(vs);
++  }
+   else if (settingId == SETTING_VIDEO_STEREOSCOPICMODE)
+   {
+     CVideoSettings vs = appPlayer->GetVideoSettings();
+@@ -544,6 +568,56 @@ void CGUIDialogVideoSettings::InitializeSettings()
+     entries.emplace_back(36658, VS_DOLBYVISION_INFOFRAME_DOLBY);
+     AddSpinner(groupDolbyVision, SETTING_VIDEO_DOLBYVISION_INFOFRAME, 36656, SettingLevel::Basic,
+                videoSettings.m_DolbyVisionInfoframe, entries);
++
++    // CM v4.0 metadata for a CM v2.9 video, and what its Auto rules go by
++    entries.clear();
++    entries.emplace_back(16039, VS_DOLBYVISION_CM4_OFF);
++    entries.emplace_back(36665, VS_DOLBYVISION_CM4_NO_L2);
++    entries.emplace_back(20422, VS_DOLBYVISION_CM4_ALWAYS);
++    entries.emplace_back(16316, VS_DOLBYVISION_CM4_AUTO);
++    entries.emplace_back(36667, VS_DOLBYVISION_CM4_AUTO2);
++    AddSpinner(groupDolbyVision, SETTING_VIDEO_DOLBYVISION_CM4, 36664, SettingLevel::Advanced,
++               videoSettings.m_DolbyVisionCM4, entries);
++
++    const auto is = [this](const char* id, int value)
++    {
++      return std::make_shared<CSettingDependencyCondition>(
++          id, std::to_string(value), SettingDependencyOperator::Equals, false, GetSettingsManager());
++    };
++
++    CSettingDependency withAuto(SettingDependencyType::Visible, GetSettingsManager());
++    withAuto.And()->Add(is(SETTING_VIDEO_DOLBYVISION_CM4, VS_DOLBYVISION_CM4_AUTO));
++    entries.clear();
++    entries.emplace_back(36669, 0);
++    entries.emplace_back(36670, 1000);
++    entries.emplace_back(36671, 2000);
++    entries.emplace_back(36672, 4000);
++    entries.emplace_back(36673, 10000);
++    AddSpinner(groupDolbyVision, SETTING_VIDEO_DOLBYVISION_CM4_TRIGGER, 36668,
++               SettingLevel::Advanced, videoSettings.m_DolbyVisionCM4Trigger, entries)
++        ->SetDependencies({withAuto});
++
++    CSettingDependency withAuto2(SettingDependencyType::Visible, GetSettingsManager());
++    withAuto2.And()->Add(is(SETTING_VIDEO_DOLBYVISION_CM4, VS_DOLBYVISION_CM4_AUTO2));
++    AddSpinner(groupDolbyVision, SETTING_VIDEO_DOLBYVISION_CM4_HEADROOM, 36674,
++               SettingLevel::Advanced, videoSettings.m_DolbyVisionCM4Headroom, 0, 5, 50, 14047)
++        ->SetDependencies({withAuto2});
++
++    // the display's peak: Auto 2's, and Auto's while that is its trigger
++    CSettingDependency withPeak(SettingDependencyType::Visible, GetSettingsManager());
++    const auto autoByPeak = std::make_shared<CSettingDependencyConditionCombination>(
++        BooleanLogicOperationAnd, GetSettingsManager());
++    autoByPeak->Add(is(SETTING_VIDEO_DOLBYVISION_CM4, VS_DOLBYVISION_CM4_AUTO))
++        ->Add(is(SETTING_VIDEO_DOLBYVISION_CM4_TRIGGER, 0));
++    withPeak.Or()
++        ->Add(is(SETTING_VIDEO_DOLBYVISION_CM4, VS_DOLBYVISION_CM4_AUTO2))
++        ->Add(autoByPeak);
++    AddEdit(groupDolbyVision, SETTING_VIDEO_DOLBYVISION_PEAK, 36676, SettingLevel::Advanced,
++            videoSettings.m_DolbyVisionPeak, 0, 1, 10000)
++        ->SetDependencies({withPeak});
++
++    AddToggle(groupDolbyVision, SETTING_VIDEO_DOLBYVISION_REMOVE_L2, 36675, SettingLevel::Expert,
++              videoSettings.m_DolbyVisionRemoveL2);
+   }
+ 
+   // stereoscopic settings
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,8 +1,8 @@
 # Kodi patches
 
 Standard (TV-led) Dolby Vision output for Kodi's GBM / DRM PRIME path,
-rendered by the engine (`libpi_engine`). Against Kodi `c0718c9a69` (the
-commit LibreELEC 13 builds), on top of the patches LibreELEC carries for it
+rendered by the engine (`libpi_engine`). Against Kodi `22.0rc2-Piers` (the
+release LibreELEC 13 builds), on top of the patches LibreELEC carries for it
 (`packages/mediacenter/kodi/patches/*.patch`, `cec-framework/`, and the RPi
 series `projects/RPi/patches/kodi/0001–0011`). Apply in order with `git am`.
 `../libreelec/0004` carries them as `projects/RPi/devices/RPi5/patches/kodi/`.
@@ -20,6 +20,7 @@ series `projects/RPi/patches/kodi/0001–0011`). Apply in order with `git am`.
 | `0009` [VideoPlayer] DRM PRIME: composite the GUI into the Dolby Vision signal | While the tunnel is on, `CWinSystemGbm::SetGuiCapture` renders the GUI into a texture (the GBM GLES context's GUI compositing FBO) instead of the GUI plane, which stays transparent, and the renderer copies it (`glBlitFramebuffer`) into the tunnel's overlay buffer, subtitles included (drawn into the GUI, under the OSD), so the OSD and menus are in their own colours. The areas handed to the engine are those of the controls that drew (`CGUIWindowManager::GetRenderedRegions`: a leaf control whose `Render` drew GUI elements) grouped in bands of rows, up to `PI_OVERLAY_RECTS` (the engine's API 3). During playback a GUI change waits for the next picture (a held picture is rendered again after 100 ms), and the GUI is drawn at most 12 times a second (`CApplication::FrameMove`). |
 | `0010` [VideoPlayer] DRM PRIME: Dolby Vision for streams cropped to the picture | A stream encoded at the picture's size (3840×2076, say) gets a 16:9 tunnel frame (3840×2160) with the picture in its middle (libpi_engine 0.4.2: an output taller than the stream), so it plays in Dolby Vision in a mode of that size instead of falling back to HDR10. `CDVTunnelDRMPRIME::GetOutputWidth/Height` are the tunnel frame's size, which the renderer checks the mode against. |
 | `0011` [dialogs] Player information: Input, Processing and Output columns | Estuary's Player information (`DialogPlayerProcessInfo.xml`, `Includes_PlayerProcessInfo.xml`) in three columns, after the panel of [libreelec-x86-DV](https://github.com/CroqueMr/libreelec-x86-DV/pull/92): Input (the stream, its pixel format and colour tags, its Dolby Vision profile, level, CM version and layers, the RPU's levels as chips), Processing (the engine's reconstruction, chroma mapping, filters and GPU time per picture; the static, RPU (L1–L11, L254, L255) and HDR10+ metadata) and Output (the mode, the signal, the tunnel and its infoframe, audio, buffers), and meters. While the dialog is shown (`CDataCacheCore::SetPlayerInfoShown`), `CRendererDRMPRIME` describes the picture on screen twice a second (`DRMPRIME::DescribePicture`, `CDVTunnelDRMPRIME::Describe`) into `CDataCacheCore::SetVideoPlayerInfo`, which the dialog sets as its window properties. The engine profiles every render (`pi_options.profile`). `VideoPicture` carries the configuration record's level and compatibility ID. |
+| `0012` [VideoPlayer] DRM PRIME: Dolby Vision CM v4.0 metadata and L2 trims | The Dolby Vision group of Player / Videos and of the video settings gets Add CM v4.0 metadata (Off, Without L2 trims only, Always, Auto, Auto 2), Auto's trigger, Auto 2's headroom, the TV peak luminance those rules go by, and Remove L2 trims (libpi_engine's `pi_engine_set_dm`: neutral L3, L9, L11 and L254 added to a CM v2.9 stream's metadata, as CB1's `cb1_cmv40` does). They apply from the next picture; Player information's Output column shows what was sent. |
 
 ## When the tunnel is used
 
