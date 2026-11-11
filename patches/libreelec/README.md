@@ -22,6 +22,8 @@ with `git am`.
 | `0013` pi-dv-engine: update to 0.4.0 | `PKG_VERSION` / `PKG_SHA256` of the 0.4.0 tarball (`libpi_engine.so.3`, overlay areas), which now downloads from the release `engine-<version>`. |
 | `0014` RPi5: kodi: composite the GUI into the Dolby Vision signal | `../kodi/0009` as `projects/RPi/devices/RPi5/patches/kodi/0048-…`. |
 | `0015` pi-dv-engine: update to 0.4.1 | `PKG_VERSION` / `PKG_SHA256` of the 0.4.1 tarball: faster, the same output and API (`libpi_engine.so.3`). |
+| `0016` pi-dv-engine: update to 0.4.2 | `PKG_VERSION` / `PKG_SHA256` of the 0.4.2 tarball: an output may be taller than the stream (the picture in its middle); the same API (`libpi_engine.so.3`). |
+| `0017` RPi5: kodi: Dolby Vision for streams cropped to the picture | `../kodi/0010` as `projects/RPi/devices/RPi5/patches/kodi/0053-…` (on the tree's 0001–0052). |
 
 **Building:** `make image` as usual (`PROJECT=RPi DEVICE=RPi5 ARCH=aarch64`).
 The engine tarball downloads from the release. To build an engine version
