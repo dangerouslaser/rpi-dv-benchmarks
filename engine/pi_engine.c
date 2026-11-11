@@ -2170,18 +2170,20 @@ static VkRect2D tile_area(const struct pi_engine *e, int i, uint32_t x0, uint32_
     return (VkRect2D){{(int32_t)x0, (int32_t)y0}, {x1 - x0, y1 - y0}};
 }
 
-/* Pass i over rows y0 .. y0 + rows - 1 of its w x h target (the render area:
- * stored tiles, grown to whole ones), as bands of rows each with its
- * pipeline and scissor; rp: render pass i or a compatible twin. */
+/* Pass i over rows y0 .. y0 + rows - 1 and columns x0 .. x1 - 1 of its w x h
+ * target (the render area: stored tiles, grown to whole ones), as bands of
+ * rows each with its pipeline and scissor; rp: render pass i or a
+ * compatible twin. */
 static void pass(struct pi_engine *e, struct ctx *c, int i, VkRenderPass rp, VkFramebuffer fb, uint32_t w, uint32_t h,
-                 uint32_t y0, uint32_t rows, const struct band *b, int n, const VkClearValue *clear)
+                 uint32_t x0, uint32_t x1, uint32_t y0, uint32_t rows, const struct band *b, int n,
+                 const VkClearValue *clear)
 {
     VkClearValue cv[2];
     memset(cv, 0, sizeof(cv));
     if (clear)
         cv[0] = cv[1] = *clear;
     VkRenderPassBeginInfo rbi = {.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, .renderPass = rp,
-                                 .framebuffer = fb, .renderArea = tile_area(e, i, 0, y0, w, y0 + rows, w, h),
+                                 .framebuffer = fb, .renderArea = tile_area(e, i, x0, y0, x1, y0 + rows, w, h),
                                  .clearValueCount = clear ? 2 : 0, .pClearValues = clear ? cv : NULL};
     vkCmdBeginRenderPass(c->cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
     vkCmdBindDescriptorSets(c->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, e->pl, 0, 1, &c->ds, 0, NULL);
@@ -2323,7 +2325,7 @@ static int record(struct pi_engine *e, struct ctx *c, const dvvk_plan *p, struct
     }
     if (p0) {   /* P0: the EL chroma's vertical filter, over the same rows */
         struct band b0 = {p0, c0, crows, 0, 0};
-        pass(e, c, 2, e->rp[2], c->fb0, cw / 2, ch, c0, crows, &b0, 1, NULL);
+        pass(e, c, 2, e->rp[2], c->fb0, cw / 2, ch, 0, cw / 2, c0, crows, &b0, 1, NULL);
         c->elv_read = 1;
     } else if (!c->elv_read) {
         /* P1 binds P0's image whether or not it reads it: give it the layout
@@ -2339,8 +2341,16 @@ static int record(struct pi_engine *e, struct ctx *c, const dvvk_plan *p, struct
                              NULL, 0, NULL, 1, &ib);
         c->elv_read = 1;
     }
-    struct band b1 = {p1, c0, crows, 0, 0};
-    pass(e, c, 0, el_unread ? e->rp1_luma : e->rp[0], c->fb, cw, ch, c0, crows, &b1, 1, NULL);
+    /* and only over the active area's columns (a pillarbox), with a margin
+     * for P2's EL reads, even (P1's quads) */
+    uint32_t cx0 = 0, cx1 = cw;
+    if (!all && p->active[2] > p->active[0] && (p->active[0] > 0 || p->active[2] < w)) {
+        cx0 = p->active[0] / 2 > 8 ? (p->active[0] / 2 - 8) & ~1u : 0;
+        cx1 = (p->active[2] + 1) / 2 + 8 < cw ? ((p->active[2] + 1) / 2 + 9) & ~1u : cw;
+        cx1 = cx1 < cw ? cx1 : cw;
+    }
+    struct band b1 = {p1, c0, crows, cx0, cx1 - cx0};
+    pass(e, c, 0, el_unread ? e->rp1_luma : e->rp[0], c->fb, cw, ch, cx0, cx1, c0, crows, &b1, 1, NULL);
     /* PO: the overlay's rectangles as the source's signal, for P2 */
     int overlay = ov->n > 0;
     if (overlay) {
@@ -2411,15 +2421,37 @@ static int record(struct pi_engine *e, struct ctx *c, const dvvk_plan *p, struct
     struct band b[5 * (1 + 4 * PI_OVERLAY_RECTS)];
     int nb = 0;
     region(b, &nb, pb, overlay ? ov->bars : NULL, 0, a0, top, r, ov->n, cw);
-    region(b, &nb, p2, overlay ? ov->p2 : NULL, a0, i0, i0, r, ov->n, cw);
-    region(b, &nb, p2i, overlay ? ov->p2 : NULL, i0, i1, i1, r, ov->n, cw);
-    region(b, &nb, p2, overlay ? ov->p2 : NULL, i1, a1, a1, r, ov->n, cw);
+    if (!overlay && !all && !(e->o.measure & PI_MEASURE_DRAW_BARS) && (p->active[0] > 0 || p->active[2] < w) &&
+        p->active[2] > p->active[0]) {
+        /* a pillarbox: its side bars aren't drawn (the clear is their black)
+         * but in the packets' rows; the interior variant over the block
+         * columns wholly inside the active area, the full one at its edges */
+        uint32_t bx0 = p->active[0] / 2, bx1 = (p->active[2] + 1) / 2;
+        uint32_t ix0 = (p->active[0] + 1) / 2, ix1 = p->active[2] / 2;
+        uint32_t j0 = (p->active[1] + 1) / 2 > prow ? (p->active[1] + 1) / 2 : prow;
+        uint32_t j1 = p->active[3] / 2;
+        j0 = j0 > a0 ? j0 : a0;
+        j1 = j1 < a1 ? j1 : a1;
+        if (j1 <= j0 || ix1 <= ix0)
+            j0 = j1 = a1;
+        uint32_t s = prow > a0 ? (prow < a1 ? prow : a1) : a0;   /* rows the packets reach: full width */
+        band_add(b, &nb, p2, a0, s, 0, cw);
+        band_add(b, &nb, p2, s, j0 > s ? j0 : s, bx0, bx1);
+        band_add(b, &nb, p2, j0, j1, bx0, ix0);
+        band_add(b, &nb, p2i, j0, j1, ix0, ix1);
+        band_add(b, &nb, p2, j0, j1, ix1, bx1);
+        band_add(b, &nb, p2, j1 > s ? j1 : s, a1, bx0, bx1);
+    } else {
+        region(b, &nb, p2, overlay ? ov->p2 : NULL, a0, i0, i0, r, ov->n, cw);
+        region(b, &nb, p2i, overlay ? ov->p2 : NULL, i0, i1, i1, r, ov->n, cw);
+        region(b, &nb, p2, overlay ? ov->p2 : NULL, i1, a1, a1, r, ov->n, cw);
+    }
     region(b, &nb, pb, overlay ? ov->bars : NULL, a1, ch, bottom, r, ov->n, cw);
     VkClearValue black;
     for (int l = 0; l < 2; l++)
         black.color.uint32[l] = PI_PACK(p->black[0], l ? p->black[2] : p->black[1]);
     black.color.uint32[2] = black.color.uint32[3] = 0;
-    pass(e, c, 1, e->rp[1], o->fb, cw, ch, 0, ch, b, nb, &black);
+    pass(e, c, 1, e->rp[1], o->fb, cw, ch, 0, cw, 0, ch, b, nb, &black);
     if (o->copy_buf)
         for (int half = 0; half < 2; half++) {
             VkBufferImageCopy cp = {.bufferOffset = (VkDeviceSize)half * o->stride, .bufferRowLength = o->stride / 4,

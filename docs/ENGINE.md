@@ -46,9 +46,13 @@ P2  w/2 × h/2   one fragment per 2×2 output block: 4:2:2 vertical filter,
   without them take the per-fragment path.
 - **The output is the scanout buffer.** P2 renders straight into the linear
   dmabuf. It needs one row of slack: `stride × (height + 1)` bytes.
-- **Letterbox rows cost almost nothing.** P1 renders only the planner's row
-  window. P2 clears the bars in the tile buffer and draws only their
-  metadata-packet rows.
+- **Letterbox rows and pillarbox columns cost almost nothing.** P1 renders
+  only the planner's row window and, for a pillarbox, the active area's
+  columns with a margin. P2 clears the bars in the tile buffer and draws only
+  their metadata-packet rows. The render areas are grown to whole tiles (an
+  area that isn't makes v3dv load every tile). P2's interior rows and
+  columns, wholly inside the active area and below the packets, take a
+  variant without either test; the full pipeline draws the edges.
 - **The BL is never resized:** its grid is the output's. Only the FEL's EL,
   coded at half size, is upscaled 2× to it (`--el-upscale`), and the
   reconstructed 4:2:0 chroma is filtered vertically to the tunnel's 4:2:2
