@@ -48,6 +48,9 @@ layout(constant_id = 7) const uint ELUP = 0;
 // the output's size, 3 at the output's size (the filter's 8-bit weights and
 // coordinates would mix a neighbour into a texel centre).
 layout(constant_id = 8) const uint OVERLAY = 0;
+// INTERIOR: drawn only over blocks wholly inside the active area and below
+// the rows the metadata packets reach, so neither is tested.
+layout(constant_id = 9) const uint INTERIOR = 0;
 layout(binding = 16) uniform sampler2D overlay_codes;   // PO: (Y, Cb, Cr) x alpha / 4096, alpha
 
 uint packet_byte(uint i) { return (P.packets[i >> 4][(i >> 2) & 3u] >> (8u * (i & 3u))) & 255u; }
@@ -76,7 +79,7 @@ uint finish(uint x, uint y, uint yy, uint c)
 {
     if ((ABLATE & 32u) != 0u)
         return yy | (c << 16);
-    if (y < P.pk.w) {
+    if (INTERIOR == 0u && y < P.pk.w) {
         uint i = y * P.size.x + x;
         if (i < P.pk.x * PI_PACKET_PIXELS) {
             uint bit_index = i & 1023u;
@@ -270,7 +273,7 @@ void pack_block(uint x, uint y, uvec4 yy, uvec4 c, out uvec2 top, out uvec2 bott
 void block(uint x, uint y, uvec4 b, uvec4 e, uvec4 c, out uvec2 top, out uvec2 bottom)
 {
     uvec4 yy = uvec4(luma(b.x, e.x), luma(b.y, e.y), luma(b.z, e.z), luma(b.w, e.w));
-    if (x < P.area.x || y < P.area.y || x + 1u >= P.area.z || y + 1u >= P.area.w) {
+    if (INTERIOR == 0u && (x < P.area.x || y < P.area.y || x + 1u >= P.area.z || y + 1u >= P.area.w)) {
         bool ox0 = x < P.area.x || x >= P.area.z, ox1 = x + 1u < P.area.x || x + 1u >= P.area.z;
         bool oy0 = y < P.area.y || y >= P.area.w, oy1 = y + 1u < P.area.y || y + 1u >= P.area.w;
         bvec4 black = bvec4(ox0 || oy0, ox1 || oy0, ox0 || oy1, ox1 || oy1);

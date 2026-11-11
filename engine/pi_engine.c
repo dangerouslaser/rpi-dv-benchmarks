@@ -108,7 +108,7 @@ enum { NB = sizeof(bindings) / sizeof(bindings[0]) };
  * shader (its METHOD, ELUP and QUAD are P1's ids); P2's 1..8. */
 enum { K1_MODE, K1_METHOD, K1_DUAL, K1_KIND0, K1_KIND1, K1_ORDER0, K1_ORDER1, K1_SINGLE, K1_PIECE, K1_ORDER2,
        K1_FAST, K1_MARK, K1_GUARD, K1_ELUP, K1_ELOUT, K1_QUAD, K1_PRE, K1_N };
-enum { K2_ANNEXB, K2_TOP_LEFT, K2_ABLATE, K2_BARS, K2_SINGLE, K2_FULL422, K2_ELUP, K2_OVERLAY, K2_N };
+enum { K2_ANNEXB, K2_TOP_LEFT, K2_ABLATE, K2_BARS, K2_SINGLE, K2_FULL422, K2_ELUP, K2_OVERLAY, K2_INTERIOR, K2_N };
 enum { MAX_SPEC = 17, KEY_MAX = K1_N };
 _Static_assert((int)K1_N <= (int)MAX_SPEC && (int)K2_N + 1 <= (int)MAX_SPEC, "a specialisation map fits its entries");
 
@@ -2289,7 +2289,8 @@ struct overlay_pass {
 /* el_unread: P2 reads no EL luma (the single-layer routes but the full-height
  * 4:2:2 layout's): P1 doesn't store it. */
 static int record(struct pi_engine *e, struct ctx *c, const dvvk_plan *p, struct pi_output *o, VkPipeline p0,
-                  VkPipeline p1, VkPipeline p2, VkPipeline pb, const struct overlay_pass *ov, int el_unread)
+                  VkPipeline p1, VkPipeline p2, VkPipeline p2i, VkPipeline pb, const struct overlay_pass *ov,
+                  int el_unread)
 {
     uint32_t w = e->w, h = e->h, cw = w / 2, ch = h / 2;
     VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -2396,10 +2397,23 @@ static int record(struct pi_engine *e, struct ctx *c, const dvvk_plan *p, struct
         r[i][2] = orect[0] / 2;
         r[i][3] = (orect[2] + 1) / 2 < cw ? (orect[2] + 1) / 2 : cw;
     }
-    struct band b[3 * (1 + 4 * PI_OVERLAY_RECTS)];
+    /* the active rows' interior (p2i): block rows wholly inside the active
+     * area and below the packets, where it spans the width */
+    uint32_t i0 = a1, i1 = a1;
+    if (p->active[0] == 0 && p->active[2] >= w && !(e->o.measure & PI_MEASURE_DRAW_BARS)) {
+        i0 = (p->active[1] + 1) / 2 > prow ? (p->active[1] + 1) / 2 : prow;
+        i1 = p->active[3] / 2;
+        i0 = i0 > a0 ? i0 : a0;
+        i1 = i1 < a1 ? i1 : a1;
+        if (i1 <= i0)
+            i0 = i1 = a1;
+    }
+    struct band b[5 * (1 + 4 * PI_OVERLAY_RECTS)];
     int nb = 0;
     region(b, &nb, pb, overlay ? ov->bars : NULL, 0, a0, top, r, ov->n, cw);
-    region(b, &nb, p2, overlay ? ov->p2 : NULL, a0, a1, a1, r, ov->n, cw);
+    region(b, &nb, p2, overlay ? ov->p2 : NULL, a0, i0, i0, r, ov->n, cw);
+    region(b, &nb, p2i, overlay ? ov->p2 : NULL, i0, i1, i1, r, ov->n, cw);
+    region(b, &nb, p2, overlay ? ov->p2 : NULL, i1, a1, a1, r, ov->n, cw);
     region(b, &nb, pb, overlay ? ov->bars : NULL, a1, ch, bottom, r, ov->n, cw);
     VkClearValue black;
     for (int l = 0; l < 2; l++)
@@ -2704,7 +2718,11 @@ int pi_render(struct pi_engine *e, const struct pi_frame *f, struct pi_output *o
     /* pipelines */
     uint32_t k1[K1_N], k2[K2_N], kb[K2_N] = {[K2_BARS] = 1};
     keys(e, p, k1, k2);
-    VkPipeline p1 = build(e, 0, k1), p2 = build(e, 1, k2), pb = build(e, 1, kb), p0 = VK_NULL_HANDLE;
+    uint32_t k2i[K2_N];
+    memcpy(k2i, k2, sizeof(k2i));
+    k2i[K2_INTERIOR] = 1;
+    VkPipeline p1 = build(e, 0, k1), p2 = build(e, 1, k2), p2i = build(e, 1, k2i), pb = build(e, 1, kb),
+               p0 = VK_NULL_HANDLE;
     if (k1[K1_ELUP]) {   /* P0: only the EL selectors matter */
         uint32_t k0[K1_N] = {[K1_METHOD] = k1[K1_METHOD], [K1_ELUP] = k1[K1_ELUP], [K1_QUAD] = k1[K1_QUAD],
                              [K1_PRE] = 1};
@@ -2724,7 +2742,7 @@ int pi_render(struct pi_engine *e, const struct pi_frame *f, struct pi_output *o
         op.p2 = build(e, 1, k2o);
         op.bars = build(e, 1, kbo);
     }
-    if (!p1 || !p2 || !pb || (k1[K1_ELUP] && !p0) || (ov && (!op.p2 || !op.bars))) {
+    if (!p1 || !p2 || !p2i || !pb || (k1[K1_ELUP] && !p0) || (ov && (!op.p2 || !op.bars))) {
         WARN_ONCE(e, W_PIPELINE, "a pipeline failed to build");
         rc = PI_E_VULKAN;
         goto release;
@@ -2737,7 +2755,7 @@ int pi_render(struct pi_engine *e, const struct pi_frame *f, struct pi_output *o
 
     /* record and submit */
     e->serial++;
-    if ((rc = record(e, c, p, o, p0, p1, p2, pb, &op, k2[K2_SINGLE] && !k2[K2_FULL422])))
+    if ((rc = record(e, c, p, o, p0, p1, p2, p2i, pb, &op, k2[K2_SINGLE] && !k2[K2_FULL422])))
         goto release;
     rc = submit(e, c, acquire_fd, drawn_fd, release_fd);
     acquire_fd = drawn_fd = -1;   /* submit takes them */
